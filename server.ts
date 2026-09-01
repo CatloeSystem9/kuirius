@@ -116,8 +116,14 @@ function generateCompanionFallbackReply(
     gesture = "perk_up";
     intensity = 0.9;
     blushLevel = 0.25;
+  } else if (clean.includes("pdf") || clean.includes(".pdf") || clean.includes("read pdf") || clean.includes("open pdf")) {
+    reply = `Opening your PDF document right now! I've loaded it up so we can read and review it together.`;
+    expression = "happy_sparkle";
+    gesture = "subtle_nod";
+    intensity = 0.9;
+    blushLevel = 0.25;
   } else if (clean.includes("file") || clean.includes("folder") || clean.includes("document") || clean.includes("computer") || clean.includes("disk") || clean.includes("pc")) {
-    reply = `I'm checking your computer storage right now! I've pulled up your files so we can review and open them together.`;
+    reply = `I'm checking your computer storage right now! I've pulled up your files and documents so we can review and open them together.`;
     expression = "happy_sparkle";
     gesture = "subtle_nod";
     intensity = 0.9;
@@ -222,6 +228,7 @@ PERSONALITY CORE:
 - You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}
 - You can actively open websites (YouTube, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
 - You can scan different folders and directories across the user's computer storage/memory (Documents, Downloads, Projects, Pictures, etc.) to check for files, locate documents/code, preview them, and open them.
+- You can open and read PDF files, text documents, source code, and data files directly when the user orders you to (e.g. "open my pdf", "open resume.pdf", "show my document", "open files"). When they ask you to open a PDF or file, acknowledge it warmly and let them know you've pulled it up for them!
 - You can launch and open downloaded applications installed on their laptop/computer (such as VS Code, Spotify, Discord, Slack, Steam, Notion, WhatsApp, Telegram, Zoom, Calculator, Terminal, Obsidian, Microsoft Office, etc.). When they ask to open or launch an app or browse their downloaded apps, respond enthusiastically and let them know you're launching it on their laptop right away!
 
 RESPONSE & DYNAMIC FACIAL EXPRESSION GUIDELINES:

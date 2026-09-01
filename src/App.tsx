@@ -10,6 +10,7 @@ import {
   EmotionAnalysis,
   WebAction,
   LocalFileAction,
+  LaptopAppAction,
 } from './types';
 import {
   getStoredSettings,
@@ -26,6 +27,11 @@ import {
 import { speakKrishaText, stopKrishaSpeech, playWakeChime } from './utils/audio';
 import { analyzeSentimentAndKeywords, normalizeExpression } from './utils/sentimentEngine';
 import { detectAndParseWebAction, openExternalUrl } from './utils/webActions';
+import {
+  detectAndParseAppLaunchCommand,
+  launchLaptopApp,
+  LaptopApp,
+} from './utils/appLauncher';
 import { wakeWordManager, WakeWordResult, WakeWordStatus } from './utils/wakeWordListener';
 import {
   parseFileCommand,
@@ -41,9 +47,12 @@ import { ConversationsModal } from './components/ConversationsModal';
 import { MemoryModal } from './components/MemoryModal';
 import { SettingsModal } from './components/SettingsModal';
 import { LocalFilesModal } from './components/LocalFilesModal';
+import { AppsModal } from './components/AppsModal';
 import { DirectChatInput } from './components/DirectChatInput';
 import { WebActionCard } from './components/WebActionCard';
 import { LocalFileActionCard } from './components/LocalFileActionCard';
+import { AppActionCard } from './components/AppActionCard';
+import { DocumentViewerModal } from './components/DocumentViewerModal';
 
 export default function App() {
   // State
@@ -55,6 +64,8 @@ export default function App() {
   const [activeModal, setActiveModal] = useState<ActiveModal>(null);
   const [initialFileSearch, setInitialFileSearch] = useState<string>('');
   const [initialFolderFilter, setInitialFolderFilter] = useState<string>('ALL');
+  const [activeViewerFile, setActiveViewerFile] = useState<LocalIndexedFile | null>(null);
+  const [availableIndexedFiles, setAvailableIndexedFiles] = useState<LocalIndexedFile[]>([]);
 
   // Dynamic Avatar Expression State
   const [expression, setExpression] = useState<AvatarExpression>('gentle_smile');
@@ -75,6 +86,8 @@ export default function App() {
   const [forcedPose, setForcedPose] = useState<VideoAnimationPose | null>(null);
   const [activeWebAction, setActiveWebAction] = useState<WebAction | null>(null);
   const [activeFileAction, setActiveFileAction] = useState<LocalFileAction | null>(null);
+  const [activeAppAction, setActiveAppAction] = useState<LaptopAppAction | null>(null);
+  const [initialAppSearch, setInitialAppSearch] = useState<string>('');
 
   const isWhiteBackground = isDancing || Boolean(lookDirection);
 
@@ -93,18 +106,27 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [isWhiteBackground, isSpeaking, lookDirection, isDancing]);
 
-  // Auto-reset greeting state after greeting animation and speech complete
+  // Auto-reset greeting state after single greeting animation and speech complete
   useEffect(() => {
-    if (!isGreeting) return;
+    if (!isGreeting && forcedPose !== 'waving_greeting') return;
 
-    const timeoutDuration = isSpeaking ? 8000 : 5500;
+    const timeoutDuration = isSpeaking ? 4800 : 3600;
     const timer = setTimeout(() => {
       setIsGreeting(false);
-      setForcedPose(null);
+      if (forcedPose === 'waving_greeting') {
+        setForcedPose(null);
+      }
     }, timeoutDuration);
 
     return () => clearTimeout(timer);
-  }, [isGreeting, isSpeaking]);
+  }, [isGreeting, forcedPose, isSpeaking]);
+
+  const handleGreetingComplete = () => {
+    setIsGreeting(false);
+    if (forcedPose === 'waving_greeting') {
+      setForcedPose(null);
+    }
+  };
 
   // Movable avatar and parallax pointer tracking
   const mainContainerRef = useRef<HTMLDivElement>(null);
@@ -404,14 +426,66 @@ export default function App() {
       setForcedPose('waving_greeting');
     }
 
-    // Check for local file system & computer memory command
+    // Check for native laptop app launch commands (e.g. "open spotify on my laptop", "open vs code", "launch discord")
+    const appCmd = detectAndParseAppLaunchCommand(text);
+    let detectedAppAction: LaptopAppAction | null = null;
+    if (appCmd.isAppCommand) {
+      if (appCmd.action === 'list_apps') {
+        detectedAppAction = {
+          type: 'list_apps',
+          appName: 'Downloaded Laptop Apps',
+        };
+        setActiveAppAction(detectedAppAction);
+        setActiveModal('apps');
+        setForcedPose('waving_greeting');
+      } else if (appCmd.app) {
+        detectedAppAction = {
+          type: 'launch_app',
+          appName: appCmd.app.name,
+          protocol: appCmd.app.protocol,
+          fallbackUrl: appCmd.app.fallbackUrl,
+          category: appCmd.app.category,
+          description: appCmd.app.description,
+        };
+        setActiveAppAction(detectedAppAction);
+        launchLaptopApp(appCmd.app);
+        setForcedPose('waving_greeting');
+      } else if (appCmd.rawAppName) {
+        detectedAppAction = {
+          type: 'launch_app',
+          appName: appCmd.rawAppName,
+        };
+        setActiveAppAction(detectedAppAction);
+        setInitialAppSearch(appCmd.rawAppName);
+        setActiveModal('apps');
+      }
+    }
+
+    // Check for local file system & PDF/document commands
     const fileCmd = parseFileCommand(text);
     let detectedFileAction: LocalFileAction | null = null;
     if (fileCmd.isFileCommand) {
       const { files: indexedFiles } = await loadIndexedFiles();
+      setAvailableIndexedFiles(indexedFiles);
       const query = fileCmd.targetQuery || '';
       const folderFilter = fileCmd.targetFolder || undefined;
-      const matched = searchLocalFiles(query, folderFilter, indexedFiles);
+      let matched = searchLocalFiles(query, folderFilter, indexedFiles);
+
+      // Prioritize PDF files if PDF was requested or query is generic
+      if (fileCmd.fileTypeFilter === 'pdf' || text.toLowerCase().includes('pdf')) {
+        const pdfOnly = matched.filter(
+          (m) => m.extension.toLowerCase() === 'pdf' || m.type === 'application/pdf'
+        );
+        if (pdfOnly.length > 0) {
+          matched = pdfOnly;
+        } else {
+          matched = [...matched].sort((a, b) => {
+            const aIsPdf = a.extension.toLowerCase() === 'pdf' ? 1 : 0;
+            const bIsPdf = b.extension.toLowerCase() === 'pdf' ? 1 : 0;
+            return bIsPdf - aIsPdf;
+          });
+        }
+      }
 
       detectedFileAction = {
         type: fileCmd.action === 'scan_folder' ? 'scan_folder' : fileCmd.action === 'open' ? 'open_file' : 'search_file',
@@ -426,24 +500,26 @@ export default function App() {
           extension: m.extension,
           category: m.category,
           blobUrl: m.blobUrl,
+          previewText: m.previewText,
         })),
       };
 
       setActiveFileAction(detectedFileAction);
 
-      // If user specifically asked to scan folders or check a folder without indexed files
+      // If user specifically asked to scan folders
       if (fileCmd.action === 'scan_folder') {
         if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
         if (query) setInitialFileSearch(query);
         setActiveModal('files');
-      } else if (matched.length === 0 && indexedFiles.length === 0) {
-        setInitialFileSearch(query);
-        if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
-        setActiveModal('files');
-      } else if (matched.length > 0 && fileCmd.action === 'open') {
-        // Automatically open the best matched file
-        openOrDownloadFile(matched[0]);
-      } else if (query) {
+      } else if (matched.length > 0) {
+        // Automatically open the best matched document/PDF in viewer and new tab
+        const targetToOpen = matched[0];
+        setActiveViewerFile(targetToOpen);
+        setActiveModal('file_viewer');
+        openOrDownloadFile(targetToOpen);
+        setForcedPose('pointing_document');
+        setExpression('happy_sparkle');
+      } else {
         setInitialFileSearch(query);
         if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
         setActiveModal('files');
@@ -490,10 +566,14 @@ export default function App() {
       role: 'user',
       content: text.trim(),
       timestamp: Date.now(),
-      expression: detectedWebAction || detectedFileAction ? 'happy_sparkle' : userEmotion.expression,
+      expression:
+        detectedWebAction || detectedFileAction || detectedAppAction
+          ? 'happy_sparkle'
+          : userEmotion.expression,
       emotionData: userEmotion,
       webAction: detectedWebAction || undefined,
       fileAction: detectedFileAction || undefined,
+      appAction: detectedAppAction || undefined,
     };
 
     let targetConvo = currentConversation;
@@ -961,6 +1041,7 @@ export default function App() {
               forcedPose={forcedPose}
               onPoseChange={setForcedPose}
               onReact={handleAvatarReaction}
+              onGreetingComplete={handleGreetingComplete}
             />
           </motion.div>
         </div>
@@ -975,15 +1056,34 @@ export default function App() {
           <LocalFileActionCard
             action={activeFileAction}
             onDismiss={() => setActiveFileAction(null)}
+            onOpenFile={(file) => {
+              setActiveViewerFile(file);
+              setActiveModal('file_viewer');
+            }}
             onOpenFilesModal={() => {
               if (activeFileAction?.query) setInitialFileSearch(activeFileAction.query);
               setActiveModal('files');
             }}
             isLightMode={isWhiteBackground}
           />
+          <AppActionCard
+            action={activeAppAction}
+            onDismiss={() => setActiveAppAction(null)}
+            onOpenAppsModal={() => {
+              if (activeAppAction?.appName && activeAppAction.appName !== 'Downloaded Laptop Apps') {
+                setInitialAppSearch(activeAppAction.appName);
+              }
+              setActiveModal('apps');
+            }}
+            isLightMode={isWhiteBackground}
+          />
           <DirectChatInput
             onSendMessage={handleSendMessage}
             onTypingChange={handleTypingReaction}
+            onOpenPdfOrFile={() => {
+              setActiveModal('files');
+              setInitialFolderFilter('ALL');
+            }}
             isLoading={isLoading}
             isSpeaking={isSpeaking}
             isLightMode={isWhiteBackground}
@@ -1014,7 +1114,7 @@ export default function App() {
         </div>
       </main>
 
-      {/* MODALS: 1. Previous Conversations, 2. Memory, 3. Settings, 4. Local Files */}
+      {/* MODALS: 1. Previous Conversations, 2. Memory, 3. Settings, 4. Local Files, 5. Apps, 6. Document/PDF Viewer */}
       <ConversationsModal
         isOpen={activeModal === 'conversations'}
         onClose={() => setActiveModal(null)}
@@ -1044,8 +1144,40 @@ export default function App() {
         initialSearchQuery={initialFileSearch}
         initialFolderFilter={initialFolderFilter}
         onSelectFile={(file) => {
-          // Speak or acknowledge file
+          setActiveViewerFile(file);
+          setActiveModal('file_viewer');
           setLastSpokenText(`Opening ${file.name} for you.`);
+        }}
+      />
+
+      <DocumentViewerModal
+        isOpen={activeModal === 'file_viewer'}
+        file={activeViewerFile}
+        onClose={() => {
+          setActiveModal(null);
+          setActiveViewerFile(null);
+        }}
+        onSelectAnotherFile={(file) => {
+          setActiveViewerFile(file);
+          openOrDownloadFile(file);
+        }}
+        onUploadNewFile={(file) => {
+          setActiveViewerFile(file);
+          setAvailableIndexedFiles((prev) => [file, ...prev.filter((p) => p.id !== file.id)]);
+        }}
+        availableFiles={availableIndexedFiles}
+      />
+
+      <AppsModal
+        isOpen={activeModal === 'apps'}
+        onClose={() => {
+          setActiveModal(null);
+          setInitialAppSearch('');
+        }}
+        initialSearchQuery={initialAppSearch}
+        onLaunchApp={(app) => {
+          setLastSpokenText(`Opening ${app.name} on your laptop.`);
+          setForcedPose('waving_greeting');
         }}
       />
 

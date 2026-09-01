@@ -22,6 +22,7 @@ interface LocalFileActionCardProps {
   action: LocalFileAction | null;
   onDismiss?: () => void;
   onOpenFilesModal?: () => void;
+  onOpenFile?: (file: LocalIndexedFile) => void;
   isLightMode?: boolean;
 }
 
@@ -29,6 +30,7 @@ export const LocalFileActionCard: React.FC<LocalFileActionCardProps> = ({
   action,
   onDismiss,
   onOpenFilesModal,
+  onOpenFile,
   isLightMode = false,
 }) => {
   if (!action) return null;
@@ -36,8 +38,15 @@ export const LocalFileActionCard: React.FC<LocalFileActionCardProps> = ({
   const matched = action.matchedFiles || [];
   const topMatch = matched[0];
   const isScanFolder = action.type === 'scan_folder';
+  const isPdf =
+    topMatch?.extension?.toLowerCase() === 'pdf' ||
+    topMatch?.name?.toLowerCase().endsWith('.pdf') ||
+    topMatch?.category === 'document';
 
-  const getFileIcon = (cat?: string) => {
+  const getFileIcon = (cat?: string, ext?: string) => {
+    if (ext === 'pdf') {
+      return <FileText className="w-4 h-4 text-rose-400" />;
+    }
     switch (cat) {
       case 'code':
         return <Code className="w-4 h-4 text-emerald-400" />;
@@ -58,7 +67,11 @@ export const LocalFileActionCard: React.FC<LocalFileActionCardProps> = ({
 
   const handleOpenTopMatch = () => {
     if (topMatch) {
-      openOrDownloadFile(topMatch as unknown as LocalIndexedFile);
+      if (onOpenFile) {
+        onOpenFile(topMatch as unknown as LocalIndexedFile);
+      } else {
+        openOrDownloadFile(topMatch as unknown as LocalIndexedFile);
+      }
     } else if (onOpenFilesModal) {
       onOpenFilesModal();
     }
@@ -146,10 +159,14 @@ export const LocalFileActionCard: React.FC<LocalFileActionCardProps> = ({
             <button
               type="button"
               onClick={handleOpenTopMatch}
-              className="flex items-center gap-1 px-3 py-1.5 rounded-xl text-[11px] font-medium bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 text-white shadow-md hover:shadow-blue-500/25 transition-all cursor-pointer"
+              className={`flex items-center gap-1 px-3.5 py-1.5 rounded-xl text-[11px] font-semibold text-white shadow-md transition-all cursor-pointer ${
+                isPdf
+                  ? 'bg-gradient-to-r from-rose-600 to-pink-600 hover:from-rose-500 hover:to-pink-500 shadow-rose-500/25'
+                  : 'bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 shadow-blue-500/25'
+              }`}
             >
-              <span>Open File</span>
-              <ExternalLink className="w-3.5 h-3.5" />
+              <FileText className="w-3.5 h-3.5" />
+              <span>{isPdf ? 'Read PDF' : 'Open File'}</span>
             </button>
           ) : (
             <button

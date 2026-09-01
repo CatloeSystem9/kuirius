@@ -96,4 +96,4 @@ export interface CompanionSettings {
   companionNotes: string;
 }
 
-export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps';
+export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer';

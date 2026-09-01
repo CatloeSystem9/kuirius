@@ -1,10 +1,11 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Send, Mic, MicOff, Volume2, VolumeX, Loader2, Sparkles, Radio } from 'lucide-react';
+import { Send, Mic, MicOff, Volume2, VolumeX, Loader2, Sparkles, Radio, Paperclip } from 'lucide-react';
 
 interface DirectChatInputProps {
   onSendMessage: (text: string) => void;
   onTypingChange?: (text: string) => void;
+  onOpenPdfOrFile?: () => void;
   isLoading: boolean;
   isSpeaking: boolean;
   voiceEnabled: boolean;
@@ -20,6 +21,7 @@ interface DirectChatInputProps {
 export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   onSendMessage,
   onTypingChange,
+  onOpenPdfOrFile,
   isLoading,
   isSpeaking,
   voiceEnabled,
@@ -81,7 +83,6 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
 
   const toggleRecording = () => {
     if (!recognitionRef.current) {
-      alert('Speech recognition is not supported in this browser.');
       return;
     }
 
@@ -201,6 +202,22 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
           {isRecording ? <MicOff className="w-4 h-4" /> : <Mic className="w-4 h-4" />}
         </button>
 
+        {/* Paperclip / File Picker Button */}
+        {onOpenPdfOrFile && (
+          <button
+            type="button"
+            onClick={onOpenPdfOrFile}
+            className={`p-2 rounded-full transition-colors cursor-pointer flex-shrink-0 ${
+              isLightMode
+                ? 'text-slate-500 hover:text-blue-600 hover:bg-slate-100'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40'
+            }`}
+            title="Pick & Open PDF / Document from Laptop"
+          >
+            <Paperclip className="w-4 h-4" />
+          </button>
+        )}
+
         {/* Text Input directly on main screen */}
         <input
           ref={inputRef}
@@ -212,14 +229,14 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
               : isSpeaking
               ? 'Krisha is speaking...'
               : wakeWordEnabled
-              ? 'Say "Krisha [command]" or type here...'
-              : 'Type a message to Krisha...'
+              ? 'Say "Krisha open PDF" or type here...'
+              : 'Type "open pdf" or ask Krisha...'
           }
           value={inputText}
           onChange={handleInputChange}
           disabled={isLoading}
           autoComplete="off"
-          className={`flex-1 bg-transparent px-3 sm:px-4 py-2 text-xs sm:text-sm focus:outline-none disabled:opacity-50 transition-colors ${
+          className={`flex-1 bg-transparent px-2 sm:px-3 py-2 text-xs sm:text-sm focus:outline-none disabled:opacity-50 transition-colors ${
             isLightMode
               ? 'text-slate-800 placeholder-slate-400'
               : 'text-slate-100 placeholder-slate-500'

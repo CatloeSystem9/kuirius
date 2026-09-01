@@ -26,6 +26,7 @@ export interface KrishaAvatarProps {
   forcedPose?: VideoAnimationPose | null;
   onPoseChange?: (pose: VideoAnimationPose) => void;
   onReact?: (type: 'head' | 'heart' | 'wave') => void;
+  onGreetingComplete?: () => void;
 }
 
 export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
@@ -39,14 +40,25 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
   forcedPose = null,
   onPoseChange,
   onReact,
+  onGreetingComplete,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [videoError, setVideoError] = useState(false);
   const [patReaction, setPatReaction] = useState<'none' | 'head' | 'heart' | 'wave'>('none');
+  const [internalGreetingPlaying, setInternalGreetingPlaying] = useState(false);
   const [sparkleCount, setSparkleCount] = useState(0);
 
+  // Sync greeting trigger state to ensure it plays only once per trigger
+  useEffect(() => {
+    if (isGreeting || patReaction === 'wave' || forcedPose === 'waving_greeting') {
+      setInternalGreetingPlaying(true);
+    }
+  }, [isGreeting, patReaction, forcedPose]);
+
   // Determine active greeting/looking flags
-  const isGreetingActive = isGreeting || patReaction === 'wave' || forcedPose === 'waving_greeting';
+  const isGreetingActive =
+    internalGreetingPlaying &&
+    (isGreeting || patReaction === 'wave' || forcedPose === 'waving_greeting');
   const isLookingActive = Boolean(lookDirection);
 
   // Expression normalization
@@ -78,7 +90,6 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
     if (patReaction === 'heart') return 'hands_on_heart';
     if (patReaction === 'head') return 'hands_on_heart';
 
-    if (currentExpression === 'happy_sparkle') return 'waving_greeting';
     if (
       currentExpression === 'flustered_blush' ||
       currentExpression === 'thoughtful_gaze' ||
@@ -89,7 +100,8 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
     if (
       currentExpression === 'playful_smirk' ||
       currentExpression === 'curious_tilt' ||
-      currentExpression === 'pout_jealous'
+      currentExpression === 'pout_jealous' ||
+      currentExpression === 'happy_sparkle'
     ) {
       return 'playful_gesture';
     }
@@ -112,6 +124,19 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
     }
     return '/assets/videos/ANIME%20GIRL%20STANDING%20QUIETLY.mp4';
   }, [isDancing, isLookingActive, isGreetingActive, isSpeaking]);
+
+  const isGreetingVideo = activeVideoSrc.includes('GREETING');
+  const shouldLoopVideo = !isGreetingVideo; // Stand quietly loops; greeting video runs strictly ONCE
+
+  const handleVideoEnded = () => {
+    if (isGreetingVideo || isGreetingActive) {
+      setInternalGreetingPlaying(false);
+      setPatReaction('none');
+      if (onGreetingComplete) {
+        onGreetingComplete();
+      }
+    }
+  };
 
   // Active cutout image fallback based on pose
   const activeCutout = useMemo(() => {
@@ -326,10 +351,11 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
                 key={activeVideoSrc}
                 src={activeVideoSrc}
                 autoPlay
-                loop
+                loop={shouldLoopVideo}
                 muted
                 playsInline
                 preload="metadata"
+                onEnded={handleVideoEnded}
                 onError={() => setVideoError(true)}
                 className="w-full h-full object-contain transition-opacity duration-300"
               />

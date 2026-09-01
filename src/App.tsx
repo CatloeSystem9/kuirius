@@ -1,0 +1,1061 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Volume2, Move, RotateCcw, Compass, ExternalLink } from 'lucide-react';
+import {
+  AvatarExpression,
+  CompanionSettings,
+  Conversation,
+  Message,
+  ActiveModal,
+  EmotionAnalysis,
+  WebAction,
+  LocalFileAction,
+} from './types';
+import {
+  getStoredSettings,
+  saveStoredSettings,
+  getStoredMemories,
+  saveStoredMemories,
+  getStoredConversations,
+  saveStoredConversations,
+  getActiveConversationId,
+  setActiveConversationId,
+  DEFAULT_MEMORIES,
+  DEFAULT_SETTINGS,
+} from './utils/storage';
+import { speakKrishaText, stopKrishaSpeech, playWakeChime } from './utils/audio';
+import { analyzeSentimentAndKeywords, normalizeExpression } from './utils/sentimentEngine';
+import { detectAndParseWebAction, openExternalUrl } from './utils/webActions';
+import { wakeWordManager, WakeWordResult, WakeWordStatus } from './utils/wakeWordListener';
+import {
+  parseFileCommand,
+  searchLocalFiles,
+  loadIndexedFiles,
+  openOrDownloadFile,
+  pickAndAddFiles,
+  LocalIndexedFile,
+} from './utils/fileSystemAccess';
+import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
+import { SidebarNav } from './components/SidebarNav';
+import { ConversationsModal } from './components/ConversationsModal';
+import { MemoryModal } from './components/MemoryModal';
+import { SettingsModal } from './components/SettingsModal';
+import { LocalFilesModal } from './components/LocalFilesModal';
+import { DirectChatInput } from './components/DirectChatInput';
+import { WebActionCard } from './components/WebActionCard';
+import { LocalFileActionCard } from './components/LocalFileActionCard';
+
+export default function App() {
+  // State
+  const [settings, setSettings] = useState<CompanionSettings>(getStoredSettings);
+  const [memories, setMemories] = useState<string[]>(getStoredMemories);
+  const [conversations, setConversations] = useState<Conversation[]>(getStoredConversations);
+  const [activeConvoId, setActiveConvoId] = useState<string | null>(getActiveConversationId);
+
+  const [activeModal, setActiveModal] = useState<ActiveModal>(null);
+  const [initialFileSearch, setInitialFileSearch] = useState<string>('');
+  const [initialFolderFilter, setInitialFolderFilter] = useState<string>('ALL');
+
+  // Dynamic Avatar Expression State
+  const [expression, setExpression] = useState<AvatarExpression>('gentle_smile');
+  const [emotionData, setEmotionData] = useState<EmotionAnalysis>({
+    expression: 'gentle_smile',
+    intensity: 0.75,
+    gesture: 'subtle_nod',
+    blushLevel: 0.3,
+    sentiment: 'positive',
+  });
+
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isDancing, setIsDancing] = useState(false);
+  const [isGreeting, setIsGreeting] = useState(false);
+  const [lookDirection, setLookDirection] = useState<'different_directions' | 'left' | 'right' | 'up' | 'down' | 'around' | null>(null);
+  const [lastSpokenText, setLastSpokenText] = useState<string>('It feels different when we\'re together...');
+  const [forcedPose, setForcedPose] = useState<VideoAnimationPose | null>(null);
+  const [activeWebAction, setActiveWebAction] = useState<WebAction | null>(null);
+  const [activeFileAction, setActiveFileAction] = useState<LocalFileAction | null>(null);
+
+  const isWhiteBackground = isDancing || Boolean(lookDirection);
+
+  // Auto-return to normal dark background and idle state after any background change
+  useEffect(() => {
+    if (!isWhiteBackground) return;
+
+    // Graceful timer: duration gives enough time for the animation and voice to complete, then fades back to normal
+    const timeoutDuration = isSpeaking ? 7500 : 5000;
+    const timer = setTimeout(() => {
+      setIsDancing(false);
+      setLookDirection(null);
+      setForcedPose(null);
+    }, timeoutDuration);
+
+    return () => clearTimeout(timer);
+  }, [isWhiteBackground, isSpeaking, lookDirection, isDancing]);
+
+  // Auto-reset greeting state after greeting animation and speech complete
+  useEffect(() => {
+    if (!isGreeting) return;
+
+    const timeoutDuration = isSpeaking ? 8000 : 5500;
+    const timer = setTimeout(() => {
+      setIsGreeting(false);
+      setForcedPose(null);
+    }, timeoutDuration);
+
+    return () => clearTimeout(timer);
+  }, [isGreeting, isSpeaking]);
+
+  // Movable avatar and parallax pointer tracking
+  const mainContainerRef = useRef<HTMLDivElement>(null);
+  const [pointerPos, setPointerPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [isMoved, setIsMoved] = useState(false);
+  const [avatarKey, setAvatarKey] = useState(0);
+  const rafPointerRef = useRef<number | null>(null);
+
+  const handlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!mainContainerRef.current) return;
+    const clientX = e.clientX;
+    const clientY = e.clientY;
+
+    if (rafPointerRef.current !== null) return;
+
+    rafPointerRef.current = requestAnimationFrame(() => {
+      rafPointerRef.current = null;
+      if (!mainContainerRef.current) return;
+      const rect = mainContainerRef.current.getBoundingClientRect();
+      const centerX = rect.left + rect.width / 2;
+      const centerY = rect.top + rect.height / 2;
+      const normX = Math.max(-1, Math.min(1, (clientX - centerX) / (rect.width / 2)));
+      const normY = Math.max(-1, Math.min(1, (clientY - centerY) / (rect.height / 2)));
+      setPointerPos({ x: normX, y: normY });
+    });
+  };
+
+  const handleResetPosition = () => {
+    setAvatarKey((prev) => prev + 1);
+    setIsMoved(false);
+  };
+
+  // Get current active conversation messages
+  const currentConversation = conversations.find((c) => c.id === activeConvoId);
+  const messages: Message[] = currentConversation ? currentConversation.messages : [];
+
+  // Initialize or get current active conversation
+  useEffect(() => {
+    if (conversations.length === 0) {
+      const initialId = 'convo_' + Date.now();
+      const initialText = `Hey ${settings.userName || 'there'}. I was just sitting here thinking about you. How was your day?`;
+      const initialEmotion = analyzeSentimentAndKeywords(initialText);
+
+      const initialConvo: Conversation = {
+        id: initialId,
+        title: 'Late Evening Chat',
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        messages: [
+          {
+            id: 'init_1',
+            role: 'model',
+            content: initialText,
+            timestamp: Date.now(),
+            expression: initialEmotion.expression,
+            emotionData: initialEmotion,
+          },
+        ],
+      };
+      setConversations([initialConvo]);
+      setActiveConvoId(initialId);
+      setActiveConversationId(initialId);
+      saveStoredConversations([initialConvo]);
+      setLastSpokenText(initialText);
+      setExpression(initialEmotion.expression);
+      setEmotionData(initialEmotion);
+    } else if (!activeConvoId) {
+      setActiveConvoId(conversations[0].id);
+      setActiveConversationId(conversations[0].id);
+      const latestMsg = conversations[0].messages[conversations[0].messages.length - 1];
+      if (latestMsg) {
+        setLastSpokenText(latestMsg.content);
+        if (latestMsg.expression) {
+          const norm = normalizeExpression(latestMsg.expression);
+          setExpression(norm);
+          setEmotionData(latestMsg.emotionData || analyzeSentimentAndKeywords(latestMsg.content));
+        }
+      }
+    }
+  }, []);
+
+  // Update storage whenever state changes
+  const handleSaveSettings = (newSettings: CompanionSettings) => {
+    setSettings(newSettings);
+    saveStoredSettings(newSettings);
+  };
+
+  const handleAddMemory = (newMemory: string) => {
+    const updated = [newMemory, ...memories];
+    setMemories(updated);
+    saveStoredMemories(updated);
+  };
+
+  const handleUpdateMemory = (index: number, newMemory: string) => {
+    const updated = [...memories];
+    updated[index] = newMemory;
+    setMemories(updated);
+    saveStoredMemories(updated);
+  };
+
+  const handleDeleteMemory = (index: number) => {
+    const updated = memories.filter((_, i) => i !== index);
+    setMemories(updated);
+    saveStoredMemories(updated);
+  };
+
+  const handleSelectConversation = (id: string) => {
+    setActiveConvoId(id);
+    setActiveConversationId(id);
+    const convo = conversations.find((c) => c.id === id);
+    if (convo && convo.messages.length > 0) {
+      const last = convo.messages[convo.messages.length - 1];
+      if (last.role === 'model') {
+        setLastSpokenText(last.content);
+        const norm = normalizeExpression(last.expression);
+        setExpression(norm);
+        setEmotionData(last.emotionData || analyzeSentimentAndKeywords(last.content));
+      }
+    }
+  };
+
+  const handleNewConversation = () => {
+    const newId = 'convo_' + Date.now();
+    const welcomeText = `Hi ${settings.userName || 'you'}. I'm right here with you. What's on your mind?`;
+    const emotion = analyzeSentimentAndKeywords(welcomeText);
+
+    const newConvo: Conversation = {
+      id: newId,
+      title: 'New Conversation',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [
+        {
+          id: 'msg_' + Date.now(),
+          role: 'model',
+          content: welcomeText,
+          timestamp: Date.now(),
+          expression: emotion.expression,
+          emotionData: emotion,
+        },
+      ],
+    };
+    const updated = [newConvo, ...conversations];
+    setConversations(updated);
+    setActiveConvoId(newId);
+    setActiveConversationId(newId);
+    saveStoredConversations(updated);
+    setLastSpokenText(welcomeText);
+    setExpression(emotion.expression);
+    setEmotionData(emotion);
+  };
+
+  const handleDeleteConversation = (id: string) => {
+    const updated = conversations.filter((c) => c.id !== id);
+    setConversations(updated);
+    saveStoredConversations(updated);
+    if (activeConvoId === id) {
+      if (updated.length > 0) {
+        setActiveConvoId(updated[0].id);
+        setActiveConversationId(updated[0].id);
+      } else {
+        handleNewConversation();
+      }
+    }
+  };
+
+  const handleResetAllData = () => {
+    localStorage.clear();
+    setMemories(DEFAULT_MEMORIES);
+    setSettings(DEFAULT_SETTINGS);
+    saveStoredMemories(DEFAULT_MEMORIES);
+    saveStoredSettings(DEFAULT_SETTINGS);
+    const freshId = 'convo_' + Date.now();
+    const freshText = `Hello ${DEFAULT_SETTINGS.userName}. I'm glad we get to spend some quiet time together.`;
+    const emotion = analyzeSentimentAndKeywords(freshText);
+
+    const freshConvo: Conversation = {
+      id: freshId,
+      title: 'New Evening',
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      messages: [
+        {
+          id: 'fresh_1',
+          role: 'model',
+          content: freshText,
+          timestamp: Date.now(),
+          expression: emotion.expression,
+          emotionData: emotion,
+        },
+      ],
+    };
+    setConversations([freshConvo]);
+    setActiveConvoId(freshId);
+    setActiveConversationId(freshId);
+    saveStoredConversations([freshConvo]);
+    setLastSpokenText(freshText);
+    setExpression(emotion.expression);
+    setEmotionData(emotion);
+  };
+
+  // Real-time sentiment tracking during active typing in chat drawer
+  const handleTypingReaction = (text: string) => {
+    if (!text.trim()) {
+      return;
+    }
+    // Perform zero-latency client-side keyword & sentiment analysis
+    const realtimeEmotion = analyzeSentimentAndKeywords(text);
+    // Trigger responsive micro-tilt or attentive listening pose
+    setExpression(realtimeEmotion.expression);
+    setEmotionData({
+      ...realtimeEmotion,
+      intensity: 0.65, // anticipatory intensity
+    });
+  };
+
+  // Interactive Touch Reaction on Krisha's 2D Model
+  const handleAvatarReaction = (type: 'head' | 'heart' | 'wave') => {
+    let text = '';
+    let expr: AvatarExpression = 'gentle_smile';
+
+    if (type === 'head') {
+      const headQuotes = [
+        "Ehehe... your hand feels so warm and gentle.",
+        "Ah... are you patting my head? That tickles, but I like it.",
+        "Mmm... I could stay like this forever with you.",
+      ];
+      text = headQuotes[Math.floor(Math.random() * headQuotes.length)];
+      expr = 'flustered_blush';
+    } else if (type === 'heart') {
+      const heartQuotes = [
+        "I can feel your warmth right here in my chest...",
+        "Every beat of my heart resonates when we're together.",
+        "You always know how to make my heart flutter...",
+      ];
+      text = heartQuotes[Math.floor(Math.random() * heartQuotes.length)];
+      expr = 'thoughtful_gaze';
+    } else if (type === 'wave') {
+      const waveQuotes = [
+        "Hello! I'm always right here by your side.",
+        "Ehehe, looking at you always brightens my day!",
+        "Hi there! What shall we talk about next?",
+      ];
+      text = waveQuotes[Math.floor(Math.random() * waveQuotes.length)];
+      expr = 'happy_sparkle';
+      setIsGreeting(true);
+      setForcedPose('waving_greeting');
+    }
+
+    setLastSpokenText(text);
+    setExpression(expr);
+    const emotion = analyzeSentimentAndKeywords(text);
+    setEmotionData({ ...emotion, expression: expr, intensity: 0.9 });
+
+    if (settings.voiceEnabled) {
+      speakKrishaText(
+        text,
+        settings.voiceName,
+        settings.voiceSpeed,
+        () => setIsSpeaking(true),
+        () => setIsSpeaking(false)
+      );
+    } else {
+      setIsSpeaking(true);
+      const talkDuration = Math.min(5000, Math.max(2000, text.length * 50));
+      setTimeout(() => {
+        setIsSpeaking(false);
+      }, talkDuration);
+    }
+  };
+
+    // Send message to Krisha
+  const handleSendMessage = async (text: string) => {
+    if (!text.trim() || isLoading) return;
+
+    // Check for dance command or stop dance command
+    const isDanceCommand = /\b(dance|dancing|dances|waltz|ballet|tango|groove)\b/i.test(text);
+    const isStopDanceCommand = /\b(stop\s+dancing|stop\s+dance|halt|pause\s+dance|enough\s+dancing)\b/i.test(text);
+
+    // Check for greeting command or greeting words
+    const isGreetingCommand = /\b(greet(\s+me)?|greeting|greetings|hello|hi|hey|good\s+morning|good\s+afternoon|good\s+evening|wave(\s+at\s+me|\s+to\s+me)?|say\s+hi|say\s+hello|welcome|howdy|sup|salute)\b/i.test(text);
+
+    // Check for looking in different directions commands
+    const isLookDifferentDirections = /\b(look\s+(in\s+|at\s+)?(different|various|all|multiple|other)\s+directions?|look\s+around|look\s+everywhere|look\s+around\s+you|look\s+in\s+all\s+directions|turn\s+around)\b/i.test(text);
+    const isLookLeft = /\b(look\s+(to\s+the\s+|to\s+)?left|turn\s+(to\s+the\s+|to\s+)?left|turn\s+left)\b/i.test(text);
+    const isLookRight = /\b(look\s+(to\s+the\s+|to\s+)?right|turn\s+(to\s+the\s+|to\s+)?right|turn\s+right)\b/i.test(text);
+    const isLookUp = /\b(look\s+(up|upward|upwards|at\s+the\s+sky|at\s+the\s+ceiling)|turn\s+up)\b/i.test(text);
+    const isLookDown = /\b(look\s+(down|downward|downwards|at\s+the\s+floor|at\s+the\s+ground)|turn\s+down)\b/i.test(text);
+    const isStopLooking = /\b(stop\s+looking|look\s+(at\s+me|forward|center|straight|here|ahead)|stop\s+turning|look\s+back)\b/i.test(text);
+    const isGeneralStop = /\b(stop|halt|pause|sit\s+down|reset)\b/i.test(text);
+
+    // Check for web action (open website / search within site)
+    const detectedWebAction = detectAndParseWebAction(text);
+    if (detectedWebAction) {
+      setActiveWebAction(detectedWebAction);
+      openExternalUrl(detectedWebAction.url);
+      setForcedPose('waving_greeting');
+    }
+
+    // Check for local file system & computer memory command
+    const fileCmd = parseFileCommand(text);
+    let detectedFileAction: LocalFileAction | null = null;
+    if (fileCmd.isFileCommand) {
+      const { files: indexedFiles } = await loadIndexedFiles();
+      const query = fileCmd.targetQuery || '';
+      const folderFilter = fileCmd.targetFolder || undefined;
+      const matched = searchLocalFiles(query, folderFilter, indexedFiles);
+
+      detectedFileAction = {
+        type: fileCmd.action === 'scan_folder' ? 'scan_folder' : fileCmd.action === 'open' ? 'open_file' : 'search_file',
+        query,
+        folderName: fileCmd.targetFolder || undefined,
+        matchedFiles: matched.map((m) => ({
+          id: m.id,
+          name: m.name,
+          folderName: m.folderName,
+          folderPath: m.folderPath,
+          size: m.size,
+          extension: m.extension,
+          category: m.category,
+          blobUrl: m.blobUrl,
+        })),
+      };
+
+      setActiveFileAction(detectedFileAction);
+
+      // If user specifically asked to scan folders or check a folder without indexed files
+      if (fileCmd.action === 'scan_folder') {
+        if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
+        if (query) setInitialFileSearch(query);
+        setActiveModal('files');
+      } else if (matched.length === 0 && indexedFiles.length === 0) {
+        setInitialFileSearch(query);
+        if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
+        setActiveModal('files');
+      } else if (matched.length > 0 && fileCmd.action === 'open') {
+        // Automatically open the best matched file
+        openOrDownloadFile(matched[0]);
+      } else if (query) {
+        setInitialFileSearch(query);
+        if (fileCmd.targetFolder) setInitialFolderFilter(fileCmd.targetFolder);
+        setActiveModal('files');
+      }
+    }
+
+    if (isDanceCommand) {
+      setIsDancing(true);
+      setForcedPose('waving_greeting');
+    } else if (isStopDanceCommand) {
+      setIsDancing(false);
+      setForcedPose(null);
+    }
+
+    if (isGreetingCommand) {
+      setIsGreeting(true);
+      setForcedPose('waving_greeting');
+    }
+
+    if (isLookDifferentDirections) {
+      setLookDirection('different_directions');
+    } else if (isLookLeft) {
+      setLookDirection('left');
+    } else if (isLookRight) {
+      setLookDirection('right');
+    } else if (isLookUp) {
+      setLookDirection('up');
+    } else if (isLookDown) {
+      setLookDirection('down');
+    } else if (isStopLooking) {
+      setLookDirection(null);
+    } else if (isGeneralStop && !isDanceCommand) {
+      setIsDancing(false);
+      setIsGreeting(false);
+      setLookDirection(null);
+      setForcedPose(null);
+    }
+
+    // Analyze user message sentiment immediately
+    const userEmotion = analyzeSentimentAndKeywords(text);
+
+    const userMsg: Message = {
+      id: 'msg_' + Date.now(),
+      role: 'user',
+      content: text.trim(),
+      timestamp: Date.now(),
+      expression: detectedWebAction || detectedFileAction ? 'happy_sparkle' : userEmotion.expression,
+      emotionData: userEmotion,
+      webAction: detectedWebAction || undefined,
+      fileAction: detectedFileAction || undefined,
+    };
+
+    let targetConvo = currentConversation;
+    let updatedConversations = [...conversations];
+
+    if (!targetConvo) {
+      targetConvo = {
+        id: 'convo_' + Date.now(),
+        title: text.slice(0, 24),
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        messages: [userMsg],
+      };
+      updatedConversations = [targetConvo, ...updatedConversations];
+      setActiveConvoId(targetConvo.id);
+      setActiveConversationId(targetConvo.id);
+    } else {
+      const updatedMessages = [...targetConvo.messages, userMsg];
+      const title =
+        targetConvo.title === 'New Conversation' || targetConvo.title === 'Late Evening Chat'
+          ? text.slice(0, 24)
+          : targetConvo.title;
+
+      targetConvo = {
+        ...targetConvo,
+        title,
+        updatedAt: Date.now(),
+        messages: updatedMessages,
+      };
+
+      updatedConversations = updatedConversations.map((c) =>
+        c.id === targetConvo!.id ? targetConvo! : c
+      );
+    }
+
+    setConversations(updatedConversations);
+    saveStoredConversations(updatedConversations);
+    setIsLoading(true);
+
+    // Krisha transitions into attentive listening mode with user context
+    setExpression(userEmotion.sentiment === 'teasing' ? 'playful_smirk' : 'listening_attentive');
+
+    // Call server Gemini chat API
+    try {
+      const res = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: targetConvo.messages.map((m) => ({
+            role: m.role,
+            content: m.content,
+          })),
+          memories,
+          userName: settings.userName,
+          companionNotes: settings.companionNotes,
+        }),
+      });
+
+      const data = await res.json();
+      const botReply = data.reply || "I'm right here with you.";
+      
+      // Compute best matched nuanced expression & micro-gesture
+      const clientAnalyzedEmotion = analyzeSentimentAndKeywords(botReply);
+      const serverExpression = data.expression ? normalizeExpression(data.expression) : clientAnalyzedEmotion.expression;
+
+      const mergedEmotionData: EmotionAnalysis = {
+        expression: serverExpression,
+        intensity: data.emotionData?.intensity ?? clientAnalyzedEmotion.intensity,
+        gesture: data.emotionData?.gesture ?? clientAnalyzedEmotion.gesture,
+        blushLevel: data.emotionData?.blushLevel ?? clientAnalyzedEmotion.blushLevel,
+        sentiment: clientAnalyzedEmotion.sentiment,
+      };
+
+      const botMsg: Message = {
+        id: 'msg_' + (Date.now() + 1),
+        role: 'model',
+        content: botReply,
+        timestamp: Date.now(),
+        expression: serverExpression,
+        emotionData: mergedEmotionData,
+        webAction: detectedWebAction || undefined,
+        fileAction: detectedFileAction || undefined,
+      };
+
+      const finalMessages = [...targetConvo.messages, botMsg];
+      const finalConvo = {
+        ...targetConvo,
+        updatedAt: Date.now(),
+        messages: finalMessages,
+      };
+
+      const finalConversations = updatedConversations.map((c) =>
+        c.id === finalConvo.id ? finalConvo : c
+      );
+
+      setConversations(finalConversations);
+      saveStoredConversations(finalConversations);
+      setExpression(serverExpression);
+      setEmotionData(mergedEmotionData);
+      setLastSpokenText(botReply);
+
+      // Trigger Voice TTS if enabled & animate talking
+      if (settings.voiceEnabled) {
+        speakKrishaText(
+          botReply,
+          settings.voiceName,
+          settings.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false)
+        );
+      } else {
+        setIsSpeaking(true);
+        const talkDuration = Math.min(6500, Math.max(2200, botReply.length * 45));
+        setTimeout(() => {
+          setIsSpeaking(false);
+        }, talkDuration);
+      }
+
+      // Asynchronously extract memory in the background
+      fetch('/api/memory/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage: text,
+          botMessage: botReply,
+          existingMemories: memories,
+        }),
+      })
+        .then((r) => r.json())
+        .then((memData) => {
+          if (memData.newMemories && memData.newMemories.length > 0) {
+            setMemories((prev) => {
+              const merged = [...memData.newMemories, ...prev];
+              saveStoredMemories(merged);
+              return merged;
+            });
+          }
+        })
+        .catch((err) => console.warn('Background memory extraction error:', err));
+    } catch (err) {
+      console.warn('Chat request fallback triggered:', err);
+      const fallbackReply = `I'm right here with you, ${settings.userName || 'you'}. Tell me more.`;
+      const fallbackEmotion = analyzeSentimentAndKeywords(fallbackReply);
+
+      const botMsg: Message = {
+        id: 'msg_' + (Date.now() + 1),
+        role: 'model',
+        content: fallbackReply,
+        timestamp: Date.now(),
+        expression: fallbackEmotion.expression,
+        emotionData: fallbackEmotion,
+      };
+
+      const finalMessages = [...targetConvo.messages, botMsg];
+      const finalConvo = {
+        ...targetConvo,
+        updatedAt: Date.now(),
+        messages: finalMessages,
+      };
+
+      const finalConversations = updatedConversations.map((c) =>
+        c.id === finalConvo.id ? finalConvo : c
+      );
+
+      setConversations(finalConversations);
+      saveStoredConversations(finalConversations);
+      setExpression(fallbackEmotion.expression);
+      setEmotionData(fallbackEmotion);
+      setLastSpokenText(fallbackReply);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleReplayVoice = (text: string) => {
+    // Replay voice and re-trigger emotion analysis
+    const emotion = analyzeSentimentAndKeywords(text);
+    setExpression(emotion.expression);
+    setEmotionData(emotion);
+
+    speakKrishaText(
+      text,
+      settings.voiceName,
+      settings.voiceSpeed,
+      () => setIsSpeaking(true),
+      () => setIsSpeaking(false)
+    );
+  };
+
+  // Wake-word detection state
+  const [wakeWordStatus, setWakeWordStatus] = useState<WakeWordStatus>('idle');
+  const [wakeWordDetectedAlert, setWakeWordDetectedAlert] = useState(false);
+  const [liveTranscript, setLiveTranscript] = useState('');
+
+  // Synchronize Krisha speaking state to mute self-triggering
+  useEffect(() => {
+    wakeWordManager.setKrishaSpeaking(isSpeaking);
+  }, [isSpeaking]);
+
+  // Keep a ref to handleSendMessage to avoid stale closures
+  const sendMessageRef = useRef(handleSendMessage);
+  useEffect(() => {
+    sendMessageRef.current = handleSendMessage;
+  });
+
+  // Handle Wake-Word "Krisha" / "Hey Krisha" detection
+  const handleWakeWordDetected = (res: WakeWordResult) => {
+    // 1. Play dual-tone crystal chime
+    if (settings.voiceEnabled) {
+      playWakeChime();
+    }
+
+    // 2. Alert animation
+    setWakeWordDetectedAlert(true);
+    setTimeout(() => setWakeWordDetectedAlert(false), 3500);
+
+    // 3. Automatically turn on Krisha! (Play greeting animation and attentive sparkling expression)
+    setIsGreeting(true);
+    setForcedPose('waving_greeting');
+    setExpression('happy_sparkle');
+    setEmotionData({
+      expression: 'happy_sparkle',
+      intensity: 0.9,
+      gesture: 'perk_up',
+      blushLevel: 0.35,
+      sentiment: 'positive',
+    });
+
+    // 4. If a command was spoken after her name:
+    if (res.command && res.command.trim().length > 1) {
+      sendMessageRef.current(res.command.trim());
+    } else {
+      // She was just called by name: "Krisha!" / "Hey Krisha"
+      const wakeGreetings = [
+        `I'm right here, ${settings.userName || 'darling'}! What can I do for you?`,
+        `Yes! I'm listening~ What's on your mind?`,
+        `Hey ${settings.userName || 'there'}! I'm wide awake and listening.`,
+      ];
+      const randomGreeting = wakeGreetings[Math.floor(Math.random() * wakeGreetings.length)];
+      setLastSpokenText(randomGreeting);
+
+      if (settings.voiceEnabled) {
+        speakKrishaText(
+          randomGreeting,
+          settings.voiceName,
+          settings.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false)
+        );
+      } else {
+        setIsSpeaking(true);
+        setTimeout(() => setIsSpeaking(false), 3000);
+      }
+    }
+  };
+
+  // Start continuous wake-word ambient listening when enabled
+  useEffect(() => {
+    if (settings.wakeWordEnabled !== false) {
+      wakeWordManager.startListening(
+        handleWakeWordDetected,
+        (status) => setWakeWordStatus(status),
+        (transcript) => setLiveTranscript(transcript)
+      );
+    } else {
+      wakeWordManager.stopListening();
+      setWakeWordStatus('idle');
+    }
+
+    return () => {
+      wakeWordManager.stopListening();
+    };
+  }, [settings.wakeWordEnabled, settings.voiceEnabled, settings.voiceName, settings.voiceSpeed, settings.userName]);
+
+  return (
+    <div
+      className={`flex flex-col sm:flex-row h-screen w-screen transition-colors duration-700 font-sans overflow-hidden select-none ${
+        isWhiteBackground ? 'bg-white text-slate-800' : 'bg-[#02040a] text-slate-300'
+      }`}
+    >
+      {/* 1. Immersive Left Sidebar Navigation (Desktop/Tablet) & Mobile Top Header */}
+      <SidebarNav
+        activeModal={activeModal}
+        onSelectModal={(modal) => setActiveModal(modal)}
+      />
+
+      {/* 2. Main Immersive Presence Screen */}
+      <main
+        ref={mainContainerRef}
+        onPointerMove={handlePointerMove}
+        className={`flex-1 flex flex-col relative overflow-hidden h-full transition-colors duration-700 ${
+          isWhiteBackground ? 'bg-white' : ''
+        }`}
+      >
+        {/* Top-Left Presence Header */}
+        <div className="absolute top-6 left-6 sm:top-10 sm:left-12 z-20 pointer-events-none">
+          <h1
+            className={`text-base sm:text-lg font-light tracking-[0.4em] uppercase transition-colors duration-700 ${
+              isWhiteBackground ? 'text-slate-800 font-medium' : 'text-blue-100/90'
+            }`}
+          >
+            Krisha
+          </h1>
+          <p
+            className={`text-[10px] uppercase tracking-widest mt-1 flex items-center gap-2 transition-colors duration-700 ${
+              isWhiteBackground ? 'text-blue-600 font-medium' : 'text-blue-400/70'
+            }`}
+          >
+            <span
+              className={`w-1.5 h-1.5 rounded-full ${
+                isWhiteBackground ? 'bg-blue-600 shadow-[0_0_8px_#2563eb]' : 'bg-blue-500 shadow-[0_0_8px_#3b82f6]'
+              } animate-pulse`}
+            />
+            <span>
+              {isDancing
+                ? 'Dancing Active'
+                : lookDirection === 'different_directions'
+                ? 'Looking in Different Directions'
+                : lookDirection
+                ? `Looking ${lookDirection.charAt(0).toUpperCase() + lookDirection.slice(1)}`
+                : 'Presence Active'}
+            </span>
+          </p>
+        </div>
+
+        {/* White Mode Exit / Stop Pill when dancing or looking */}
+        {isWhiteBackground && (
+          <div className="absolute top-6 right-6 sm:top-10 sm:right-12 z-20 pointer-events-auto">
+            <motion.button
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              onClick={() => {
+                setIsDancing(false);
+                setLookDirection(null);
+                setForcedPose(null);
+              }}
+              className="flex items-center gap-1.5 px-3.5 py-1.5 bg-slate-100 hover:bg-slate-200 border border-slate-300/80 rounded-full text-[11px] text-slate-700 hover:text-slate-900 transition-all shadow-[0_4px_12px_rgba(0,0,0,0.06)] cursor-pointer"
+              title="Restore normal dark background"
+            >
+              <span className="w-2 h-2 rounded-full bg-blue-600 animate-ping" />
+              <span>{isDancing ? 'Stop Dancing' : 'Reset View'}</span>
+            </motion.button>
+          </div>
+        )}
+
+        {/* Recenter Control when dragged (when not in white mode to avoid overlap) */}
+        {isMoved && !isWhiteBackground && (
+          <div className="absolute top-6 right-6 sm:top-10 sm:right-12 z-20 pointer-events-auto">
+            <motion.button
+              initial={{ opacity: 0, scale: 0.9 }}
+              animate={{ opacity: 1, scale: 1 }}
+              onClick={handleResetPosition}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-[#0b1020]/90 border border-blue-500/30 hover:border-blue-400/60 rounded-full text-[11px] text-blue-300 hover:text-white transition-all shadow-[0_0_15px_rgba(59,130,246,0.2)] cursor-pointer"
+              title="Recenter Krisha"
+            >
+              <RotateCcw className="w-3 h-3 text-blue-400" />
+              <span>Recenter</span>
+            </motion.button>
+          </div>
+        )}
+
+        {/* Central Full-Body 2D Character Figure (Movable & Draggable) */}
+        <div
+          className={`flex-1 flex items-center justify-center relative px-4 pt-10 sm:pt-4 overflow-hidden transition-colors duration-700 ${
+            isWhiteBackground ? 'bg-white' : 'bg-[#171722]'
+          }`}
+        >
+          <motion.div
+            key={avatarKey}
+            drag
+            dragConstraints={mainContainerRef}
+            dragElastic={0.15}
+            dragMomentum={true}
+            onDragStart={() => setIsMoved(true)}
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            whileDrag={{
+              scale: 1.03,
+              cursor: 'grabbing',
+              filter: 'drop-shadow(0 25px 35px rgba(0,0,0,0.75))',
+            }}
+            whileHover={{ scale: 1.01 }}
+            transition={{
+              scale: { type: 'spring', stiffness: 260, damping: 20 },
+              opacity: { duration: 0.6, ease: 'easeOut' },
+            }}
+            className="relative z-10 w-full max-w-[420px] h-[580px] flex flex-col items-center justify-end cursor-grab active:cursor-grabbing"
+          >
+            {/* Spoken / Dialogue Speech Bubble above Krisha */}
+            {lastSpokenText && (
+              <motion.div
+                key={lastSpokenText}
+                initial={{ opacity: 0, y: 8, scale: 0.95 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                transition={{ duration: 0.35 }}
+                className={`absolute top-2 sm:top-4 z-30 px-4 py-2.5 max-w-[280px] sm:max-w-xs rounded-2xl backdrop-blur-md flex flex-col items-center gap-1.5 pointer-events-auto transition-all duration-500 ${
+                  isWhiteBackground
+                    ? 'bg-white/95 border border-slate-200/90 shadow-[0_12px_32px_rgba(0,0,0,0.12)]'
+                    : 'bg-[#0b1022]/90 border border-blue-500/30 shadow-[0_8px_32px_rgba(0,0,0,0.8)]'
+                }`}
+              >
+                <p
+                  className={`text-xs font-normal italic leading-relaxed text-center transition-colors ${
+                    isWhiteBackground ? 'text-slate-800' : 'text-blue-100'
+                  }`}
+                >
+                  "{lastSpokenText}"
+                </p>
+                <div className="flex items-center gap-3">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      handleReplayVoice(lastSpokenText);
+                    }}
+                    className={`flex items-center gap-1 text-[10px] transition-colors cursor-pointer ${
+                      isWhiteBackground
+                        ? 'text-blue-600 hover:text-blue-800'
+                        : 'text-blue-400/80 hover:text-blue-200'
+                    }`}
+                    title="Listen to voice"
+                  >
+                    <Volume2 className="w-3 h-3" />
+                    <span>Replay Voice</span>
+                  </button>
+
+                  {activeWebAction && (
+                    <a
+                      href={activeWebAction.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      className={`flex items-center gap-1 text-[10px] font-medium transition-colors ${
+                        isWhiteBackground
+                          ? 'text-indigo-600 hover:text-indigo-800'
+                          : 'text-cyan-400 hover:text-cyan-200'
+                      }`}
+                      title={`Open ${activeWebAction.siteName}`}
+                    >
+                      <ExternalLink className="w-3 h-3" />
+                      <span>{activeWebAction.siteName}</span>
+                    </a>
+                  )}
+                </div>
+                {/* Speech Bubble Pointer Arrow */}
+                <div
+                  className={`absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45 transition-colors ${
+                    isWhiteBackground
+                      ? 'bg-white border-r border-b border-slate-200/90'
+                      : 'bg-[#0b1022] border-r border-b border-blue-500/30'
+                  }`}
+                />
+              </motion.div>
+            )}
+
+            {/* Dynamic Full-Body 2D Character Figure with Parallax & Micro-Movements */}
+            <KrishaAvatar
+              expression={expression}
+              emotionData={emotionData}
+              isSpeaking={isSpeaking}
+              isListening={isLoading}
+              isDancing={isDancing}
+              isGreeting={isGreeting}
+              lookDirection={lookDirection}
+              pointerPos={pointerPos}
+              forcedPose={forcedPose}
+              onPoseChange={setForcedPose}
+              onReact={handleAvatarReaction}
+            />
+          </motion.div>
+        </div>
+
+        {/* Bottom Direct Chat Input Bar (Directly on screen with Web Action & File Action Preview) */}
+        <div className="pb-5 sm:pb-7 flex flex-col items-center justify-center z-20 w-full px-4">
+          <WebActionCard
+            action={activeWebAction}
+            onDismiss={() => setActiveWebAction(null)}
+            isLightMode={isWhiteBackground}
+          />
+          <LocalFileActionCard
+            action={activeFileAction}
+            onDismiss={() => setActiveFileAction(null)}
+            onOpenFilesModal={() => {
+              if (activeFileAction?.query) setInitialFileSearch(activeFileAction.query);
+              setActiveModal('files');
+            }}
+            isLightMode={isWhiteBackground}
+          />
+          <DirectChatInput
+            onSendMessage={handleSendMessage}
+            onTypingChange={handleTypingReaction}
+            isLoading={isLoading}
+            isSpeaking={isSpeaking}
+            isLightMode={isWhiteBackground}
+            voiceEnabled={settings.voiceEnabled}
+            onToggleVoice={() =>
+              handleSaveSettings({ ...settings, voiceEnabled: !settings.voiceEnabled })
+            }
+            wakeWordEnabled={settings.wakeWordEnabled !== false}
+            onToggleWakeWord={() =>
+              handleSaveSettings({
+                ...settings,
+                wakeWordEnabled: !(settings.wakeWordEnabled !== false),
+              })
+            }
+            wakeWordStatus={wakeWordStatus}
+            wakeWordDetected={wakeWordDetectedAlert}
+            liveTranscript={liveTranscript}
+          />
+        </div>
+
+        {/* System Watermark / Minimal Indicator */}
+        <div
+          className={`absolute bottom-3 right-6 opacity-25 hover:opacity-50 transition-all text-[9px] tracking-widest uppercase font-mono select-none hidden sm:block pointer-events-none ${
+            isWhiteBackground ? 'text-slate-500' : 'text-blue-400/80'
+          }`}
+        >
+          System V.2.14 // Minimal Mode
+        </div>
+      </main>
+
+      {/* MODALS: 1. Previous Conversations, 2. Memory, 3. Settings, 4. Local Files */}
+      <ConversationsModal
+        isOpen={activeModal === 'conversations'}
+        onClose={() => setActiveModal(null)}
+        conversations={conversations}
+        activeConversationId={activeConvoId}
+        onSelectConversation={handleSelectConversation}
+        onNewConversation={handleNewConversation}
+        onDeleteConversation={handleDeleteConversation}
+      />
+
+      <MemoryModal
+        isOpen={activeModal === 'memory'}
+        onClose={() => setActiveModal(null)}
+        memories={memories}
+        onAddMemory={handleAddMemory}
+        onUpdateMemory={handleUpdateMemory}
+        onDeleteMemory={handleDeleteMemory}
+      />
+
+      <LocalFilesModal
+        isOpen={activeModal === 'files'}
+        onClose={() => {
+          setActiveModal(null);
+          setInitialFileSearch('');
+          setInitialFolderFilter('ALL');
+        }}
+        initialSearchQuery={initialFileSearch}
+        initialFolderFilter={initialFolderFilter}
+        onSelectFile={(file) => {
+          // Speak or acknowledge file
+          setLastSpokenText(`Opening ${file.name} for you.`);
+        }}
+      />
+
+      <SettingsModal
+        isOpen={activeModal === 'settings'}
+        onClose={() => setActiveModal(null)}
+        settings={settings}
+        onSaveSettings={handleSaveSettings}
+        onResetAllData={handleResetAllData}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Krisha",
+  "description": "A minimal, dark blue-black AI companion with persistent memory, conversation history, voice interaction, and local computer storage file searching and opening.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

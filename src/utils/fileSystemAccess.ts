@@ -503,6 +503,30 @@ export function parseFileCommand(text: string): {
     };
   }
 
+  // Direct file with extension: e.g. "open resume.pdf", "open document.pdf", "view notes.txt"
+  const directFileWithExtRegex = /\b(?:open|show|view|get|pull\s+up|load)\s+(?:a\s+|the\s+|my\s+)?([a-z0-9_\-\s]+\.(?:pdf|txt|md|docx?|json|js|ts|tsx|py|csv|png|jpe?g|webp))\b/i;
+  const matchDirectFile = clean.match(directFileWithExtRegex);
+  if (matchDirectFile) {
+    return {
+      isFileCommand: true,
+      targetQuery: matchDirectFile[1].trim(),
+      targetFolder: null,
+      action: 'open',
+    };
+  }
+
+  // Direct PDF or document opening: e.g. "open pdf", "open my pdf", "open the pdf", "open documents", "open files"
+  const directPdfOrDocRegex = /\b(?:open|show|view|display|launch|load)\s+(?:a\s+|the\s+|my\s+)?(?:pdf|pdfs|document|documents|file|files)\b/i;
+  if (directPdfOrDocRegex.test(clean)) {
+    const isPdfMention = /\bpdfs?\b/i.test(clean);
+    return {
+      isFileCommand: true,
+      targetQuery: isPdfMention ? 'pdf' : null,
+      targetFolder: null,
+      action: 'open',
+    };
+  }
+
   // Open / search specific file
   const fileOpenRegex = /\b(?:open|search|find|lookup|locate|view|show|get)\s+(?:a\s+|the\s+|my\s+)?(?:file|document|doc|pdf|folder|code|image|photo|video)\s+(?:named|called|for|about|with\s+name)?\s*([^\n\r.]+.*)?/i;
   const directFileSearchRegex = /\b(?:search|find|check)\s+(?:my\s+)?(?:computer|pc|disk|drive|storage|laptop|desktop|memory)\s+(?:for\s+)?(.+)/i;
@@ -510,11 +534,12 @@ export function parseFileCommand(text: string): {
 
   const m3 = clean.match(openFileFromComputerRegex);
   if (m3) {
+    const isExplicitOpen = /\bopen\b/i.test(clean);
     return {
       isFileCommand: true,
       targetQuery: m3[1] ? m3[1].replace(/^(?:named|called|for)\s+/i, '').trim() : null,
       targetFolder: null,
-      action: 'search',
+      action: isExplicitOpen ? 'open' : 'search',
     };
   }
 
@@ -532,11 +557,12 @@ export function parseFileCommand(text: string): {
   if (m1) {
     const rawTarget = m1[1] ? m1[1].trim() : '';
     if (!/^(youtube|google|reddit|spotify|twitter|netflix|wikipedia|dancing|dance|directions|left|right|around)/i.test(rawTarget)) {
+      const isExplicitOpen = /^\s*open\b/i.test(clean);
       return {
         isFileCommand: true,
         targetQuery: rawTarget.length > 0 ? rawTarget : null,
         targetFolder: null,
-        action: 'search',
+        action: isExplicitOpen ? 'open' : 'search',
       };
     }
   }

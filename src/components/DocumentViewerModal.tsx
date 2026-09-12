@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   X,
@@ -19,7 +19,6 @@ import {
   ZoomIn,
   ZoomOut,
   Upload,
-  BookOpen,
   LayoutTemplate,
   FileCode,
 } from 'lucide-react';
@@ -45,8 +44,20 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
   const [copied, setCopied] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [zoomLevel, setZoomLevel] = useState(100);
-  const [viewMode, setViewMode] = useState<'formatted' | 'embedded' | 'text'>('formatted');
+  const [viewMode, setViewMode] = useState<'formatted' | 'embedded' | 'text'>(
+    file?.extension.toLowerCase() === 'pdf' ? 'embedded' : 'formatted'
+  );
   const [isUploading, setIsUploading] = useState(false);
+
+  useEffect(() => {
+    if (file) {
+      const isPdfDoc =
+        file.extension.toLowerCase() === 'pdf' ||
+        file.type === 'application/pdf' ||
+        file.name.toLowerCase().endsWith('.pdf');
+      setViewMode(isPdfDoc ? 'embedded' : 'formatted');
+    }
+  }, [file]);
 
   if (!isOpen || !file) return null;
 
@@ -54,6 +65,18 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
     file.extension.toLowerCase() === 'pdf' ||
     file.type === 'application/pdf' ||
     file.name.toLowerCase().endsWith('.pdf');
+
+  const activeBlobUrl = React.useMemo(() => {
+    if (file.blobUrl) return file.blobUrl;
+    if (file.fileRef instanceof Blob) {
+      try {
+        return URL.createObjectURL(file.fileRef);
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  }, [file]);
 
   const isImage =
     ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(file.extension.toLowerCase()) ||
@@ -169,8 +192,8 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
 
             {/* Viewer Controls */}
             <div className="flex items-center gap-1.5 shrink-0">
-              {/* PDF View Mode Tabs */}
-              {isPdf && (
+              {/* Text/Code View Mode Tabs */}
+              {!isPdf && isTextOrCode && (
                 <div className="hidden sm:flex items-center gap-1 bg-blue-950/60 p-0.5 rounded-lg border border-blue-900/40 text-xs mr-1">
                   <button
                     type="button"
@@ -181,23 +204,9 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
                         : 'text-slate-400 hover:text-slate-200'
                     }`}
                   >
-                    <BookOpen className="w-3 h-3" />
-                    <span>Page Reader</span>
+                    <LayoutTemplate className="w-3 h-3" />
+                    <span>Formatted</span>
                   </button>
-                  {file.blobUrl && (
-                    <button
-                      type="button"
-                      onClick={() => setViewMode('embedded')}
-                      className={`px-2 py-1 rounded-md transition-colors flex items-center gap-1 ${
-                        viewMode === 'embedded'
-                          ? 'bg-blue-600 text-white font-medium shadow-sm'
-                          : 'text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      <LayoutTemplate className="w-3 h-3" />
-                      <span>Native Plugin</span>
-                    </button>
-                  )}
                   <button
                     type="button"
                     onClick={() => setViewMode('text')}
@@ -208,7 +217,7 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
                     }`}
                   >
                     <FileCode className="w-3 h-3" />
-                    <span>Text</span>
+                    <span>Raw Text</span>
                   </button>
                 </div>
               )}
@@ -290,96 +299,52 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
           {/* Document Content Canvas */}
           <div className="flex-1 overflow-y-auto relative bg-[#02050c] flex flex-col items-center justify-start p-4 sm:p-6 md:p-8">
             {isPdf ? (
-              viewMode === 'embedded' && file.blobUrl ? (
+              activeBlobUrl ? (
                 <div
-                  className="w-full h-full min-h-[500px] border-0 bg-white rounded-xl shadow-2xl overflow-hidden"
+                  className="w-full h-full min-h-[520px] border border-blue-900/40 bg-slate-900 rounded-xl shadow-2xl overflow-hidden flex flex-col"
                   style={{ transform: `scale(${zoomLevel / 100})`, transformOrigin: 'top center' }}
                 >
                   <object
-                    data={`${file.blobUrl}#toolbar=1&navpanes=0`}
+                    data={`${activeBlobUrl}#toolbar=1&navpanes=0`}
                     type="application/pdf"
-                    className="w-full h-full min-h-[550px]"
+                    className="w-full h-full min-h-[580px] flex-1"
                   >
                     <iframe
-                      src={`${file.blobUrl}#zoom=${zoomLevel}`}
+                      src={`${activeBlobUrl}#zoom=${zoomLevel}`}
                       title={file.name}
-                      className="w-full h-full min-h-[550px] border-0 bg-white"
+                      className="w-full h-full min-h-[580px] border-0 bg-white"
                     />
                   </object>
                 </div>
-              ) : viewMode === 'text' ? (
-                <div
-                  className="w-full max-w-3xl bg-[#080d1e] border border-blue-900/40 rounded-xl p-6 text-slate-200 font-mono text-xs leading-relaxed whitespace-pre-wrap shadow-2xl"
-                  style={{ transform: `scale(${zoomLevel / 100})`, transformOrigin: 'top center' }}
-                >
-                  {file.previewText || 'No text extracted.'}
-                </div>
               ) : (
-                /* High-Fidelity Formatted PDF Page Reader (100% Reliable in any browser / iframe) */
-                <div
-                  className="w-full max-w-2xl bg-white text-slate-900 rounded-xl shadow-[0_15px_50px_rgba(0,0,0,0.6)] p-6 sm:p-10 border border-slate-200/80 transition-transform duration-200 font-sans my-2"
-                  style={{ transform: `scale(${zoomLevel / 100})`, transformOrigin: 'top center' }}
-                >
-                  {/* PDF Document Header */}
-                  <div className="border-b-2 border-rose-500 pb-4 mb-6 flex items-start justify-between">
-                    <div>
-                      <span className="text-[10px] font-bold tracking-widest text-rose-600 uppercase font-mono">
-                        PDF DOCUMENT • ARCHIVE FORMAT
-                      </span>
-                      <h1 className="text-xl sm:text-2xl font-extrabold text-slate-900 mt-1 leading-tight">
-                        {file.name.replace(/\.pdf$/i, '').replace(/_/g, ' ')}
-                      </h1>
-                      <p className="text-xs text-slate-500 mt-1 font-mono">
-                        Location: {file.folderPath || file.folderName} • Size: {formatFileSize(file.size)} • Last Updated:{' '}
-                        {new Date(file.lastModified).toLocaleDateString()}
-                      </p>
-                    </div>
-                    <div className="px-3 py-1 bg-rose-50 border border-rose-200 rounded-lg text-rose-700 text-xs font-bold font-mono">
-                      PDF
-                    </div>
+                <div className="w-full max-w-lg bg-[#080d1e] border border-blue-900/40 rounded-2xl p-8 text-center flex flex-col items-center justify-center shadow-2xl my-auto">
+                  <div className="w-16 h-16 rounded-2xl bg-rose-500/10 border border-rose-500/25 flex items-center justify-center mb-4 text-rose-400">
+                    <FileText className="w-8 h-8" />
                   </div>
-
-                  {/* Rendered Document Body */}
-                  <div className="space-y-4 text-slate-800 text-sm leading-relaxed">
-                    {file.previewText ? (
-                      file.previewText.split('\n').map((line, idx) => {
-                        const trimmed = line.trim();
-                        if (!trimmed) {
-                          return <div key={idx} className="h-2" />;
-                        }
-                        if (trimmed.startsWith('# ') || trimmed.endsWith(':')) {
-                          return (
-                            <h2
-                              key={idx}
-                              className="text-base font-bold text-slate-900 mt-4 pb-1 border-b border-slate-100 uppercase tracking-wide text-blue-900"
-                            >
-                              {trimmed.replace(/^#\s*/, '')}
-                            </h2>
-                          );
-                        }
-                        if (trimmed.startsWith('- ') || trimmed.startsWith('• ') || /^\d+\.\s/.test(trimmed)) {
-                          return (
-                            <div key={idx} className="flex items-start gap-2 pl-2">
-                              <span className="text-blue-600 font-bold">•</span>
-                              <span className="text-slate-700">{trimmed.replace(/^[-•\d.]\s*/, '')}</span>
-                            </div>
-                          );
-                        }
-                        return (
-                          <p key={idx} className="text-slate-700 leading-relaxed">
-                            {trimmed}
-                          </p>
-                        );
-                      })
-                    ) : (
-                      <p className="text-slate-600 italic">Document ready for viewing.</p>
-                    )}
-                  </div>
-
-                  {/* PDF Document Footer */}
-                  <div className="mt-10 pt-4 border-t border-slate-200 flex items-center justify-between text-[11px] text-slate-400 font-mono">
-                    <span>Krisha AI Companion Document Bridge</span>
-                    <span>Page 1 of 1 • Verified Storage</span>
+                  <span className="text-[10px] font-bold tracking-widest text-rose-500 uppercase font-mono mb-1">
+                    PDF Document
+                  </span>
+                  <h2 className="text-base font-bold text-slate-100 mb-1">{file.name}</h2>
+                  <p className="text-xs text-slate-400 mb-6 font-mono">
+                    Location: {file.folderPath || file.folderName} • Size: {formatFileSize(file.size)}
+                  </p>
+                  <div className="flex flex-wrap items-center justify-center gap-3">
+                    <button
+                      type="button"
+                      onClick={handleExternalOpen}
+                      className="flex items-center gap-2 px-5 py-2.5 rounded-xl bg-gradient-to-r from-rose-600 to-pink-600 hover:from-rose-500 hover:to-pink-500 text-white text-xs font-semibold uppercase tracking-wider transition-all shadow-lg shadow-rose-600/25 cursor-pointer"
+                    >
+                      <ExternalLink className="w-4 h-4" />
+                      <span>Open PDF in Browser Tab</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handlePickLocalPdf}
+                      className="flex items-center gap-2 px-4 py-2.5 rounded-xl bg-blue-950/80 hover:bg-blue-900 border border-blue-800/40 text-blue-200 text-xs font-semibold uppercase tracking-wider transition-all cursor-pointer"
+                    >
+                      <Upload className="w-4 h-4" />
+                      <span>Choose / Upload PDF</span>
+                    </button>
                   </div>
                 </div>
               )

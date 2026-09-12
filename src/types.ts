@@ -67,6 +67,47 @@ export interface LaptopAppAction {
   description?: string;
 }
 
+export interface UserLocation {
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  formattedAddress?: string;
+  city?: string;
+  neighborhood?: string;
+  state?: string;
+  country?: string;
+  postalCode?: string;
+  street?: string;
+  googleMapsUrl: string;
+  embedUrl?: string;
+  source?: string;
+  timestamp: number;
+  googleMapsPriority?: boolean;
+  usedAlternative?: boolean;
+  mapsFailureReason?: string;
+  gpsFailureReason?: string;
+}
+
+export interface MapsLocationAction {
+  type: 'current_location' | 'search_place' | 'directions';
+  lat?: number;
+  lng?: number;
+  accuracy?: number;
+  formattedAddress?: string;
+  city?: string;
+  neighborhood?: string;
+  country?: string;
+  googleMapsUrl: string;
+  embedUrl?: string;
+  query?: string;
+  destination?: string;
+  googleMapsPriority?: boolean;
+  usedAlternative?: boolean;
+  source?: string;
+  mapsFailureReason?: string;
+  gpsFailureReason?: string;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -77,6 +118,7 @@ export interface Message {
   webAction?: WebAction;
   fileAction?: LocalFileAction;
   appAction?: LaptopAppAction;
+  mapsAction?: MapsLocationAction;
 }
 
 export interface Conversation {
@@ -96,4 +138,4 @@ export interface CompanionSettings {
   companionNotes: string;
 }
 
-export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer';
+export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer' | 'location' | 'web_browser';

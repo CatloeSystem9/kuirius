@@ -21,12 +21,14 @@ export interface KrishaAvatarProps {
   isListening?: boolean;
   isDancing?: boolean;
   isGreeting?: boolean;
+  isThanked?: boolean;
   lookDirection?: 'different_directions' | 'left' | 'right' | 'up' | 'down' | 'around' | null;
   pointerPos?: { x: number; y: number };
   forcedPose?: VideoAnimationPose | null;
   onPoseChange?: (pose: VideoAnimationPose) => void;
   onReact?: (type: 'head' | 'heart' | 'wave') => void;
   onGreetingComplete?: () => void;
+  onThankComplete?: () => void;
 }
 
 export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
@@ -35,17 +37,20 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
   isSpeaking,
   isDancing = false,
   isGreeting = false,
+  isThanked = false,
   lookDirection = null,
   pointerPos = { x: 0, y: 0 },
   forcedPose = null,
   onPoseChange,
   onReact,
   onGreetingComplete,
+  onThankComplete,
 }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [videoError, setVideoError] = useState(false);
   const [patReaction, setPatReaction] = useState<'none' | 'head' | 'heart' | 'wave'>('none');
   const [internalGreetingPlaying, setInternalGreetingPlaying] = useState(false);
+  const [internalThankPlaying, setInternalThankPlaying] = useState(false);
   const [sparkleCount, setSparkleCount] = useState(0);
 
   // Sync greeting trigger state to ensure it plays only once per trigger
@@ -55,10 +60,18 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
     }
   }, [isGreeting, patReaction, forcedPose]);
 
+  // Sync thank reaction trigger
+  useEffect(() => {
+    if (isThanked) {
+      setInternalThankPlaying(true);
+    }
+  }, [isThanked]);
+
   // Determine active greeting/looking flags
   const isGreetingActive =
     internalGreetingPlaying &&
     (isGreeting || patReaction === 'wave' || forcedPose === 'waving_greeting');
+  const isThankActive = internalThankPlaying && isThanked;
   const isLookingActive = Boolean(lookDirection);
 
   // Expression normalization
@@ -113,6 +126,9 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
     if (isDancing) {
       return '/assets/videos/ANIME%20GIRL%20DANCING.mp4';
     }
+    if (isThankActive) {
+      return '/assets/videos/ANIME%20GIRL%20REACTING%20AFTER%20GETTING%20THANKED%20BY%20USER.mp4';
+    }
     if (isLookingActive) {
       return '/assets/videos/ANIME%20GIRL%20LOOKING%20IN%20DIFFRENT%20DIRECTIONS.mp4';
     }
@@ -123,17 +139,23 @@ export const KrishaAvatar: React.FC<KrishaAvatarProps> = ({
       return '/assets/videos/ANIME%20GIRL%20TALKING.mp4';
     }
     return '/assets/videos/ANIME%20GIRL%20STANDING%20QUIETLY.mp4';
-  }, [isDancing, isLookingActive, isGreetingActive, isSpeaking]);
+  }, [isDancing, isThankActive, isLookingActive, isGreetingActive, isSpeaking]);
 
-  const isGreetingVideo = activeVideoSrc.includes('GREETING');
-  const shouldLoopVideo = !isGreetingVideo; // Stand quietly loops; greeting video runs strictly ONCE
+  const isOneShotVideo = activeVideoSrc.includes('GREETING') || activeVideoSrc.includes('THANKED');
+  const shouldLoopVideo = !isOneShotVideo; // Stand quietly and talking loops; greeting and thanked runs strictly once
 
   const handleVideoEnded = () => {
-    if (isGreetingVideo || isGreetingActive) {
+    if (isGreetingActive || activeVideoSrc.includes('GREETING')) {
       setInternalGreetingPlaying(false);
       setPatReaction('none');
       if (onGreetingComplete) {
         onGreetingComplete();
+      }
+    }
+    if (isThankActive || activeVideoSrc.includes('THANKED')) {
+      setInternalThankPlaying(false);
+      if (onThankComplete) {
+        onThankComplete();
       }
     }
   };

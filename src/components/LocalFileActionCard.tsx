@@ -166,7 +166,7 @@ export const LocalFileActionCard: React.FC<LocalFileActionCardProps> = ({
               }`}
             >
               <FileText className="w-3.5 h-3.5" />
-              <span>{isPdf ? 'Read PDF' : 'Open File'}</span>
+              <span>{isPdf ? 'Open PDF' : 'Open File'}</span>
             </button>
           ) : (
             <button

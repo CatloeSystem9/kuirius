@@ -11,6 +11,8 @@ import {
   WebAction,
   LocalFileAction,
   LaptopAppAction,
+  MapsLocationAction,
+  UserLocation,
 } from './types';
 import {
   getStoredSettings,
@@ -32,6 +34,18 @@ import {
   launchLaptopApp,
   LaptopApp,
 } from './utils/appLauncher';
+import {
+  getStoredLocation,
+  detectBackgroundLocation,
+  requestBrowserGps,
+  acquireFreshGpsLocationAndAddress,
+  acquireLocationWithPriority,
+  isLocationIntent,
+  shouldOpenGoogleMaps,
+  parseLocationStatement,
+  geocodeAddress,
+  buildMapsActionFromLocation,
+} from './utils/locationService';
 import { wakeWordManager, WakeWordResult, WakeWordStatus } from './utils/wakeWordListener';
 import {
   parseFileCommand,
@@ -52,7 +66,10 @@ import { DirectChatInput } from './components/DirectChatInput';
 import { WebActionCard } from './components/WebActionCard';
 import { LocalFileActionCard } from './components/LocalFileActionCard';
 import { AppActionCard } from './components/AppActionCard';
+import { MapsLocationCard } from './components/MapsLocationCard';
+import { LocationDetailsModal } from './components/LocationDetailsModal';
 import { DocumentViewerModal } from './components/DocumentViewerModal';
+import { WebBrowserModal } from './components/WebBrowserModal';
 
 export default function App() {
   // State
@@ -66,6 +83,11 @@ export default function App() {
   const [initialFolderFilter, setInitialFolderFilter] = useState<string>('ALL');
   const [activeViewerFile, setActiveViewerFile] = useState<LocalIndexedFile | null>(null);
   const [availableIndexedFiles, setAvailableIndexedFiles] = useState<LocalIndexedFile[]>([]);
+
+  // Background Google Maps Location State
+  const [userLocation, setUserLocation] = useState<UserLocation | null>(getStoredLocation);
+  const [activeLocationAction, setActiveLocationAction] = useState<MapsLocationAction | null>(null);
+  const [isRefreshingLocation, setIsRefreshingLocation] = useState(false);
 
   // Dynamic Avatar Expression State
   const [expression, setExpression] = useState<AvatarExpression>('gentle_smile');
@@ -81,6 +103,7 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isDancing, setIsDancing] = useState(false);
   const [isGreeting, setIsGreeting] = useState(false);
+  const [isThanked, setIsThanked] = useState(false);
   const [lookDirection, setLookDirection] = useState<'different_directions' | 'left' | 'right' | 'up' | 'down' | 'around' | null>(null);
   const [lastSpokenText, setLastSpokenText] = useState<string>('It feels different when we\'re together...');
   const [forcedPose, setForcedPose] = useState<VideoAnimationPose | null>(null);
@@ -121,11 +144,57 @@ export default function App() {
     return () => clearTimeout(timer);
   }, [isGreeting, forcedPose, isSpeaking]);
 
+  // Auto-reset thank-you reaction after completion
+  useEffect(() => {
+    if (!isThanked) return;
+
+    const timeoutDuration = isSpeaking ? 5200 : 4000;
+    const timer = setTimeout(() => {
+      setIsThanked(false);
+    }, timeoutDuration);
+
+    return () => clearTimeout(timer);
+  }, [isThanked, isSpeaking]);
+
+  // Only load stored verified location on mount; no continuous tracking
+  useEffect(() => {
+    let isMounted = true;
+    detectBackgroundLocation().then((loc) => {
+      if (isMounted && loc) {
+        setUserLocation(loc);
+      }
+    });
+
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  const handleRefreshLocation = async () => {
+    setIsRefreshingLocation(true);
+    try {
+      const fresh = await acquireFreshGpsLocationAndAddress();
+      if (fresh.location) {
+        setUserLocation(fresh.location);
+        const action = buildMapsActionFromLocation(fresh.location);
+        setActiveLocationAction(action);
+      }
+    } catch (err) {
+      console.warn('Manual GPS refresh attempt failed:', err);
+    } finally {
+      setIsRefreshingLocation(false);
+    }
+  };
+
   const handleGreetingComplete = () => {
     setIsGreeting(false);
     if (forcedPose === 'waving_greeting') {
       setForcedPose(null);
     }
+  };
+
+  const handleThankComplete = () => {
+    setIsThanked(false);
   };
 
   // Movable avatar and parallax pointer tracking
@@ -409,6 +478,9 @@ export default function App() {
     // Check for greeting command or greeting words
     const isGreetingCommand = /\b(greet(\s+me)?|greeting|greetings|hello|hi|hey|good\s+morning|good\s+afternoon|good\s+evening|wave(\s+at\s+me|\s+to\s+me)?|say\s+hi|say\s+hello|welcome|howdy|sup|salute)\b/i.test(text);
 
+    // Check for thank you command or appreciation words
+    const isThankCommand = /\b(thank\s+you|thanks|thank\s+u|thx|arigato|appreciate\s+(you|it)|grateful|good\s+job|great\s+job)\b/i.test(text);
+
     // Check for looking in different directions commands
     const isLookDifferentDirections = /\b(look\s+(in\s+|at\s+)?(different|various|all|multiple|other)\s+directions?|look\s+around|look\s+everywhere|look\s+around\s+you|look\s+in\s+all\s+directions|turn\s+around)\b/i.test(text);
     const isLookLeft = /\b(look\s+(to\s+the\s+|to\s+)?left|turn\s+(to\s+the\s+|to\s+)?left|turn\s+left)\b/i.test(text);
@@ -419,11 +491,19 @@ export default function App() {
     const isGeneralStop = /\b(stop|halt|pause|sit\s+down|reset)\b/i.test(text);
 
     // Check for web action (open website / search within site)
-    const detectedWebAction = detectAndParseWebAction(text);
+    let detectedWebAction = detectAndParseWebAction(text);
     if (detectedWebAction) {
       setActiveWebAction(detectedWebAction);
       openExternalUrl(detectedWebAction.url);
       setForcedPose('waving_greeting');
+      // If user specifically asked to browse websites or expressed difficulty opening websites
+      if (
+        /\b(unable|can't|cannot|not\s+able|websites?\s+like\s+youtube|open\s+websites?|open\s+browser|open\s+web)\b/i.test(
+          text
+        )
+      ) {
+        setActiveModal('web_browser');
+      }
     }
 
     // Check for native laptop app launch commands (e.g. "open spotify on my laptop", "open vs code", "launch discord")
@@ -472,7 +552,7 @@ export default function App() {
       let matched = searchLocalFiles(query, folderFilter, indexedFiles);
 
       // Prioritize PDF files if PDF was requested or query is generic
-      if (fileCmd.fileTypeFilter === 'pdf' || text.toLowerCase().includes('pdf')) {
+      if (text.toLowerCase().includes('pdf') || query.toLowerCase().includes('pdf')) {
         const pdfOnly = matched.filter(
           (m) => m.extension.toLowerCase() === 'pdf' || m.type === 'application/pdf'
         );
@@ -539,6 +619,10 @@ export default function App() {
       setForcedPose('waving_greeting');
     }
 
+    if (isThankCommand) {
+      setIsThanked(true);
+    }
+
     if (isLookDifferentDirections) {
       setLookDirection('different_directions');
     } else if (isLookLeft) {
@@ -554,8 +638,67 @@ export default function App() {
     } else if (isGeneralStop && !isDanceCommand) {
       setIsDancing(false);
       setIsGreeting(false);
+      setIsThanked(false);
       setLookDirection(null);
       setForcedPose(null);
+    }
+
+    // Check for explicit user location declaration (e.g. "I am in Pune", "I live in Mumbai", "Set location to New York")
+    const statedLocationQuery = parseLocationStatement(text);
+    let currentActiveLocation = userLocation;
+    let detectedMapsAction: MapsLocationAction | null = null;
+    let locationAcquisitionError: string | null = null;
+    const isLocationQuery = isLocationIntent(text);
+    const wantsToOpenMaps = shouldOpenGoogleMaps(text);
+
+    if (statedLocationQuery) {
+      try {
+        const resolvedLoc = await geocodeAddress(statedLocationQuery);
+        if (resolvedLoc) {
+          currentActiveLocation = resolvedLoc;
+          setUserLocation(resolvedLoc);
+          detectedMapsAction = buildMapsActionFromLocation(resolvedLoc);
+          setActiveLocationAction(detectedMapsAction);
+          setForcedPose('waving_greeting');
+
+          if (wantsToOpenMaps && resolvedLoc.googleMapsUrl) {
+            try {
+              window.open(resolvedLoc.googleMapsUrl, '_blank', 'noopener,noreferrer');
+            } catch (openErr) {
+              console.warn('Popup blocked or failed to open tab:', openErr);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Failed to geocode stated location:', err);
+      }
+    } else if (isLocationQuery) {
+      // User asked to check location or open Google Maps:
+      // FIRST PRIORITY: Google Maps! Pinpointing user's position through Google Maps with high accuracy.
+      // ALTERNATIVES: Only if Google Maps (First Priority) fails, uses network/IP geolocation alternatives.
+      try {
+        const priorityResult = await acquireLocationWithPriority();
+        if (priorityResult.location) {
+          currentActiveLocation = priorityResult.location;
+          setUserLocation(priorityResult.location);
+          detectedMapsAction = buildMapsActionFromLocation(priorityResult.location);
+          setActiveLocationAction(detectedMapsAction);
+          setForcedPose('waving_greeting');
+
+          if (wantsToOpenMaps && priorityResult.location.googleMapsUrl) {
+            try {
+              window.open(priorityResult.location.googleMapsUrl, '_blank', 'noopener,noreferrer');
+            } catch (openErr) {
+              console.warn('Popup blocked or failed to open tab:', openErr);
+            }
+          }
+        } else if (priorityResult.googleMapsError) {
+          locationAcquisitionError = priorityResult.googleMapsError;
+        }
+      } catch (err: any) {
+        console.warn('Google Maps location acquisition error:', err);
+        locationAcquisitionError = err?.message || 'Could not acquire location via Google Maps.';
+      }
     }
 
     // Analyze user message sentiment immediately
@@ -567,13 +710,14 @@ export default function App() {
       content: text.trim(),
       timestamp: Date.now(),
       expression:
-        detectedWebAction || detectedFileAction || detectedAppAction
+        detectedWebAction || detectedFileAction || detectedAppAction || detectedMapsAction
           ? 'happy_sparkle'
           : userEmotion.expression,
       emotionData: userEmotion,
       webAction: detectedWebAction || undefined,
       fileAction: detectedFileAction || undefined,
       appAction: detectedAppAction || undefined,
+      mapsAction: detectedMapsAction || undefined,
     };
 
     let targetConvo = currentConversation;
@@ -629,6 +773,10 @@ export default function App() {
           memories,
           userName: settings.userName,
           companionNotes: settings.companionNotes,
+          userLocation: currentActiveLocation || undefined,
+          locationError: locationAcquisitionError || undefined,
+          isExplicitLocationQuery: isLocationQuery,
+          wantsToOpenMaps,
         }),
       });
 
@@ -647,6 +795,13 @@ export default function App() {
         sentiment: clientAnalyzedEmotion.sentiment,
       };
 
+      const resolvedWebAction = detectedWebAction || data.webAction || null;
+      if (resolvedWebAction && !detectedWebAction) {
+        detectedWebAction = resolvedWebAction;
+        setActiveWebAction(resolvedWebAction);
+        openExternalUrl(resolvedWebAction.url);
+      }
+
       const botMsg: Message = {
         id: 'msg_' + (Date.now() + 1),
         role: 'model',
@@ -654,8 +809,10 @@ export default function App() {
         timestamp: Date.now(),
         expression: serverExpression,
         emotionData: mergedEmotionData,
-        webAction: detectedWebAction || undefined,
+        webAction: resolvedWebAction || undefined,
         fileAction: detectedFileAction || undefined,
+        appAction: detectedAppAction || undefined,
+        mapsAction: detectedMapsAction || undefined,
       };
 
       const finalMessages = [...targetConvo.messages, botMsg];
@@ -858,6 +1015,7 @@ export default function App() {
       <SidebarNav
         activeModal={activeModal}
         onSelectModal={(modal) => setActiveModal(modal)}
+        location={userLocation}
       />
 
       {/* 2. Main Immersive Presence Screen */}
@@ -1036,12 +1194,14 @@ export default function App() {
               isListening={isLoading}
               isDancing={isDancing}
               isGreeting={isGreeting}
+              isThanked={isThanked}
               lookDirection={lookDirection}
               pointerPos={pointerPos}
               forcedPose={forcedPose}
               onPoseChange={setForcedPose}
               onReact={handleAvatarReaction}
               onGreetingComplete={handleGreetingComplete}
+              onThankComplete={handleThankComplete}
             />
           </motion.div>
         </div>
@@ -1051,6 +1211,7 @@ export default function App() {
           <WebActionCard
             action={activeWebAction}
             onDismiss={() => setActiveWebAction(null)}
+            onOpenBrowserModal={() => setActiveModal('web_browser')}
             isLightMode={isWhiteBackground}
           />
           <LocalFileActionCard
@@ -1075,6 +1236,12 @@ export default function App() {
               }
               setActiveModal('apps');
             }}
+            isLightMode={isWhiteBackground}
+          />
+          <MapsLocationCard
+            action={activeLocationAction}
+            onDismiss={() => setActiveLocationAction(null)}
+            onChangeLocation={() => setActiveModal('location')}
             isLightMode={isWhiteBackground}
           />
           <DirectChatInput
@@ -1187,6 +1354,35 @@ export default function App() {
         settings={settings}
         onSaveSettings={handleSaveSettings}
         onResetAllData={handleResetAllData}
+      />
+
+      <LocationDetailsModal
+        isOpen={activeModal === 'location'}
+        onClose={() => setActiveModal(null)}
+        location={userLocation}
+        onRefreshLocation={handleRefreshLocation}
+        onUpdateLocation={(newLoc) => {
+          setUserLocation(newLoc);
+          setActiveLocationAction(buildMapsActionFromLocation(newLoc));
+        }}
+        isRefreshing={isRefreshingLocation}
+        onAskKrishaLocation={() => {
+          setActiveModal(null);
+          handleSendMessage("Where am I right now?");
+        }}
+        isLightMode={isWhiteBackground}
+      />
+
+      <WebBrowserModal
+        isOpen={activeModal === 'web_browser'}
+        onClose={() => setActiveModal(null)}
+        activeAction={activeWebAction}
+        onLaunchWebsite={(action) => {
+          setActiveWebAction(action);
+          setLastSpokenText(`Opening ${action.siteName} for you.`);
+          setForcedPose('waving_greeting');
+        }}
+        isLightMode={isWhiteBackground}
       />
     </div>
   );

@@ -985,6 +985,652 @@ app.post("/api/tts", async (req, res) => {
   }
 });
 
+// Cloud screen-analysis endpoint (Phase 4). Opt-in only: the client calls this
+// exclusively for explicit 'cloud' vision requests, never automatically.
+// Sends the (already downscaled) JPEG through the existing Gemini model
+// waterfall and returns a strictly structured JSON analysis.
+const VISION_RATE_WINDOW_MS = 60_000;
+const VISION_MAX_PER_WINDOW = 8;
+let visionRequestTimestamps: number[] = [];
+
+app.post("/api/vision/analyze", async (req, res) => {
+  try {
+    const { image, question, activeWindowTitle } = req.body || {};
+    if (!image || typeof image !== "string") {
+      return res.json({ fallback: true, reason: "no_image" });
+    }
+
+    // Server-side rate limit: hard cap on cloud vision calls.
+    const now = Date.now();
+    visionRequestTimestamps = visionRequestTimestamps.filter((t) => now - t < VISION_RATE_WINDOW_MS);
+    if (visionRequestTimestamps.length >= VISION_MAX_PER_WINDOW) {
+      return res.json({ fallback: true, reason: "rate_limited" });
+    }
+    visionRequestTimestamps.push(now);
+
+    const base64 = image.includes(",") ? image.split(",")[1] : image;
+    if (!base64 || base64.length < 100) {
+      return res.json({ fallback: true, reason: "malformed_image" });
+    }
+
+    const ai = getGenAI();
+    const prompt = `You are the vision backend of a screen-observation assistant. Analyze the attached screen capture and answer the user's question about it.
+${activeWindowTitle ? `The visible window title (best-effort): "${activeWindowTitle}".` : ""}
+
+Return ONLY a JSON object with exactly this shape:
+{
+  "summary": "1-3 sentence factual description of what is visible",
+  "application": "best-guess active application name or empty string",
+  "texts": [{"text": "visible text", "kind": "heading|label|button_label|error|content|unknown", "confidence": 0-1}],
+  "elements": [{"type": "button|link|checkbox|dropdown|text_field|menu|tab|dialog|icon|list|notification|popup", "text": "visible label if any", "bounds": {"x": 0-1, "y": 0-1, "width": 0-1, "height": 0-1}, "confidence": 0-1, "actionable": true|false}],
+  "dialogs": [{"kind": "dialog|popup|notification|confirmation", "text": "...", "confidence": 0-1}],
+  "errors": ["visible error messages"],
+  "warnings": ["visible warnings"],
+  "loading": true|false,
+  "confidence": 0-1
+}
+Rules: report only what is actually visible; use empty arrays when nothing applies; never invent text or elements. Bounds are normalized 0..1 relative to the whole image.
+${question ? `User question: "${question}"` : ""}`;
+
+    const { text } = await generateContentWithFallback(ai, {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: base64 } }],
+        },
+      ],
+      responseMimeType: "application/json",
+      temperature: 0.2,
+    });
+
+    let analysis: any;
+    try {
+      analysis = JSON.parse(text || "{}");
+    } catch {
+      return res.json({ fallback: true, reason: "malformed_model_output" });
+    }
+
+    return res.json({ analysis });
+  } catch (error: any) {
+    return res.json({ fallback: true, reason: error?.message || "vision_failed" });
+  }
+});
+
+// Windows mouse-control endpoint (Phase 5). Executes validated mouse actions
+// locally through PowerShell + user32 P/Invoke (SetCursorPos + mouse_event) —
+// zero npm dependencies. The BROWSER enforces the 'mouse.control' permission
+// before ever calling this endpoint; this endpoint additionally validates all
+// parameters and only accepts known actions.
+//
+// Performance: a persistent PowerShell worker process is kept alive so the
+// ~4s per-invocation startup + Add-Type compilation cost is paid once; warm
+// actions complete in ~100ms. The worker restarts automatically if it dies
+// or hangs, with a per-call execFile fallback.
+import { execFile as _execFile, spawn as _spawn } from "child_process";
+import { promisify } from "util";
+const execFile = promisify(_execFile);
+
+const MOUSE_PS_TIMEOUT_MS = 20_000;
+const MOUSE_CLIENT_TIMEOUT_MS = 25_000;
+
+class PowerShellWorker {
+  private proc: ReturnType<typeof _spawn> | null = null;
+  private buffer = "";
+  private seq = 0;
+  private queue: Promise<unknown> = Promise.resolve();
+  private pending: { id: number; resolve: (out: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout } | null = null;
+
+  private ensureProcess(): void {
+    if (this.proc && this.proc.stdin && !this.proc.killed) return;
+    this.buffer = "";
+    this.proc = _spawn("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command", "-"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    this.proc.stdout!.on("data", (d: Buffer) => this.onData(String(d)));
+    this.proc.stderr!.on("data", () => {
+      /* stderr noise (progress) is ignored */
+    });
+    this.proc.on("exit", () => {
+      this.proc = null;
+      if (this.pending) {
+        clearTimeout(this.pending.timer);
+        const p = this.pending;
+        this.pending = null;
+        p.reject(new Error("PowerShell worker exited"));
+      }
+    });
+  }
+
+  private onData(chunk: string): void {
+    this.buffer += chunk;
+    if (!this.pending) return;
+    const marker = `REQDONE ${this.pending.id}`;
+    const idx = this.buffer.indexOf(marker);
+    if (idx >= 0) {
+      const output = this.buffer.slice(0, idx).trim();
+      this.buffer = this.buffer.slice(idx + marker.length);
+      const p = this.pending;
+      clearTimeout(p.timer);
+      this.pending = null;
+      p.resolve(output);
+    }
+  }
+
+  kill(): void {
+    try {
+      this.proc?.kill();
+    } catch {
+      /* ignore */
+    }
+    this.proc = null;
+  }
+
+  /** Serialize requests; the mouse layer issues one action at a time. */
+  run(script: string): Promise<string> {
+    const task = this.queue.then(() => this.runNow(script));
+    this.queue = task.catch(() => undefined);
+    return task;
+  }
+
+  private runNow(script: string): Promise<string> {
+    this.ensureProcess();
+    const id = ++this.seq;
+    return new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pending = null;
+        this.kill(); // stuck — the next call respawns a fresh worker
+        reject(new Error("PowerShell worker timed out"));
+      }, MOUSE_PS_TIMEOUT_MS);
+      this.pending = { id, resolve, reject, timer };
+      this.proc!.stdin!.write(`${script}\nWrite-Output "REQDONE ${id}"\n`);
+    });
+  }
+}
+
+const mouseWorker = new PowerShellWorker();
+
+async function runMouseScript(script: string): Promise<string> {
+  try {
+    return await mouseWorker.run(script);
+  } catch (err) {
+    // Fallback: one-shot invocation if the persistent worker is unavailable.
+    const { stdout } = await execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
+      { timeout: MOUSE_PS_TIMEOUT_MS, windowsHide: true }
+    );
+    return stdout;
+  }
+}
+
+function clampInt(v: unknown, min: number, max: number): number | null {
+  const n = typeof v === "number" ? v : parseFloat(String(v));
+  if (!Number.isFinite(n)) return null;
+  const i = Math.round(n);
+  return i < min || i > max ? null : i;
+}
+
+const USER32_PINVOKE =
+  `if (-not ([System.Management.Automation.PSTypeName]'W.U32').Type) { Add-Type -MemberDefinition '[DllImport(\"user32.dll\")] public static extern bool SetCursorPos(int X, int Y); [DllImport(\"user32.dll\")] public static extern void mouse_event(uint F, uint DX, uint DY, uint D, UIntPtr E);' -Name U32 -Namespace W; }; `;
+
+app.post("/api/computer/mouse", async (req, res) => {
+  const { action } = req.body || {};
+  try {
+    let script = "";
+    const parsePos = (stdout: string) => {
+      const m = stdout.match(/POS (-?\d+) (-?\d+)/);
+      if (!m) throw new Error("Could not parse cursor position from PowerShell output");
+      return { x: parseInt(m[1], 10), y: parseInt(m[2], 10) };
+    };
+
+    switch (action) {
+      case "position": {
+        script = "Add-Type -AssemblyName System.Windows.Forms; $p=[System.Windows.Forms.Cursor]::Position; Write-Output (\"POS {0} {1}\" -f $p.X,$p.Y)";
+        break;
+      }
+      case "screen_bounds": {
+        script =
+          "Add-Type -AssemblyName System.Windows.Forms; $b=[System.Windows.Forms.SystemInformation]::VirtualScreen; Write-Output (\"BOUNDS {0} {1} {2} {3}\" -f $b.X,$b.Y,$b.Width,$b.Height)";
+        break;
+      }
+      case "move": {
+        const x = clampInt(req.body.x, -100000, 100000);
+        const y = clampInt(req.body.y, -100000, 100000);
+        if (x === null || y === null) return res.status(400).json({ success: false, errorKind: "invalid_coordinates", error: "Invalid coordinates" });
+        // .NET fast path — no P/Invoke needed to set the cursor position.
+        script =
+          "Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; " +
+          `[System.Windows.Forms.Cursor]::Position = New-Object System.Drawing.Point(${x},${y}); ` +
+          "$p=[System.Windows.Forms.Cursor]::Position; Write-Output (\"POS {0} {1}\" -f $p.X,$p.Y)";
+        break;
+      }
+      case "click":
+      case "double_click":
+      case "right_click": {
+        const x = clampInt(req.body.x, -100000, 100000);
+        const y = clampInt(req.body.y, -100000, 100000);
+        if (x === null || y === null) return res.status(400).json({ success: false, errorKind: "invalid_coordinates", error: "Invalid coordinates" });
+        const downUp =
+          action === "right_click" ? [8, 16] : [2, 4];
+        const clickPair = `[W.U32]::mouse_event(${downUp[0]},0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 40; [W.U32]::mouse_event(${downUp[1]},0,0,0,[UIntPtr]::Zero)`;
+        const doubleGap = action === "double_click" ? "Start-Sleep -Milliseconds 70; " : "";
+        script =
+          USER32_PINVOKE +
+          `[void][W.U32]::SetCursorPos(${x},${y}); Start-Sleep -Milliseconds 60; ${clickPair}; ` +
+          (action === "double_click" ? `${doubleGap}${clickPair}; ` : "") +
+          "Write-Output OK";
+        break;
+      }
+      case "scroll": {
+        const x = clampInt(req.body.x, -100000, 100000);
+        const y = clampInt(req.body.y, -100000, 100000);
+        const dRaw = clampInt(req.body.deltaY, -100000, 100000);
+        if (x === null || y === null || dRaw === null || dRaw === 0) {
+          return res.status(400).json({ success: false, errorKind: "invalid_coordinates", error: "Invalid scroll parameters" });
+        }
+        // mouse_event expects the wheel delta as unsigned; convert negatives.
+        const wheel = dRaw >>> 0;
+        script =
+          USER32_PINVOKE +
+          `[void][W.U32]::SetCursorPos(${x},${y}); Start-Sleep -Milliseconds 50; [W.U32]::mouse_event(0x0800,0,0,${wheel},[UIntPtr]::Zero); Write-Output OK`;
+        break;
+      }
+      case "drag": {
+        const fromX = clampInt(req.body.fromX, -100000, 100000);
+        const fromY = clampInt(req.body.fromY, -100000, 100000);
+        const toX = clampInt(req.body.toX, -100000, 100000);
+        const toY = clampInt(req.body.toY, -100000, 100000);
+        if (fromX === null || fromY === null || toX === null || toY === null) {
+          return res.status(400).json({ success: false, errorKind: "invalid_coordinates", error: "Invalid drag coordinates" });
+        }
+        const steps = Math.max(6, Math.min(24, Math.ceil(Math.hypot(toX - fromX, toY - fromY) / 40)));
+        let moves = "";
+        for (let i = 1; i <= steps; i++) {
+          const ix = Math.round(fromX + ((toX - fromX) * i) / steps);
+          const iy = Math.round(fromY + ((toY - fromY) * i) / steps);
+          moves += `[void][W.U32]::SetCursorPos(${ix},${iy}); Start-Sleep -Milliseconds 12; `;
+        }
+        script =
+          USER32_PINVOKE +
+          `[void][W.U32]::SetCursorPos(${fromX},${fromY}); Start-Sleep -Milliseconds 80; ` +
+          `[W.U32]::mouse_event(2,0,0,0,[UIntPtr]::Zero); Start-Sleep -Milliseconds 60; ` +
+          moves +
+          `[void][W.U32]::SetCursorPos(${toX},${toY}); Start-Sleep -Milliseconds 40; ` +
+          `[W.U32]::mouse_event(4,0,0,0,[UIntPtr]::Zero); Write-Output (\"POS {0} {1}\" -f ${toX},${toY})`;
+        break;
+      }
+      default:
+        return res.status(400).json({ success: false, errorKind: "invalid_input", error: `Unknown mouse action "${String(action)}"` });
+    }
+
+    const stdout = await runMouseScript(script);
+
+    if (stdout.includes("POS")) {
+      return res.json({ success: true, position: parsePos(stdout) });
+    }
+    if (stdout.includes("BOUNDS")) {
+      const m = stdout.match(/BOUNDS (-?\d+) (-?\d+) (\d+) (\d+)/);
+      if (!m) return res.json({ success: false, errorKind: "backend_failed", error: "Could not parse screen bounds" });
+      return res.json({
+        success: true,
+        bounds: { x: parseInt(m[1], 10), y: parseInt(m[2], 10), width: parseInt(m[3], 10), height: parseInt(m[4], 10) },
+      });
+    }
+    if (stdout.includes("OK")) {
+      return res.json({ success: true });
+    }
+    return res.json({ success: false, errorKind: "backend_failed", error: "Mouse action produced no recognizable output" });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    const timedOut = (err as any)?.killed === true || message.toLowerCase().includes("timed out");
+    return res.json({
+      success: false,
+      errorKind: timedOut ? "timeout" : "backend_failed",
+      error: timedOut ? "Mouse action timed out" : message.slice(0, 300),
+    });
+  }
+});
+
+// ---- Keyboard control (Phase 6) ----
+// SendInput-based keyboard injection sharing the persistent PowerShell worker.
+// KEYEVENTF_UNICODE types text without simulating per-character keypresses and
+// without touching the clipboard. The BROWSER enforces the 'keyboard.control'
+// permission and validates key names before ever calling this endpoint; this
+// endpoint re-validates everything server-side.
+
+const CSHARP_KBD = `using System; using System.Runtime.InteropServices; namespace W { public static class Kbd {
+[StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public InputUnion U; }
+[StructLayout(LayoutKind.Explicit)] public struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public uint pad0; [FieldOffset(0)] public uint pad1; [FieldOffset(0)] public uint pad2; }
+[StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+const uint KEYUP = 2; const uint UNICODE = 4; const uint KEYBOARD = 1;
+[DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+static int Send(ushort vk, ushort scan, uint flags) { var i = new INPUT(); i.type = KEYBOARD; i.U.ki.wVk = vk; i.U.ki.wScan = scan; i.U.ki.dwFlags = flags; return (int)SendInput(1, new INPUT[]{i}, Marshal.SizeOf(typeof(INPUT))); }
+public static string TypeText(string text, int delayMs) { int ok = 0; foreach (char c in text) { if (c == 13) continue; if (c == 10) { Tap(13); ok++; System.Threading.Thread.Sleep(delayMs); continue; } Send(0, (ushort)c, UNICODE); Send(0, (ushort)c, UNICODE | KEYUP); System.Threading.Thread.Sleep(delayMs); ok++; } return "SENT " + ok; }
+public static string Tap(ushort vk) { Send(vk, 0, 0); System.Threading.Thread.Sleep(15); Send(vk, 0, KEYUP); return "TAP " + vk; }
+public static string Down(ushort vk) { Send(vk, 0, 0); return "DOWN " + vk; }
+public static string Up(ushort vk) { Send(vk, 0, KEYUP); return "UP " + vk; }
+} }`;
+
+function kbdPrelude(): string {
+  // Compile the SendInput wrapper once per worker process (guarded — Add-Type
+  // throws if the type already exists). The C# is collapsed to a SINGLE line:
+  // the worker protocol is line-based, and single-quoted PS strings can hold
+  // the whole source (it contains no single quotes). -Name/-Namespace are NOT
+  // valid with -TypeDefinition, so the namespace lives inside the C# source.
+  const csharp = CSHARP_KBD.replace(/\r?\n/g, ' ');
+  return `if (-not ([System.Management.Automation.PSTypeName]'W.Kbd').Type) { Add-Type -TypeDefinition '${csharp}' }; `;
+}
+
+function psEscapeText(text: string): string {
+  // Escape for a PowerShell double-quoted string. Newlines MUST become
+  // backtick escapes (a raw newline would split the line-based worker
+  // protocol) — inserted AFTER backtick-escaping so they are not doubled.
+  return text
+    .replace(/`/g, '``')
+    .replace(/"/g, '`"')
+    .replace(/\$/g, '`$')
+    .replace(/\r\n/g, '`r`n')
+    .replace(/\n/g, '`n')
+    .replace(/\r/g, '`r');
+}
+
+function vkFor(key: string): number | null {
+  const k = key.trim().toLowerCase();
+  const named: Record<string, number> = {
+    enter: 13, return: 13, escape: 27, esc: 27, tab: 9, backspace: 8, delete: 46, del: 46,
+    insert: 45, space: 32, left: 37, up: 38, right: 39, down: 40,
+    home: 36, end: 35, pageup: 33, pagedown: 34,
+    minus: 189, equal: 187, comma: 188, period: 190, slash: 191, backquote: 192,
+    bracketleft: 219, backslash: 220, bracketright: 221, semicolon: 186, quote: 222,
+    ctrl: 17, control: 17, alt: 18, shift: 16, win: 91, cmd: 91, meta: 91,
+  };
+  if (named[k] !== undefined) return named[k];
+  if (/^[a-z]$/.test(k)) return 65 + (k.charCodeAt(0) - 97);
+  if (/^[0-9]$/.test(k)) return 48 + parseInt(k, 10);
+  const fMatch = k.match(/^f([1-9]|1[0-2])$/);
+  if (fMatch) return 111 + parseInt(fMatch[1], 10);
+  return null;
+}
+
+app.post("/api/computer/keyboard", async (req, res) => {
+  const { action } = req.body || {};
+  try {
+    let script = "";
+    let expectSent = false;
+
+    switch (action) {
+      case "type": {
+        const text = typeof req.body.text === "string" ? req.body.text : "";
+        if (!text.trim() || text.length > 5000) {
+          return res.status(400).json({ success: false, errorKind: "invalid_input", error: "Invalid text" });
+        }
+        const clean = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
+        script =
+          kbdPrelude() +
+          `$r = [W.Kbd]::TypeText("${psEscapeText(clean)}", 3); Write-Output $r`;
+        expectSent = true;
+        break;
+      }
+      case "key": {
+        const vk = vkFor(String(req.body.key ?? ""));
+        if (vk === null) return res.status(400).json({ success: false, errorKind: "invalid_key", error: "Unknown key" });
+        script = kbdPrelude() + `Write-Output ([W.Kbd]::Tap(${vk}))`;
+        break;
+      }
+      case "hotkey": {
+        const mods = Array.isArray(req.body.modifiers) ? req.body.modifiers : [];
+        const vk = vkFor(String(req.body.key ?? ""));
+        if (vk === null) return res.status(400).json({ success: false, errorKind: "invalid_key", error: "Unknown key" });
+        const modVks: number[] = [];
+        for (const mod of mods) {
+          const m = vkFor(String(mod));
+          if (m === null || ![16, 17, 18, 91].includes(m)) {
+            return res.status(400).json({ success: false, errorKind: "invalid_key", error: "Unknown modifier" });
+          }
+          modVks.push(m);
+        }
+        if (modVks.length === 0 || modVks.length > 4) {
+          return res.status(400).json({ success: false, errorKind: "invalid_input", error: "Invalid modifier count" });
+        }
+        const downs = modVks.map((m) => `[void][W.Kbd]::Down(${m}); Start-Sleep -Milliseconds 20; `).join("");
+        const upsReversed = [...modVks].reverse().map((m) => `[void][W.Kbd]::Up(${m}); `).join("");
+        // Modifiers are always released, even if the key tap throws (finally).
+        script =
+          kbdPrelude() +
+          `try { ${downs}Start-Sleep -Milliseconds 40; [void][W.Kbd]::Tap(${vk}); Write-Output OK } finally { Start-Sleep -Milliseconds 20; ${upsReversed}Write-Output MODUP }`;
+        break;
+      }
+      case "key_down": {
+        const vk = vkFor(String(req.body.key ?? ""));
+        if (vk === null) return res.status(400).json({ success: false, errorKind: "invalid_key", error: "Unknown key" });
+        script = kbdPrelude() + `Write-Output ([W.Kbd]::Down(${vk}))`;
+        break;
+      }
+      case "key_up": {
+        const vk = vkFor(String(req.body.key ?? ""));
+        if (vk === null) return res.status(400).json({ success: false, errorKind: "invalid_key", error: "Unknown key" });
+        script = kbdPrelude() + `Write-Output ([W.Kbd]::Up(${vk}))`;
+        break;
+      }
+      default:
+        return res.status(400).json({ success: false, errorKind: "invalid_input", error: `Unknown keyboard action "${String(action)}"` });
+    }
+
+    const stdout = await runMouseScript(script);
+
+    if (expectSent) {
+      const m = stdout.match(/SENT (\d+)/);
+      if (!m) return res.json({ success: false, errorKind: "backend_failed", error: "Type action produced no recognizable output" });
+      return res.json({ success: true, sent: parseInt(m[1], 10) });
+    }
+    if (stdout.includes("MODUP") || stdout.includes("OK") || stdout.includes("TAP") || stdout.includes("DOWN") || stdout.includes("UP ")) {
+      return res.json({ success: true });
+    }
+    return res.json({ success: false, errorKind: "backend_failed", error: "Keyboard action produced no recognizable output" });
+  } catch (err: any) {
+    const message = String(err?.message || err);
+    const timedOut = message.toLowerCase().includes("timed out");
+    return res.json({
+      success: false,
+      errorKind: timedOut ? "timeout" : "backend_failed",
+      error: timedOut ? "Keyboard action timed out" : message.slice(0, 300),
+    });
+  }
+});
+
+// ---- Browser agent endpoints (Phase 8) ----
+// Krisha-controlled headless Chrome/Edge over CDP (see browserCdp.ts). The
+// endpoint layer exposes TYPED actions only (navigate / click-by-text /
+// type-into-field / read-state) — callers cannot inject arbitrary JS.
+import {
+  browserPageState,
+  browserNavigate,
+  browserEvaluate,
+  browserListTabs,
+} from "./browserCdp";
+
+function assertSafeHttpUrl(raw: string): URL {
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    throw new Error("Malformed URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`Unsupported URL scheme "${parsed.protocol}" — only http/https are allowed`);
+  }
+  return parsed;
+}
+
+app.post("/api/browser/state", async (req, res) => {
+  try {
+    const state = await browserPageState();
+    let tabs: any[] = [];
+    try {
+      tabs = await browserListTabs();
+    } catch {
+      // tabs are best-effort
+    }
+    res.json({ success: true, state, tabs });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+app.post("/api/browser/navigate", async (req, res) => {
+  try {
+    const url = assertSafeHttpUrl(String(req.body?.url ?? "")).toString();
+    const result = await browserNavigate(url);
+    res.json({ success: true, ...result });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+async function browserHistoryAction(req: any, res: any, expression: string) {
+  try {
+    await browserEvaluate(expression);
+    const state = await browserPageState();
+    res.json({ success: true, url: state.url, title: state.title });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+}
+
+app.post("/api/browser/back", async (req, res) => browserHistoryAction(req, res, "history.back()"));
+app.post("/api/browser/forward", async (req, res) => browserHistoryAction(req, res, "history.forward()"));
+app.post("/api/browser/refresh", async (req, res) => browserHistoryAction(req, res, "location.reload()"));
+
+app.post("/api/browser/click", async (req, res) => {
+  try {
+    const text = String(req.body?.text ?? "").trim();
+    const kind = ["link", "button", "any"].includes(req.body?.kind) ? req.body.kind : "any";
+    if (!text) return res.json({ success: false, error: "Missing click target text" });
+    const result = await browserEvaluate<any>(
+      `(() => {
+        const q = ${JSON.stringify(text.toLowerCase())};
+        const kind = ${JSON.stringify(kind)};
+        const trim = s => (s || "").trim().toLowerCase();
+        const cands = [];
+        if (kind !== "button") cands.push(...[...document.querySelectorAll("a[href]")]);
+        if (kind !== "link") cands.push(...[...document.querySelectorAll("button, [role=button], input[type=submit], input[type=button]")]);
+        for (const el of cands) {
+          const t = trim(el.innerText || el.value || el.getAttribute("aria-label"));
+          if (t && (t === q || t.includes(q))) {
+            el.scrollIntoView({ block: "center" });
+            el.click();
+            return JSON.stringify({ clicked: t.slice(0, 80), href: el.href || null });
+          }
+        }
+        return JSON.stringify({ clicked: null });
+      })()`
+    );
+    const parsed = JSON.parse(result);
+    if (!parsed.clicked) {
+      return res.json({ success: false, errorKind: "not_found", error: `No visible link/button matching "${text.slice(0, 60)}" on the page` });
+    }
+    const state = await browserPageState();
+    res.json({ success: true, clicked: parsed.clicked, href: parsed.href, url: state.url, title: state.title });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+app.post("/api/browser/type", async (req, res) => {
+  try {
+    const match = String(req.body?.match ?? "").trim();
+    const text = String(req.body?.text ?? "");
+    if (!match) return res.json({ success: false, error: "Missing field match" });
+    if (!text || text.length > 2000) return res.json({ success: false, errorKind: "invalid_input", error: "Invalid text" });
+    const result = await browserEvaluate<any>(
+      `(() => {
+        const m = ${JSON.stringify(match.toLowerCase())};
+        const text = ${JSON.stringify(text)};
+        const fields = [...document.querySelectorAll("input, textarea")].filter(f => {
+          const s = getComputedStyle(f);
+          return s.display !== "none" && s.visibility !== "hidden";
+        });
+        const score = f => {
+          const hay = [f.placeholder, f.name, f.id, f.getAttribute("aria-label"), (f.labels && f.labels[0] && f.labels[0].innerText)].map(x => (x || "").toLowerCase());
+          if (hay.some(h => h && (h.includes(m) || m.includes(h)))) return 2;
+          return hay.some(h => h && m.split(/\\s+/).some(w => w.length > 2 && h.includes(w))) ? 1 : 0;
+        };
+        let best = null, bestScore = 0;
+        for (const f of fields) { const s = score(f); if (s > bestScore) { bestScore = s; best = f; } }
+        if (!best || bestScore === 0) return JSON.stringify({ typed: false });
+        best.scrollIntoView({ block: "center" });
+        best.focus();
+        const proto = best.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, "value").set;
+        setter.call(best, text);
+        best.dispatchEvent(new Event("input", { bubbles: true }));
+        best.dispatchEvent(new Event("change", { bubbles: true }));
+        return JSON.stringify({ typed: true, field: (best.name || best.placeholder || best.id || best.type || "").slice(0, 60) });
+      })()`
+    );
+    const parsed = JSON.parse(result);
+    if (!parsed.typed) {
+      return res.json({ success: false, errorKind: "not_found", error: `No visible field matching "${match.slice(0, 60)}" on the page` });
+    }
+    res.json({ success: true, field: parsed.field });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+app.post("/api/browser/scroll", async (req, res) => {
+  try {
+    const deltaY = Math.max(-20000, Math.min(20000, Math.round(Number(req.body?.deltaY) || 0)));
+    await browserEvaluate(`window.scrollBy(0, ${deltaY}); "scrolled"`);
+    res.json({ success: true });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+app.post("/api/browser/tabs", async (req, res) => {
+  try {
+    const tabs = await browserListTabs();
+    res.json({ success: true, tabs });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+// ---- Filesystem + application agent endpoints (Phase 9) ----
+// Real-disk operations with strict path safety (allowed roots + system-dir
+// denylist for mutations) and evidence-based verification. Application
+// operations are allowlist-based; no arbitrary command execution.
+import * as sys from './systemAgentServer';
+
+function fsResult(res: any, fn: () => Promise<unknown>) {
+  fn()
+    .then((result) => res.json({ success: true, result }))
+    .catch((err: any) => res.json({ success: false, error: String(err?.message || err).slice(0, 300) }));
+}
+
+app.post('/api/fs/list', (req, res) => fsResult(res, () => sys.fsList(String(req.body?.path ?? ''))));
+app.post('/api/fs/inspect', (req, res) => fsResult(res, () => sys.fsInspect(String(req.body?.path ?? ''))));
+app.post('/api/fs/search', (req, res) => fsResult(res, () => sys.fsSearch(String(req.body?.root ?? ''), String(req.body?.query ?? ''), Number(req.body?.maxDepth) || 4)));
+app.post('/api/fs/read', (req, res) => fsResult(res, () => sys.fsReadFile(String(req.body?.path ?? ''), Number(req.body?.offset) || 0)));
+app.post('/api/fs/create', (req, res) => fsResult(res, () => sys.fsCreate(String(req.body?.path ?? ''), req.body?.type === 'dir' ? 'dir' : 'file', typeof req.body?.content === 'string' ? req.body.content : undefined)));
+app.post('/api/fs/rename', (req, res) => fsResult(res, () => sys.fsRename(String(req.body?.path ?? ''), String(req.body?.newName ?? ''))));
+app.post('/api/fs/copy', (req, res) => fsResult(res, () => sys.fsCopy(String(req.body?.from ?? ''), String(req.body?.to ?? ''), req.body?.overwrite === true)));
+app.post('/api/fs/move', (req, res) => fsResult(res, () => sys.fsMove(String(req.body?.from ?? ''), String(req.body?.to ?? ''), req.body?.overwrite === true)));
+app.post('/api/fs/delete', (req, res) => fsResult(res, () => sys.fsDelete(String(req.body?.path ?? ''), req.body?.recursive === true)));
+app.post('/api/fs/open', (req, res) => fsResult(res, () => sys.fsOpenWithAssociation(String(req.body?.path ?? ''))));
+
+app.post('/api/app/discover', (req, res) =>
+  fsResult(res, () => sys.appDiscover(req.body?.force === true).then((apps) => sys.appSearch(apps, String(req.body?.query ?? ''))))
+);
+app.post('/api/app/launch', (req, res) =>
+  fsResult(res, () => (req.body?.path ? sys.appLaunchByPath(String(req.body.path)) : sys.appLaunchByName(String(req.body?.name ?? ''))))
+);
+app.post('/api/app/status', (req, res) => fsResult(res, () => sys.appStatus(String(req.body?.name ?? ''))));
+app.post('/api/app/close', (req, res) => fsResult(res, () => sys.appClose(Number(req.body?.pid), req.body?.force === true)));
+app.post('/api/app/focus', (req, res) => fsResult(res, () => sys.appFocus(Number(req.body?.pid))));
+
 // Vite middleware & Static serving
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {

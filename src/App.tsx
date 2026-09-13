@@ -17,13 +17,10 @@ import {
 import {
   getStoredSettings,
   saveStoredSettings,
-  getStoredMemories,
-  saveStoredMemories,
   getStoredConversations,
   saveStoredConversations,
   getActiveConversationId,
   setActiveConversationId,
-  DEFAULT_MEMORIES,
   DEFAULT_SETTINGS,
 } from './utils/storage';
 import { speakKrishaText, stopKrishaSpeech, playWakeChime } from './utils/audio';
@@ -56,6 +53,9 @@ import {
   LocalIndexedFile,
 } from './utils/fileSystemAccess';
 import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
+import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, type AgentSystem } from './agent/bridge';
+import { getMemoryService } from './agent/memory/memoryService';
+import { attachMemoryToSystem } from './agent/memory/memoryBridge';
 import { SidebarNav } from './components/SidebarNav';
 import { ConversationsModal } from './components/ConversationsModal';
 import { MemoryModal } from './components/MemoryModal';
@@ -74,7 +74,8 @@ import { WebBrowserModal } from './components/WebBrowserModal';
 export default function App() {
   // State
   const [settings, setSettings] = useState<CompanionSettings>(getStoredSettings);
-  const [memories, setMemories] = useState<string[]>(getStoredMemories);
+  // Memory state is the display view of the structured memory service (Phase 2).
+  const [memories, setMemories] = useState<string[]>(() => getMemoryService().displayMemories());
   const [conversations, setConversations] = useState<Conversation[]>(getStoredConversations);
   const [activeConvoId, setActiveConvoId] = useState<string | null>(getActiveConversationId);
 
@@ -167,6 +168,33 @@ export default function App() {
 
     return () => {
       isMounted = false;
+    };
+  }, []);
+
+  // ---- Agent Core (Phase 1) ----
+  // Multi-step requests are delegated to the agent loop; single-step messages
+  // keep the original inline flow below. UI components are untouched — the
+  // agent surfaces its results through the same action cards / modals.
+  const agentSystemRef = useRef<AgentSystem | null>(null);
+  useEffect(() => {
+    const system = createAgentSystem({
+      applyWebAction: (action) => setActiveWebAction(action),
+      applyAppAction: (action) => setActiveAppAction(action),
+      applyFileAction: (action) => setActiveFileAction(action),
+      applyMapsAction: (action) => setActiveLocationAction(action),
+      applyViewerFile: (file) => setActiveViewerFile(file),
+      openModal: (modal) => setActiveModal(modal),
+      setPose: (pose) => setForcedPose(pose as VideoAnimationPose),
+    });
+    const memoryAttachment = attachMemoryToSystem(system, getMemoryService());
+    agentSystemRef.current = system;
+    return () => {
+      memoryAttachment.detach();
+      system.screenObserver?.stop();
+      system.keyboardControl?.releaseAll().catch(() => undefined);
+      system.core.cancelAll();
+      system.detach();
+      agentSystemRef.current = null;
     };
   }, []);
 
@@ -284,22 +312,24 @@ export default function App() {
   };
 
   const handleAddMemory = (newMemory: string) => {
-    const updated = [newMemory, ...memories];
-    setMemories(updated);
-    saveStoredMemories(updated);
+    getMemoryService().remember(newMemory, { source: 'user_manual' });
+    setMemories(getMemoryService().displayMemories());
   };
 
   const handleUpdateMemory = (index: number, newMemory: string) => {
-    const updated = [...memories];
-    updated[index] = newMemory;
-    setMemories(updated);
-    saveStoredMemories(updated);
+    const record = getMemoryService().resolveDisplayIndex(index);
+    if (record) {
+      getMemoryService().update(record.id, newMemory);
+    }
+    setMemories(getMemoryService().displayMemories());
   };
 
   const handleDeleteMemory = (index: number) => {
-    const updated = memories.filter((_, i) => i !== index);
-    setMemories(updated);
-    saveStoredMemories(updated);
+    const record = getMemoryService().resolveDisplayIndex(index);
+    if (record) {
+      getMemoryService().forget(record.id);
+    }
+    setMemories(getMemoryService().displayMemories());
   };
 
   const handleSelectConversation = (id: string) => {
@@ -364,9 +394,9 @@ export default function App() {
 
   const handleResetAllData = () => {
     localStorage.clear();
-    setMemories(DEFAULT_MEMORIES);
+    getMemoryService().reset();
+    setMemories(getMemoryService().displayMemories());
     setSettings(DEFAULT_SETTINGS);
-    saveStoredMemories(DEFAULT_MEMORIES);
     saveStoredSettings(DEFAULT_SETTINGS);
     const freshId = 'convo_' + Date.now();
     const freshText = `Hello ${DEFAULT_SETTINGS.userName}. I'm glad we get to spend some quiet time together.`;
@@ -467,9 +497,132 @@ export default function App() {
     }
   };
 
-    // Send message to Krisha
+    // Execute a multi-step request through the Agent Core and report honestly in chat.
+  const runAgentDelegated = async (text: string) => {
+    const now = Date.now();
+    const userEmotion = analyzeSentimentAndKeywords(text);
+    const agentUserMsg: Message = {
+      id: 'msg_' + now,
+      role: 'user',
+      content: text.trim(),
+      timestamp: now,
+      emotionData: userEmotion,
+    };
+
+    let baseMessages: Message[];
+    let targetConvoId: string;
+    let updatedConversations = [...conversations];
+
+    const existing = conversations.find((c) => c.id === activeConvoId);
+    if (!existing) {
+      targetConvoId = 'convo_' + now;
+      baseMessages = [agentUserMsg];
+      updatedConversations = [
+        {
+          id: targetConvoId,
+          title: text.slice(0, 24),
+          createdAt: now,
+          updatedAt: now,
+          messages: baseMessages,
+        },
+        ...updatedConversations,
+      ];
+      setActiveConvoId(targetConvoId);
+      setActiveConversationId(targetConvoId);
+    } else {
+      targetConvoId = existing.id;
+      baseMessages = [...existing.messages, agentUserMsg];
+      updatedConversations = updatedConversations.map((c) =>
+        c.id === targetConvoId
+          ? {
+              ...c,
+              title: c.title === 'New Conversation' || c.title === 'Late Evening Chat' ? text.slice(0, 24) : c.title,
+              updatedAt: now,
+              messages: baseMessages,
+            }
+          : c
+      );
+    }
+
+    setConversations(updatedConversations);
+    saveStoredConversations(updatedConversations);
+    setIsLoading(true);
+    setExpression('listening_attentive');
+
+    try {
+      const { summary } = await runAgentTask(agentSystemRef.current!, text);
+      const reportText = summary || 'I finished going through the steps, but I could not summarize the result.';
+      const reportEmotion = analyzeSentimentAndKeywords(reportText);
+
+      const agentBotMsg: Message = {
+        id: 'msg_' + (now + 1),
+        role: 'model',
+        content: reportText,
+        timestamp: Date.now(),
+        expression: reportEmotion.expression,
+        emotionData: reportEmotion,
+      };
+
+      const finalMessages = [...baseMessages, agentBotMsg];
+      const finalConversations = updatedConversations.map((c) =>
+        c.id === targetConvoId ? { ...c, updatedAt: Date.now(), messages: finalMessages } : c
+      );
+
+      setConversations(finalConversations);
+      saveStoredConversations(finalConversations);
+      setLastSpokenText(reportText);
+      setExpression(reportEmotion.expression);
+      setEmotionData(reportEmotion);
+
+      if (settings.voiceEnabled) {
+        speakKrishaText(
+          reportText,
+          settings.voiceName,
+          settings.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false)
+        );
+      } else {
+        setIsSpeaking(true);
+        const talkDuration = Math.min(6500, Math.max(2200, reportText.length * 45));
+        setTimeout(() => setIsSpeaking(false), talkDuration);
+      }
+
+      // Background memory extraction (same endpoint as the normal chat flow)
+      fetch('/api/memory/extract', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userMessage: text,
+          botMessage: reportText,
+          existingMemories: memories,
+        }),
+      })
+        .then((r) => r.json())
+        .then((memData) => {
+          if (memData.newMemories && memData.newMemories.length > 0) {
+            getMemoryService().rememberMany(memData.newMemories, { source: 'conversation_extract' });
+            setMemories(getMemoryService().displayMemories());
+          }
+        })
+        .catch((err) => console.warn('Agent memory extraction error:', err));
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Send message to Krisha
   const handleSendMessage = async (text: string) => {
     if (!text.trim() || isLoading) return;
+
+    // ---- Agent Core delegation (Phase 1 / 4 / 5 / 6) ----
+    // Multi-step, screen-observation, mouse-control, and keyboard-control
+    // requests run through the agent loop. Other messages keep the original
+    // inline chat flow below.
+    if (agentSystemRef.current && (isMultiStepRequest(text) || isScreenIntent(text) || isMouseIntent(text) || isKeyboardIntent(text) || isSystemIntent(text))) {
+      await runAgentDelegated(text);
+      return;
+    }
 
     // Check for dance command or stop dance command
     const isDanceCommand = /\b(dance|dancing|dances|waltz|ballet|tango|groove)\b/i.test(text);
@@ -770,7 +923,11 @@ export default function App() {
             role: m.role,
             content: m.content,
           })),
-          memories,
+          // Relevance-based retrieval (Phase 2): only memories useful for this
+          // message go into the prompt, never the whole database.
+          memories: getMemoryService()
+            .recall(text, { limit: 8 })
+            .map((m) => m.content),
           userName: settings.userName,
           companionNotes: settings.companionNotes,
           userLocation: currentActiveLocation || undefined,
@@ -862,11 +1019,8 @@ export default function App() {
         .then((r) => r.json())
         .then((memData) => {
           if (memData.newMemories && memData.newMemories.length > 0) {
-            setMemories((prev) => {
-              const merged = [...memData.newMemories, ...prev];
-              saveStoredMemories(merged);
-              return merged;
-            });
+            getMemoryService().rememberMany(memData.newMemories, { source: 'conversation_extract' });
+            setMemories(getMemoryService().displayMemories());
           }
         })
         .catch((err) => console.warn('Background memory extraction error:', err));

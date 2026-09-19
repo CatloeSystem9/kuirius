@@ -177,6 +177,10 @@ export function classifySystemIntent(clause: string): StepClassification | null 
     return { toolName: 'filesystem.list', capability: 'filesystem.list', description: `List "${m[1].trim()}"`, input: { path: m[1].trim() } };
   }
 
+  if ((m = text.match(/^search\s+(?:the\s+)?(?:filesystem|disk|computer)\s+for\s+(.+)$/i))) {
+    return { toolName: 'filesystem.search', capability: 'filesystem.search', description: `Search the filesystem for "${m[1].trim()}"`, input: { root: '', query: m[1].trim() } };
+  }
+
   if ((m = text.match(/^read\s+(?:the\s+)?(?:file\s+)?(.+)$/i))) {
     const target = m[1].trim();
     if (!/\.\w{1,5}$/.test(target) && !/[\\/]/.test(target)) return null;
@@ -646,21 +650,6 @@ export class HeuristicPlanner implements Planner {
       return { goal, steps, createdAt: now, revision: 1 };
     }
 
-    // Phase 10 tool chaining: a filesystem.search followed by a
-    // read/inspect without an absolute path chains via the task context —
-    // the search result feeds the later step's input.
-    for (let i = 0; i < steps.length - 1; i++) {
-      const producer = steps[i];
-      const consumer = steps[i + 1];
-      if (producer.toolName === 'filesystem.search' && (consumer.toolName === 'filesystem.read' || consumer.toolName === 'filesystem.inspect')) {
-        const pathValue = String(consumer.input.path ?? '');
-        if (!/^[a-zA-Z]:[\\/]/.test(pathValue)) {
-          producer.outputKey = 'found';
-          consumer.input = { path: { $context: 'found.matches.0.path' } } as Record<string, unknown>;
-        }
-      }
-    }
-
     if (overflow) {
       planned.push(`Note: request had ${usableClauses.length} parts; only the first ${MAX_PLAN_STEPS - 1} were planned`);
     }
@@ -685,11 +674,30 @@ export class HeuristicPlanner implements Planner {
       });
     });
 
+    // Phase 10 tool chaining: a filesystem.search followed by a
+    // read/inspect/open without an absolute path chains via the task context —
+    // the search result feeds the later step's input.
+    for (let i = 0; i < steps.length - 1; i++) {
+      const producer = steps[i];
+      const consumer = steps[i + 1];
+      if (
+        producer.toolName === 'filesystem.search' &&
+        (consumer.toolName === 'filesystem.read' || consumer.toolName === 'filesystem.inspect' || consumer.toolName === 'filesystem.open_file')
+      ) {
+        const pathValue = String(consumer.input.path ?? '');
+        if (!/^[a-zA-Z]:[\\/]/.test(pathValue)) {
+          producer.outputKey = 'found';
+          consumer.input = { path: { $context: 'found.matches.0.path' } } as Record<string, unknown>;
+        }
+      }
+    }
+
     return {
       goal,
       steps,
       createdAt: now,
       revision: 1,
+      objective: goal.description,
     };
   }
 

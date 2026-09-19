@@ -33,6 +33,9 @@ export interface BrowserAgentOptions {
   computerUse?: { run(goal: string, signal?: AbortSignal): Promise<any> };
   /** Reuse window for state between steps (ms). */
   stateStaleMs?: number;
+  /** Adaptive observation (Phase 13): request screen observation only when
+   * browser-native state is insufficient or a visual check is warranted. */
+  adaptiveObservation?: { observe(trigger: 'browser_navigation' | 'visual_fallback'): Promise<void> };
 }
 
 export class BrowserAgent {
@@ -41,12 +44,25 @@ export class BrowserAgent {
   private computerUse?: BrowserAgentOptions['computerUse'];
   private stateStaleMs: number;
   private cachedState: BrowserState | null = null;
+  private adaptiveObservation?: BrowserAgentOptions['adaptiveObservation'];
 
   constructor(options: BrowserAgentOptions) {
     this.backend = options.backend;
     this.events = options.events;
     this.computerUse = options.computerUse;
     this.stateStaleMs = options.stateStaleMs ?? 2000;
+    this.adaptiveObservation = options.adaptiveObservation;
+  }
+
+  setAdaptiveObservation(hook: NonNullable<BrowserAgentOptions['adaptiveObservation']>): void {
+    this.adaptiveObservation = hook;
+  }
+
+  /** Best-effort adaptive screen observation — never blocks the browser flow. */
+  private requestObservation(trigger: 'browser_navigation' | 'visual_fallback'): void {
+    this.adaptiveObservation?.observe(trigger).catch(() => {
+      // Observation is advisory here; browser-native state remains authoritative.
+    });
   }
 
   setComputerUse(cu: NonNullable<BrowserAgentOptions['computerUse']>): void {
@@ -71,6 +87,9 @@ export class BrowserAgent {
       };
       this.cachedState = state;
       this.events?.emit({ name: 'BROWSER_OBSERVED', payload: { available: false }, timestamp: Date.now() });
+      // CDP state is insufficient — ask the adaptive layer for a screen look
+      // (the visual fallback path). Advisory only.
+      this.requestObservation('visual_fallback');
       return state;
     }
     // Defensive bounding — the server slices too, but never trust the wire.
@@ -153,6 +172,10 @@ export class BrowserAgent {
       payload: { action: 'navigate', note: verification.note },
       timestamp: Date.now(),
     });
+
+    // Phase 13: request adaptive screen observation after navigation (useful
+    // for desktop-visible side effects); browser-native state stays primary.
+    this.requestObservation('browser_navigation');
 
     return {
       action: 'navigate',

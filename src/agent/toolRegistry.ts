@@ -246,9 +246,26 @@ export class ToolRegistry {
       result.retryable = retryableForKind(result.errorKind ?? 'execution_error');
     }
 
+    // Phase 14: include a small evidence slice (verified flag + short output
+    // summary) so the multimodal layer can record tool results as evidence.
+    // Bounded to 200 chars — nothing unbounded leaves through the bus.
+    const outputSummary =
+      result.output !== undefined
+        ? JSON.stringify(result.output).slice(0, 200)
+        : typeof result.state?.['summary'] === 'string'
+          ? String(result.state['summary']).slice(0, 200)
+          : undefined;
+
     this.bus?.emit({
       name: result.success ? 'TOOL_COMPLETED' : 'TOOL_FAILED',
-      payload: { tool: name, durationMs: result.durationMs, error: result.error },
+      payload: {
+        tool: name,
+        durationMs: result.durationMs,
+        error: result.error,
+        verified: result.verified,
+        outputSummary,
+        taskId: ctx?.taskId,
+      },
       timestamp: Date.now(),
     });
     return result;

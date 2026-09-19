@@ -17,6 +17,7 @@
  */
 import type {
   ActiveWindowInfo,
+  Bounds,
   CapturedFrame,
   CaptureSource,
   ObservationMode,
@@ -30,6 +31,7 @@ import { MODE_RECOMMENDED_MAX_AGE_MS, ObserverError } from './visionTypes';
 import { AgentEventBus } from '../events';
 import { PermissionManager } from '../permissions';
 import { computeBlockSignature, compareSignatures } from './signatures';
+import { cropFrame, translateAnalysis } from './regionCrop';
 import { LocalPixelVisionProvider } from './localPixelVision';
 import { GeminiVisionProvider } from './geminiVision';
 
@@ -119,14 +121,20 @@ export class ScreenObserver {
 
   // ----------------------------------------------------------------- states
 
-  /** Current structured screen state (capture + analyze), with reuse window. */
-  async getCurrentState(options: { analyze?: 'auto' | 'cloud'; question?: string; maxAgeMs?: number } = {}): Promise<ScreenState> {
+  /**
+   * Current structured screen state (capture + analyze), with reuse window.
+   * `region` (Phase 13) crops the frame for cheaper analysis; detected bounds
+   * are translated back to full-screen coordinates and the change signature
+   * is always computed on the full frame.
+   */
+  async getCurrentState(options: { analyze?: 'auto' | 'cloud'; question?: string; maxAgeMs?: number; region?: Bounds } = {}): Promise<ScreenState> {
     const maxAge = options.maxAgeMs ?? this.getRecommendedReuseWindow();
     if (this.lastState && maxAge > 0 && Date.now() - this.lastState.timestamp < maxAge) {
       return this.lastState; // unchanged-screen optimization: skip recapture entirely
     }
 
     const frame = await this.captureFrame();
+    const analysisFrame = options.region ? cropFrame(frame, options.region) : frame;
 
     const provider = options.analyze === 'cloud' ? this.providers.cloud : this.providers.local;
     if (!provider.available()) {
@@ -136,7 +144,8 @@ export class ScreenObserver {
     const activeWindow = this.captureSource.getActiveWindowInfo();
     let analysis;
     try {
-      analysis = await provider.analyze(frame, { question: options.question, activeWindow });
+      analysis = await provider.analyze(analysisFrame, { question: options.question, activeWindow });
+      if (options.region) analysis = translateAnalysis(analysis, options.region);
       this.events?.emit({ name: 'SCREEN_ANALYSIS_COMPLETED', payload: { provider: analysis.provider, confidence: analysis.confidence }, timestamp: Date.now() });
     } catch (err) {
       const kind = err instanceof ObserverError ? err.kind : 'analysis_failed';

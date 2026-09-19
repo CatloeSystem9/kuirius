@@ -38,6 +38,8 @@ const WAIT_INTERVALS_MS = [250, 500, 1000];
 
 export class ComputerUseAgent {
   private observer?: ComputerUseOptions['observer'];
+  private adaptive?: NonNullable<ComputerUseOptions['adaptive']>;
+  private multimodal?: NonNullable<ComputerUseOptions['multimodal']>;
   private mouse: NonNullable<ComputerUseOptions['mouse']>;
   private keyboard: NonNullable<ComputerUseOptions['keyboard']>;
   private events: ComputerUseOptions['events'];
@@ -48,6 +50,8 @@ export class ComputerUseAgent {
 
   constructor(options: ComputerUseOptions) {
     this.observer = options.observer;
+    this.adaptive = options.adaptive;
+    this.multimodal = options.multimodal;
     this.mouse = options.mouse;
     this.keyboard = options.keyboard;
     this.events = options.events;
@@ -59,6 +63,14 @@ export class ComputerUseAgent {
 
   setObserver(observer: NonNullable<ComputerUseOptions['observer']>): void {
     this.observer = observer;
+  }
+
+  setAdaptiveObserver(adaptive: NonNullable<ComputerUseOptions['adaptive']>): void {
+    this.adaptive = adaptive;
+  }
+
+  setMultimodal(hook: NonNullable<ComputerUseOptions['multimodal']>): void {
+    this.multimodal = hook;
   }
 
   async run(goal: string, signal?: AbortSignal): Promise<ComputerUseResult> {
@@ -141,6 +153,7 @@ export class ComputerUseAgent {
           payload: { kind: intent.kind, error: record.error },
           timestamp: Date.now(),
         });
+        this.adaptive?.notifyVerification('failed');
         if (record.status === 'failed') {
           // Stop the run on a failed action — continue would act on a broken
           // understanding of the screen.
@@ -203,6 +216,7 @@ export class ComputerUseAgent {
       // ---- RECOVERY (spec §7): re-observe → re-evaluate → safe alternative.
       if (attempt < this.maxRecoveriesPerAction) {
         recoveries++;
+        this.adaptive?.notifyRecovery(true);
         this.events?.emit({
           name: 'COMPUTER_RECOVERY_STARTED',
           payload: { kind: intent.kind, attempt, lastError },
@@ -296,6 +310,49 @@ export class ComputerUseAgent {
 
   private async ensureState(signal: AbortSignal | undefined, previous: ScreenState | null, force = false): Promise<ScreenState | null> {
     if (!this.observer) return previous;
+
+    // Phase 13: when the adaptive observation layer is present it decides
+    // whether to capture fresh, focus a region, or safely reuse the cached
+    // state (never stale state — the decider enforces the reuse window).
+    if (this.adaptive) {
+      // force=true only for focus-change/recovery re-observations; normal
+      // action cycles let the decision engine choose reuse vs. fresh capture.
+      const result = await this.adaptive.observe(
+        {
+          trigger: force ? 'explicit_request' : previous ? 'after_mouse_action' : 'task_step',
+          priority: force ? 'HIGH' : 'NORMAL',
+          reason: force ? 'focus changed: fresh observation required' : 'computer-use action cycle',
+          requireFresh: force,
+        },
+        signal
+      );
+      if (result.status === 'observed' || result.status === 'reused') {
+        if (result.state) {
+          this.events?.emit({
+            name: 'COMPUTER_OBSERVED',
+            payload: { stateId: result.state.id, activeWindow: result.state.activeWindow?.title, adaptive: result.status, changeKind: result.changeKind },
+            timestamp: Date.now(),
+          });
+          this.multimodal?.recordObservation(result.state);
+          return result.state;
+        }
+      }
+      if (result.status === 'failed') {
+        this.events?.emit({
+          name: 'COMPUTER_RECOVERY_STARTED',
+          payload: { reason: 'adaptive_observation_failed', kind: result.error?.kind },
+          timestamp: Date.now(),
+        });
+        // Structured failure: fall back to previous state — stale data is
+        // never silently treated as fresh.
+        return previous;
+      }
+      // stopped/delayed/budget_exhausted/cancelled: reuse cache only if the
+      // adaptive layer still considers it valid (its decision said so).
+      if (result.decision.action === 'REUSE_VALID_STATE' && previous) return previous;
+      return previous;
+    }
+
     try {
       const state = await this.observer.getCurrentState({ maxAgeMs: force ? 0 : this.stateStaleMs });
       this.events?.emit({
@@ -303,6 +360,7 @@ export class ComputerUseAgent {
         payload: { stateId: state.id, activeWindow: state.activeWindow?.title },
         timestamp: Date.now(),
       });
+      this.multimodal?.recordObservation(state);
       return state;
     } catch {
       // Observation failures must not silently pass stale data forward.

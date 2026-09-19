@@ -1,0 +1,23 @@
+{
+  "name": "krix-specialists",
+  "version": "1.0.0",
+  "description": "Standalone 100-specialist AI agent library/registry for future integration into Krix.",
+  "type": "commonjs",
+  "main": "specialistRegistry.ts",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "keywords": ["krix", "ai-agents", "specialist-registry"],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.4.0",
+    "@types/node": "^20.11.0"
+  }
+}

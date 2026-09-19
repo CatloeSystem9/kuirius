@@ -51,6 +51,9 @@ export interface PlanStep {
   finishedAt?: number;
   /** Store the tool result output into task context under this key (Phase 10). */
   outputKey?: string;
+  /** Observation requirement for this step (Phase 13, learned workflows):
+   * requireFresh forbids reusing cached screen state for this step. */
+  observation?: { requireFresh?: boolean; region?: string };
   /** Run only when this condition holds against the task context (Phase 10). */
   condition?: import('./context').StepCondition;
   /** Steps that must have completed before this one runs (Phase 10). */
@@ -72,6 +75,8 @@ export interface AgentPlan {
   objective?: string;
   /** When task context has this key, the objective is achieved and remaining steps are skipped (Phase 10). */
   evidenceKey?: string;
+  /** Set when the plan was instantiated from a learned workflow (Phase 12). */
+  learnedFrom?: { workflowId: string; version: number; score: number };
 }
 
 export type TaskStatus =

@@ -221,7 +221,9 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   const registry = new ToolRegistry();
   registry.register(tool('boom', async () => fail('disk exploded', { retryable: false })));
   registry.register(tool('after', async () => ok()));
-  const core = makeCore(registry);
+  const goal = extractGoal('boom then after');
+  const fixed = new FixedPlanner(planFor(goal, [step({ toolName: 'boom' }), step({ toolName: 'after' })]));
+  const core = makeCore(registry, { planner: fixed });
   const task = await core.submit('boom then after');
   assertEqual(task.status, 'failed' as const, 'task failed');
   assert(task.error!.includes('disk exploded'), 'failure reason recorded');
@@ -236,7 +238,9 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   registry.register(tool('quick', async () => ok()));
   registry.register(tool('waiter', async (_i, ctx) => new Promise((resolve) => { ctx.signal.addEventListener('abort', () => resolve(ok())); })));
   registry.register(tool('never', async () => { throw new Error('should not run'); }));
-  const core = makeCore(registry);
+  const goal = extractGoal('quick then waiter then never');
+  const fixed = new FixedPlanner(planFor(goal, [step({ toolName: 'quick' }), step({ toolName: 'waiter' }), step({ toolName: 'never' })]));
+  const core = makeCore(registry, { planner: fixed });
   const pending = core.submit('quick then waiter then never');
   await new Promise((r) => setTimeout(r, 100));
   const running = core.store.list().find((t) => t.status === 'running');
@@ -253,7 +257,9 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   const registry = new ToolRegistry();
   registry.register(tool('hangs', async () => new Promise(() => { /* never resolves */ })));
   registry.register(tool('after', async () => ok()));
-  const core = makeCore(registry, { stepTimeoutMs: 80 });
+  const goal = extractGoal('hangs then after');
+  const fixed = new FixedPlanner(planFor(goal, [step({ toolName: 'hangs' }), step({ toolName: 'after' })]));
+  const core = makeCore(registry, { planner: fixed, stepTimeoutMs: 80 });
   const task = await core.submit('hangs then after');
   assertEqual(task.status, 'failed' as const, 'task failed after timeout');
   assert(task.error!.includes('timed out'), 'timeout recorded as the stop reason');
@@ -270,8 +276,10 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   privileged.permissions = ['filesystem.write'];
   privileged.riskLevel = 'high';
   registry.register(privileged);
+  const goal = extractGoal('privileged');
+  const fixed = new FixedPlanner(planFor(goal, [step({ toolName: 'privileged' })]));
   const permissions = new PermissionManager(); // filesystem.write NOT granted
-  const core = makeCore(registry, { permissions });
+  const core = makeCore(registry, { planner: fixed, permissions });
   const task = await core.submit('privileged');
   assertEqual(task.status, 'failed' as const, 'task stopped at the permission boundary');
   assertEqual(task.plan!.steps[0].result!.errorKind, 'permission_denied' as const, 'permission_denied classification');
@@ -283,7 +291,9 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   console.log('Test 10: misleading success does not claim completion');
   const registry = new ToolRegistry();
   registry.register(tool('liar', async () => ok({ output: { success: true, uncertain: true, note: 'dispatched but unconfirmed' } })));
-  const core = makeCore(registry);
+  const goal = extractGoal('liar');
+  const fixed = new FixedPlanner(planFor(goal, [step({ toolName: 'liar' })]));
+  const core = makeCore(registry, { planner: fixed });
   const task = await core.submit('liar');
   assertEqual(task.plan!.steps[0].status, 'uncertain' as const, 'uncertain evidence → step marked uncertain');
   assert(task.summary!.includes('uncertain'), 'summary admits uncertainty');
@@ -291,11 +301,11 @@ function planFor(goal: AgentGoal, steps: PlanStep[], objective?: string, evidenc
   // output_contains verification catching a misleading result
   const registry2 = new ToolRegistry();
   registry2.register(tool('fakeDone', async () => ok({ output: { status: 'PENDING' } })));
-  const goal = extractGoal('fakeDone');
-  const plan = new HeuristicPlanner().makePlan(goal);
-  plan.steps[0].verification = { type: 'output_contains', expected: 'COMPLETED' } as Verification;
-  const fixed = new FixedPlanner(plan);
-  const core2 = makeCore(registry2, { planner: fixed, maxAttemptsPerStep: 1 });
+  const goal2 = extractGoal('fakeDone');
+  const plan2 = new HeuristicPlanner().makePlan(goal2);
+  plan2.steps[0].verification = { type: 'output_contains', expected: 'COMPLETED' } as Verification;
+  const fixed2 = new FixedPlanner(plan2);
+  const core2 = makeCore(registry2, { planner: fixed2, maxAttemptsPerStep: 1 });
   const task2 = await core2.submit('fakeDone');
   assertEqual(task2.status, 'failed' as const, 'verification mismatch fails the step honestly');
 }

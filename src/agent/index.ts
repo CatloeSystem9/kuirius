@@ -31,6 +31,10 @@ export type { StepCondition as ContextCondition } from './context';
 export * from './system/systemTypes';
 export * from './system/systemServices';
 export * from './system/systemTools';
+export * from './learning/learningTypes';
+export * from './learning/workflowStore';
+export * from './learning/learningService';
+export * from './learning/workflowPlanner';
 // bridge re-exports planner names (isMultiStepRequest/isScreenIntent/isMouseIntent) —
 // export its own API explicitly to avoid ambiguous star-export collisions.
 export { createAgentSystem, runAgentTask, type AgentHost, type AgentSystem, type AgentRunResult } from './bridge';

@@ -73,7 +73,23 @@ export type AgentEventName =
   | 'APP_LAUNCH_FAILED'
   | 'APP_STATE_CHANGED'
   | 'APP_CLOSED'
-  | 'NOTICE';
+  | 'NOTICE'
+  | 'RECOVERY_STARTED'
+  | 'RECOVERY_CLASSIFIED'
+  | 'RECOVERY_STRATEGY_SELECTED'
+  | 'RECOVERY_ATTEMPTED'
+  | 'RECOVERY_REOBSERVED'
+  | 'RECOVERY_VERIFIED'
+  | 'RECOVERY_SUCCEEDED'
+  | 'RECOVERY_FAILED'
+  | 'RECOVERY_ABORTED'
+  | 'SAFE_STOP_TRIGGERED'
+  // Phase 12 — Learning + Workflow Acquisition
+  | 'USER_CORRECTION'
+  | 'STRATEGY_UPDATED'
+  | 'WORKFLOW_DETECTED'
+  | 'WORKFLOW_LEARNED'
+  | 'WORKFLOW_REUSED';
 
 export interface AgentEvent<P = unknown> {
   name: AgentEventName;

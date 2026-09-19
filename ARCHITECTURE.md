@@ -459,3 +459,374 @@ FS_OPERATION_* / APP_* events; transient failures retried once (reads
   details are never stored — the Phase 2 service only receives workflow-level
   outcomes through the standard task-completion bridge.
 
+## 16. Multi-step autonomy (Phase 10)
+
+```
+planner: extractGoal → decompose into ordered plan steps (clauses/compound)
+         ▼
+Tool chaining: producer step (outputKey: "found")
+               consumer step ({$context: "found.matches.0.path"})
+         ▼
+Agent Core execution loop:
+   1. DEPENDENCY CHECK: step.dependsOn evaluated against prior step statuses
+      (unmet dependency → status: 'skipped')
+   2. CONDITION EVALUATION: step.condition evaluated against task.context
+      (context_exists | context_missing | context_equals | context_contains
+       unsatisfied → status: 'skipped')
+   3. CONTEXT RESOLUTION: resolveContextRefs replaces {$context: path}
+      placeholders with live values from task.context
+   4. STEP DISPATCH & TIMEOUT: withTimeoutAndAbort + AbortSignal,
+      permission verification, retry policy
+   5. VERIFICATION: evidence-based verification; honest uncertainty
+      propagates (uncertain output → step.status: 'uncertain', not completed)
+   6. CONTEXT PERSISTENCE: boundContextValue truncates output to 4KB preview
+      before storing under step.outputKey into task.context
+   7. OBJECTIVE COMPLETION CHECK: plan.evidenceKey presence in context
+      triggers early completion of remaining steps
+         ▼
+Lifecycle events: TASK_STARTED / TASK_STEP_STARTED / TASK_STEP_SKIPPED /
+                  TASK_COMPLETED / TASK_FAILED / TASK_CANCELLED
+```
+
+- **Task context scratchpad**: Structured runtime context persisted on `AgentTask.context`. Steps emit outputs under `outputKey`, and downstream steps consume values via `{$context: 'path.to.field'}` references without intermediate hardcoding. Context values are strictly bounded (max 4,000 characters) to prevent memory bloating from file contents or dumps.
+- **Dynamic condition gating**: Steps declare optional `StepCondition` rules (`context_exists`, `context_missing`, `context_equals`, `context_contains`) evaluated against runtime context, allowing autonomous workflows to branch or skip satisfied actions dynamically without user intervention.
+- **Early objective termination**: When a plan declares an `evidenceKey`, producing that evidence in the context immediately marks remaining steps as cleanly skipped and completes the task, avoiding redundant actions.
+- **Honest uncertainty propagation**: Dispatched operations that succeed without definitive confirmation mark steps as `uncertain` rather than fabricated `completed`, truthfully reflected in task summaries.
+- **Safe autonomy boundary**: Full lifecycle cancellation, step timeouts, and permission gates (`screen.observation`, `mouse.control`, `keyboard.control`, `filesystem.read`, `filesystem.write`) remain enforced at each step.
+
+## 17. Error recovery (Phase 11)
+
+```
+step failure (Agent Core runStepWithRetry budget exhausted, or failed step)
+        ▼
+AgentCore → RecoveryManager.handleFailure
+   1. GUARD     abort signal checked first; cancellation short-circuits recovery
+   2. CLASSIFY  classifyFailure: error text + ToolResult.errorKind → 14-part
+                taxonomy (TRANSIENT, TIMEOUT, STALE_STATE, TARGET_NOT_FOUND,
+                FOCUS_LOST, NAVIGATION_CHANGED, PERMISSION_DENIED,
+                INVALID_INPUT, TOOL_FAILURE, VERIFICATION_FAILURE,
+                DEPENDENCY_FAILURE, CONTEXT_FAILURE, UNSAFE_OPERATION, UNKNOWN)
+   3. POLICY    RecoveryPolicy.evaluate → RecoveryDecision
+                - budgets: maxAttemptsPerStep (2), maxAttemptsPerTask (6),
+                  maxRepeatedIdenticalFailures (2) → SAFE_STOP when exceeded
+                - non-recoverable classes (PERMISSION_DENIED, UNSAFE_OPERATION,
+                  INVALID_INPUT, DEPENDENCY_FAILURE, CONTEXT_FAILURE) → SAFE_STOP
+                - idempotency guard: side-effecting capabilities (clicks, typing,
+                  file writes, app launch/close) that TIMEOUT or fail VERIFICATION
+                  are RE_OBSERVEd — never blindly retried
+   4. EXECUTE   RecoveryStrategyExecutor runs the bounded strategy:
+                RETRY · RE_OBSERVE (screen.observe / browser.state) ·
+                REFOCUS (application.focus) · RE_RESOLVE_TARGET ·
+                BROWSER_RECOVERY (browser.refresh) · ALTERNATIVE_TOOL ·
+                ROLLBACK (cleanupPath only) · SAFE_STOP — each with
+                post-recovery verification evidence
+   5. DECIDE    recovered → core re-runs the step (RETRY, RE_OBSERVE, REFOCUS,
+                BROWSER_RECOVERY), splices in an alternative step
+                (ALTERNATIVE_TOOL), or continues;
+                not recovered → failed step output invalidated, task stops honestly
+        ▼
+RECOVERY_* events (STARTED / CLASSIFIED / STRATEGY_SELECTED / ATTEMPTED /
+                   REOBSERVED / VERIFIED / SUCCEEDED / FAILED / ABORTED),
+SAFE_STOP_TRIGGERED; RecoveryAttempt history (sanitized, bounded to 500 chars)
+```
+
+- **Context safety (`RecoveryContextManager`)**: every `{$context}` reference in a
+  step input is validated before execution; keys marked INVALID (failed producer)
+  or missing from the task context stop the step before it runs. Failed step
+  outputs are deleted from `task.context` and marked INVALID so stale values can
+  never silently flow into downstream steps.
+- **Bounded by design**: no strategy loops, no unbounded retries — every recovery
+  path consumes from the same explicit budget and every attempt is recorded in the
+  sanitized `RecoveryAttempt` history (passwords/tokens redacted).
+- **Test suite**: `scripts/test-recovery-phase11.ts`
+  (`npx tsx scripts/test-recovery-phase11.ts`) covers the classifier, policy
+  budgets/idempotency, context safety, executor verification, manager state
+  machine, and AgentCore integration (retry, re-observe + re-run, alternative
+  step injection, safe stop on invalid context).
+
+## 18. Learning + workflow acquisition (Phase 12)
+
+```
+TASK_COMPLETED ──▶ LearningService.learnFromTask
+TASK_FAILED    │    verified success → create/reinforce workflow (confidence ▲)
+USER_MESSAGE   │    failure → evidence against the matching workflow only
+TOOL_COMPLETED │                 (confidence ▼; failures never create workflows)
+TOOL_FAILED    ─▶ per-capability strategy statistics
+        ▼
+LearningWorkflowStore (krisha_learning_workflows_v1, schemaVersion 1,
+│                      repair-on-load, bounded: 40 workflows / 20 evidence /
+│                      10 corrections / 60 strategy entries; lowest-confidence
+│                      stalest evicted first)
+│
+├─▶ WorkflowAwarePlanner (thin decorator over the Phase 1 Planner):
+│     makePlan → planFromWorkflow: is there a confident, environment-compatible
+│     workflow for this goal? YES → instantiate steps as a plan TEMPLATE
+│     (plan.learnedFrom recorded); NO → inner planner plans normally
+│
+└─▶ mirrorToMemory: reusable workflows reflected into the Phase 2
+    MemoryService (category 'workflow', workflowId link only)
+        ▼
+Every reused step still runs the full Agent Core stack — verification,
+retry, recovery, permissions, cancellation, timeouts (Phase 12 adds a
+memory of WHAT worked; it does not add a second execution path)
+```
+
+- **Workflow knowledge is structured data, never prose/screenshots**: goal
+  pattern, required capabilities, ordered step templates (toolName/capability/
+  sanitized inputTemplate/contextRefs/outputKey), evidence list, corrections,
+  confidence, version + version history.
+- **Confidence is deterministic and bounded** (spec §7): verified_success +0.1,
+  unverified_success +0.01, verified_failure −0.2, unverified_failure −0.05,
+  clamped [0,1]. Reuse requires the 'usable' level (≥ 0.45) — a workflow must
+  prove itself with a verified success after creation before auto-reuse.
+- **Reuse ranking is local and deterministic** (no model calls): score =
+  0.6·goalSimilarity + 0.25·confidence + 0.15·environmentCoverage; every step
+  must resolve to a concrete tool in the CURRENT registry (by name, or by
+  capability as adaptation); `REUSE_MIN_SCORE = 0.55` and full coverage required.
+- **Corrections**: `detectCorrection` (Phase 2) on USER_MESSAGE → durable
+  correction attached to the matching workflow + small bounded confidence
+  reduction; corrections are also stored in Phase 2 memory.
+- **Adaptation**: a new verified success with a different step sequence bumps
+  the workflow version (bounded history) instead of fossilizing or duplicating;
+  tool replaced via capability keeps reuse alive when the environment changes.
+- **Safety**: workflows containing high/critical-risk tools are never learned;
+  secrets are stripped from input templates (`sanitizeTemplate` — sensitive
+  keys and secret-like values redacted, values truncated); learning never
+  writes source code, permissions, or settings (no self-modification); all
+  store writes are bounded and corruption-tolerant.
+- **Outcome honesty**: `unverified` outcomes barely count (+0.01/−0.05);
+  failure evidence and known failure points are recorded even when the failed
+  task executed fewer steps than the full plan (failed steps included in
+  evidence; skipped steps are not).
+- **Debug/inspection**: `learning.list() / get() / disable() / forget() /
+  strategyStats() / stats()` — plus `window.__KRISHA_AGENT__.learning` in the
+  browser (DevTools only, no UI).
+- **Test suite**: `scripts/test-learning-phase12.ts`
+  (`npx tsx scripts/test-learning-phase12.ts`) — 70 assertions covering
+  preference learning, correction learning, workflow learning, reuse, failed
+  strategies, environment adaptation, duplicate prevention, persistence across
+  restart, learning safety, resource bounds, and planner fallback/versioning.
+
+## 19. Adaptive screen observation (Phase 13)
+
+```
+EVENT BUS (existing Phase 1 events)
+  MOUSE_CLICK_COMPLETED / KEYBOARD_ACTION_COMPLETED / BROWSER_NAVIGATED /
+  APP_* / FS_OPERATION_COMPLETED / RECOVERY_* / SCREEN_CHANGED / TASK_*
+        │  (AdaptiveObserver.attach — no polling loop, no timers)
+        ▼
+AdaptiveObserver ── beginTask/endTask/stopObservation/resume
+  │   pending-trigger queue (bounded, TTL 5s, priority-deduped)
+  │   context feeds: recordAction / notifyVerification / notifyChange / notifyRecovery
+  ▼
+Decision engine (pure, deterministic — observationDecider.decide)
+  rules in order: workflow freshness + recovery + failed verification
+  → budget gates → idle gate → explicit/no-prior/stale → change-awareness
+  → filesystem-step preference → post-action → default reuse
+  output: OBSERVE_NOW | OBSERVE_AFTER_ACTION | OBSERVE_REGION |
+          REUSE_VALID_STATE | DELAY_OBSERVATION | STOP_OBSERVATION (+reason)
+  ▼
+ObservationBudgetTracker (per task: 24 captures, 6/10s window,
+  3 consecutive, 4 unchanged, 2 retries — structured exhaustion statuses)
+  ▼
+ScreenObserver (Phase 4, unchanged behavior; new optional `region` option)
+  capture → crop (region) → local analysis → bounds translated back to
+  full-screen coordinates; change signatures ALWAYS computed on the full frame
+```
+
+- **New module** `src/agent/observation/`: `observationTypes.ts` (requests,
+  policy, results, triggers, priorities LOW–CRITICAL, modes, regions, budgets,
+  changes, decisions), `observationPolicy.ts` (mode resolution: idle /
+  active_task / after_action / uncertain / rapid_change / settled with
+  mode-specific reuse windows — idle 60s ≈ off, active 1.5s, rapid 400ms),
+  `observationBudget.ts`, `observationDecider.ts`, `adaptiveObserver.ts`.
+- **Event-driven, never polling**: no intervals, no background workers.
+  Events only RECORD triggers; captures happen solely inside explicit
+  `observe()` calls driven by the Agent Core / Computer-Use / Browser flows.
+  HIGH/CRITICAL events (recovery, failed verification) surface as pending
+  triggers consumed by the next decision — never as reflex captures.
+- **Budgets** (spec §4): per-task cap, sliding rate window, consecutive-capture
+  cap, unchanged-screen cap, bounded retries. Exhaustion returns structured
+  statuses (`budget_exhausted` / `stopped` with machine-readable reason,
+  `delayed` with retryAfterMs) — never an uncontrolled loop.
+- **Change-awareness** (spec §5): signature fractions classify as none / minor
+  (<2%) / relevant (<25%) / major / unknown; streaks escalate policy to
+  rapid_change (tighter) or settled (looser). Unchanged + fresh → reuse with
+  zero captures.
+- **Region-awareness** (spec §6): heuristic presets (browser_content,
+  dialog_area, target_control, verification_region, active_application) crop
+  the frame BEFORE analysis (cheaper inference); detected bounds are mapped
+  back to full-screen coordinates so mouse/keyboard targeting stays correct
+  (`src/agent/vision/regionCrop.ts`). Full-screen remains the default.
+- **Task-awareness** (spec §7): filesystem-type steps prefer filesystem
+  verification (`REUSE_VALID_STATE`); post-action triggers verify the result;
+  browser state reads never trigger observations (CDP-first).
+- **Stale-state protection** (spec §8): decisions consult the policy reuse
+  window; recovery and failed verification always force fresh captures; a
+  fresh capture clears recovery state. Observation failures return structured
+  errors (`permission_denied`, `timeout`, …) for Phase 11 recovery — never
+  silent stale reuse.
+- **Computer-Use integration** (spec §10): the Phase 7 loop's OBSERVE step now
+  consults the adaptive layer (reuse when fresh, capture when stale/forced,
+  fresh on focus change); action failures feed `notifyVerification('failed')`,
+  recovery feeds `notifyRecovery(true)`. Closed-loop architecture unchanged.
+- **Browser integration** (spec §11): the Phase 8 agent requests observation
+  only after navigation or when CDP state is insufficient (best-effort,
+  browser-native state stays authoritative).
+- **Learned workflow integration** (spec §12): `WorkflowStep.observation`
+  (`requireFresh`, optional `region`) is learned (Phase 12 `toWorkflowStep`),
+  carried on `PlanStep.observation`, and enforced by the Agent Core before the
+  step runs — reused workflows never replay stale screen state.
+- **Privacy** (spec §13): no image data in the observation layer, no new
+  persistence; task end purges the ScreenObserver snapshot cache; cropped
+  frames carry no `dataUrl` copy; observation metadata is JSON-safe
+  (asserted in tests).
+- **Cancellation/recovery** (spec §14): `observe()` accepts AbortSignals and a
+  hard timeout; failures are structured (`failed`/`cancelled` with kind) and
+  retried at most `maxRetries` times through the retry budget.
+- **Debug/inspection**: `adaptiveObserver.getDiagnostics()` /
+  `budgetStatus()` / `getLastDecision()`; exposed as
+  `window.__KRISHA_AGENT__.adaptiveObserver` (DevTools only, no UI).
+- **Test suite**: `scripts/test-observation-phase13.ts`
+  (`npx tsx scripts/test-observation-phase13.ts`) — 91 assertions covering
+  policy/decision determinism, idle behavior, active-task behavior,
+  post-action observation, change detection, unchanged-screen reuse,
+  stale-state detection, budgets + exhaustion, regions, task/browser/
+  computer-use/workflow/recovery integration, cancellation, timeout,
+  permission failure, privacy, no-polling guarantees.
+- **Real-machine check**: `scripts/real-machine-check-observation.ts`
+  (needs the local server) — observes state, verifies unchanged-screen reuse,
+  performs a harmless reversible cursor nudge via the real backend, verifies
+  adaptive fresh re-observation + real change classification, verifies no
+  polling, restores the original state, bounded capture counts.
+- **Limitations**: region presets are heuristic rectangles (no per-window
+  rects without extra OS queries); screen capture itself still requires the
+  interactive browser-consent flow (Phase 4); the decider is deliberately
+  rule-based (no learned observation policy yet); screenshot content is never
+  persisted anywhere.
+
+## 20. Multimodal intelligence (Phase 14)
+
+New module `src/agent/multimodal/` — a unified, bounded reasoning layer that
+combines evidence from multiple modalities (text, screenshots, UI state,
+browser state, application state, documents, audio transcripts, structured
+tool results) instead of treating each input independently. Agent Core
+remains the central brain; no vision/browser/control systems were duplicated.
+
+**Module layout**:
+- `multimodalTypes.ts` — `ModalityType` (9 registered kinds),
+  `ModalityObservation` (type, source, timestamp, confidence, metadata,
+  sensitivity, freshness TTL, stepId), payloads per modality, `Sensitivity`
+  (`public`/`normal`/`sensitive`/`highly_sensitive`), `MultimodalConclusion`
+  (claim, confidence, supporting/contradicting evidence, uncertainties,
+  conflicts, requiredVerification), `MultimodalReasoningProvider` interface
+  (spec §15 — pluggable external models; the system works fully without one).
+- `modalityRegistry.ts` — per-modality descriptors: base priority
+  (fresh tool state 100 > UI/screenshot 85 > browser 80 > app 75 > document
+  70 > text 60 > image 50 > transcript 45), TTL (freshness windows), default
+  sensitivity, redaction flags. `effectivePriority` decays with age and low
+  confidence — stale evidence never outranks fresh evidence.
+- `modalityNormalizer.ts` — converts raw inputs (text, ScreenState,
+  BrowserState, app status, tool outputs, URLs, transcripts, documents) into
+  `ModalityObservation`s: extracts summaries/keywords, computes content
+  hashes (dedup), assigns confidence, and runs the **secret scanner** —
+  passwords, API keys, tokens, JWTs, card-like numbers are redacted
+  (`[REDACTED]`) and escalate the observation to `highly_sensitive`.
+- `multimodalContext.ts` — the task-scoped evidence store: bounded
+  (`maxObservations`, `maxPerModality`, `totalCharBudget`), per-modality
+  caps (newest kept), content-hash dedup (refresh not duplicate), TTL-based
+  staleness (`removeStale`), step association (`forStep`), task scoping
+  (`beginTask` clears, `endTask` purges), `priorityOf` (freshness ×
+  registry × confidence), and `providerSafeDigest()` — a bounded,
+  sensitive-evidence-free string for external providers.
+- `multimodalAnalyzer.ts` — selective, on-demand gathering: `gather(ctx,
+  kinds)` only touches the requested modalities (browser gather never
+  captures the screen; screen gather goes **through the Phase 13 adaptive
+  observer** — reuse when fresh, `requireFreshScreen` forces a capture, and
+  no pixel data is stored, only structured UI summaries). Also: application
+  status via the Phase 9 service (unverified reads are never recorded),
+  text recording, and document understanding with bounded chunking +
+  keyword-scored relevant-section selection (huge documents never load
+  fully). Every gather honors `timeoutMs` and `AbortSignal`.
+- `multimodalReasoner.ts` — deterministic cross-modal reasoning:
+  question classification (find-element, verify-state, active-application,
+  summarize-document, continue-workflow…), target extraction, evidence
+  matching across modalities, source-priority resolution, **conflict
+  detection** (browser URL vs screen URL; app reported open vs absent on
+  screen; text vs evidence), confidence math (multi-source bonus,
+  single-source cap, conflict penalty) and honest uncertainty — no
+  fabricated elements, zero confidence when evidence is missing, and
+  `requiredVerification` steps listed. If the local answer is
+  low-confidence AND an external provider is set, the provider is consulted
+  with the `providerSafeDigest` (timeout- and cancellation-guarded); the
+  local result stands otherwise.
+- `multimodalVerifier.ts` — independent-evidence verification of
+  expectations ("X is open", "text \"…\" is visible", URL expectations):
+  gathers agreeing/contradicting evidence from 4 families (application
+  state, visible screen, browser-native state, structured tool results),
+  requires ≥2 evidence kinds for `confirmed` (a single fresh verified tool
+  result may also confirm), reports conflicts, and always lists the next
+  verification step when independent confirmation is missing.
+- `multimodalService.ts` + `index.ts` — the facade: task lifecycle on the
+  Event Bus (TASK_STARTED opens a scope; TOOL_COMPLETED/TOOL_FAILED record
+  real tool evidence with step association; TASK_COMPLETED/TASK_FAILED
+  purge everything), plus the integration hook consumed by the Phase 7
+  Computer-Use Agent (`multimodal.recordObservation(state)` — CU
+  observations become queryable multimodal evidence; the CU closed loop is
+  unchanged).
+
+**Privacy (spec §13)**: every modality carries a sensitivity
+classification; secrets are redacted at normalization time and never
+persisted; `providerSafeDigest()` excludes sensitive and highly-sensitive
+evidence from anything sent to an external provider; screenshot/screen
+observations store structured summaries only — no image data, no new
+persistence anywhere; task end purges all evidence.
+
+**Resource control (spec §14)**: strictly on-demand — no background
+processing, no polling (captures happen only inside explicit `gather()`
+calls; the Phase 13 no-polling property is asserted in tests), bounded
+context sizes, per-modality caps, TTL expiration, content-hash dedup,
+selective gathering, document chunking with relevant-section selection.
+
+**Provider abstraction (spec §15)**: `MultimodalReasoningProvider` is a
+plain interface (`id`, `reason(input)`); `MultimodalReasoner.setProvider()`
+installs one, `getProvider()`/`setProvider(null)` removes it. Without a
+provider everything works deterministically and locally (asserted in
+tests). Provider calls receive only the redacted bounded digest, are
+skipped when aborted, and time out to the local result.
+
+- **Bridge wiring**: `MultimodalService` is constructed with the Phase 13
+  observer, Phase 8 browser agent, and Phase 9 application service;
+  `attach(bus)` records tool evidence; `multimodal.recordObservation` is
+  handed to the Computer-Use Agent; exposed as
+  `window.__KRISHA_AGENT__.multimodal` (DevTools only, no UI).
+- **Test suite**: `scripts/test-multimodal-phase14.ts`
+  (`npx tsx scripts/test-multimodal-phase14.ts`) — 150 assertions covering
+  registry priorities, normalization + secret redaction, context bounds/
+  dedup/staleness/step association/task scoping, document chunking +
+  section selection, cross-modal reasoning, source prioritization, conflict
+  detection, confidence/uncertainty math, verification (confirmed/refuted/
+  uncertain + cancellation), service/bus lifecycle, Computer-Use evidence
+  recording, provider enrichment/timeout/cancellation, privacy (no pixels,
+  secret rejection, digest exclusion), resource discipline (no polling,
+  selective gathering), gather timeout/cancellation.
+- **Real-machine check**: `scripts/real-machine-check-multimodal.ts`
+  (needs the local server) — launches Character Map through the Phase 9
+  allowlist, gathers real process-table evidence via the Phase 14 analyzer,
+  types a harmless phrase through the real keyboard backend (no Enter) plus
+  a reversible cursor nudge, records both action results as tool evidence,
+  runs a Phase 13 screen observation (synthetic cursor source, honestly
+  labeled — real capture needs interactive consent), verifies "charmap is
+  open" with independent confirmation (application state + tool results),
+  asserts the synthetic-screen corroboration gap is reported as a conflict,
+  then force-closes the app and confirms the process is gone.
+- **Limitations**: local reasoning is deterministic/rule-based (external
+  providers enrich only); document support covers already-extracted text
+  (PDF rendering remains with the existing Phase 9 surfaces); real screen
+  capture still needs the interactive consent flow, so real-machine checks
+  use the labeled synthetic cursor source; conflict detection covers the
+  main contradiction classes (URL, app presence, text-vs-evidence) rather
+  than open-world consistency; evidence older than its registry TTL is
+  ignored, which can leave questions unanswered by design.
+
+

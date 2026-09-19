@@ -21,6 +21,7 @@ import { HeuristicPlanner, extractGoal } from './planner';
 import { selectToolForCapability } from './toolSelector';
 import { PermissionManager } from './permissions';
 import { evaluateCondition, resolveContextRefs, resolveContextPath, boundContextValue } from './context';
+import { RecoveryManager } from './recovery';
 
 export interface AgentCoreOptions {
   registry: ToolRegistry;
@@ -28,6 +29,7 @@ export interface AgentCoreOptions {
   store: TaskStore;
   planner?: Planner;
   permissions?: PermissionManager;
+  recovery?: RecoveryManager;
   stepTimeoutMs?: number;
   maxAttemptsPerStep?: number;
   retryDelayMs?: number;
@@ -41,12 +43,15 @@ export class AgentCore {
   readonly events: AgentEventBus;
   readonly store: TaskStore;
   readonly permissions: PermissionManager;
+  readonly recovery: RecoveryManager;
   private planner: Planner;
   private stepTimeoutMs: number;
   private maxAttemptsPerStep: number;
   private retryDelayMs: number;
   private maxSteps: number;
   private controllers = new Map<string, AbortController>();
+  /** Adaptive observation layer (Phase 13) — optional; honors learned-workflow freshness. */
+  private adaptive?: import('./observation/adaptiveObserver').AdaptiveObserver;
 
   constructor(options: AgentCoreOptions) {
     this.registry = options.registry;
@@ -54,10 +59,20 @@ export class AgentCore {
     this.store = options.store;
     this.planner = options.planner ?? new HeuristicPlanner();
     this.permissions = options.permissions ?? new PermissionManager();
+    this.recovery = options.recovery ?? new RecoveryManager({
+      registry: this.registry,
+      events: this.events,
+      permissions: this.permissions,
+    });
     this.stepTimeoutMs = options.stepTimeoutMs ?? 30_000;
     this.maxAttemptsPerStep = options.maxAttemptsPerStep ?? 2;
     this.retryDelayMs = options.retryDelayMs ?? 300;
     this.maxSteps = options.maxSteps ?? 10;
+  }
+
+  /** Wire the Phase 13 adaptive observation layer (optional). */
+  setAdaptiveObserver(adaptive: import('./observation/adaptiveObserver').AdaptiveObserver): void {
+    this.adaptive = adaptive;
   }
 
   /** Submit a user request. Resolves when the task reaches a terminal state. */
@@ -65,6 +80,7 @@ export class AgentCore {
     const now = Date.now();
     const goal = extractGoal(input);
     const task = this.store.create(goal, now);
+    this.recovery.resetTask(task.id);
 
     this.events.emit({ name: 'USER_MESSAGE', taskId: task.id, payload: { input }, timestamp: Date.now() });
     this.events.emit({ name: 'TASK_STARTED', taskId: task.id, payload: { goal }, timestamp: Date.now() });
@@ -183,7 +199,38 @@ export class AgentCore {
 
       // ---- Tool chaining (Phase 10): resolve {$context} references in the
       // step input against the current task context.
-      step.input = resolveContextRefs(step.input, taskBeforeStep.context ?? {});
+      const taskContext = taskBeforeStep.context ?? {};
+      const validation = this.recovery.getContextManager().validateStepInputs(step, taskContext);
+      if (!validation.safe) {
+        step.status = 'failed';
+        step.error = `Context reference invalid or missing: ${[...validation.invalidKeys, ...validation.missingKeys].join(', ')}`;
+        const rec = await this.recovery.handleFailure({
+          taskId: task.id,
+          step,
+          error: step.error,
+          taskContext,
+          signal,
+        });
+        if (step.outputKey) {
+          this.store.update(task.id, (t) => {
+            if (t.context && step.outputKey) {
+              const updated = { ...t.context };
+              delete updated[step.outputKey];
+              t.context = updated;
+            }
+          });
+        }
+        this.markRemaining(plan, index + 1, 'skipped');
+        this.store.update(task.id, (t) => {
+          t.status = 'failed';
+          t.error = rec.reason || step.error;
+          t.completedAt = Date.now();
+          t.summary = this.buildSummary(t);
+        });
+        this.events.emit({ name: 'TASK_FAILED', taskId: task.id, payload: { error: step.error, stepId: step.id }, timestamp: Date.now() });
+        return;
+      }
+      step.input = resolveContextRefs(step.input, taskContext);
 
       const finishedStep = await this.runStepWithRetry(step, taskNow, signal);
 
@@ -194,6 +241,11 @@ export class AgentCore {
         this.store.update(task.id, (t) => {
           t.context = { ...(t.context ?? {}), [key]: bounded };
         });
+        if (finishedStep.status === 'completed') {
+          this.recovery.getContextManager().markValid(key);
+        } else {
+          this.recovery.getContextManager().markUnknown(key);
+        }
       }
 
       if (finishedStep.status === 'cancelled') {
@@ -208,7 +260,84 @@ export class AgentCore {
       }
 
       if (finishedStep.status !== 'completed' && finishedStep.status !== 'uncertain') {
-        // Try an alternative strategy before giving up (Phase 11 hook).
+        // Invalidate failed step output in context immediately (Phase 11 context safety)
+        if (step.outputKey) {
+          this.recovery.getContextManager().invalidateOutput(this.store.get(task.id)?.context ?? {}, step.outputKey);
+          this.store.update(task.id, (t) => {
+            if (t.context && step.outputKey) {
+              const updated = { ...t.context };
+              delete updated[step.outputKey];
+              t.context = updated;
+            }
+          });
+        }
+
+        // Try recovery (Phase 11)
+        const recovery = await this.recovery.handleFailure({
+          taskId: task.id,
+          step,
+          error: finishedStep.error || 'unknown error',
+          result: finishedStep.result,
+          taskContext: this.store.get(task.id)?.context,
+          signal,
+        });
+
+        if (recovery.recovered) {
+          if (recovery.alternativeStep) {
+            plan.steps.splice(index + 1, 0, recovery.alternativeStep);
+            plan.revision += 1;
+            this.events.emit({
+              name: 'NOTICE',
+              taskId: task.id,
+              payload: { message: `Recovered with alternative strategy: ${recovery.alternativeStep.description}` },
+              timestamp: Date.now(),
+            });
+            continue;
+          }
+          if (recovery.modifiedInput) {
+            step.input = recovery.modifiedInput;
+            step.status = 'pending';
+            step.error = undefined;
+            const retried = await this.runStepWithRetry(step, taskNow, signal);
+            if (retried.status === 'completed' || retried.status === 'uncertain') {
+              if (step.outputKey && retried.result?.output !== undefined) {
+                const key = step.outputKey;
+                const bounded = boundContextValue(retried.result.output);
+                this.store.update(task.id, (t) => {
+                  t.context = { ...(t.context ?? {}), [key]: bounded };
+                });
+                this.recovery.getContextManager().markValid(key);
+              }
+              continue;
+            }
+          }
+          // RE_TRY re-runs the step directly; environment-restoring strategies
+          // (re-observe / refocus / browser recovery) restore the world and then
+          // re-run the same step against the fresh state.
+          if (
+            recovery.strategy === 'RETRY' ||
+            recovery.strategy === 'RE_OBSERVE' ||
+            recovery.strategy === 'REFOCUS' ||
+            recovery.strategy === 'BROWSER_RECOVERY'
+          ) {
+            step.status = 'pending';
+            step.error = undefined;
+            const retried = await this.runStepWithRetry(step, taskNow, signal);
+            if (retried.status === 'completed' || retried.status === 'uncertain') {
+              if (step.outputKey && retried.result?.output !== undefined) {
+                const key = step.outputKey;
+                const bounded = boundContextValue(retried.result.output);
+                this.store.update(task.id, (t) => {
+                  t.context = { ...(t.context ?? {}), [key]: bounded };
+                });
+                this.recovery.getContextManager().markValid(key);
+              }
+              continue;
+            }
+          }
+        }
+
+        // Planner alternative hook (legacy fallback)
         const alternative = this.planner.proposeAlternative(step, finishedStep.error || 'unknown error');
         if (alternative) {
           plan.steps.splice(index + 1, 0, alternative);
@@ -220,7 +349,9 @@ export class AgentCore {
         this.markRemaining(plan, index + 1, 'skipped');
         this.store.update(task.id, (t) => {
           t.status = 'failed';
-          t.error = `Step ${index + 1} failed: ${finishedStep.error || 'unknown error'}`;
+          // Preserve the actual failure (retry attempts overwrite step.error);
+          // recovery.reason is evidence text and must not mask the real cause.
+          t.error = `Step ${index + 1} failed: ${step.error || finishedStep.error || recovery.reason || 'unknown error'}`;
           t.completedAt = Date.now();
           t.summary = this.buildSummary(t);
         });
@@ -285,6 +416,28 @@ export class AgentCore {
   }
 
   private async runStepWithRetry(step: PlanStep, task: AgentTask, signal: AbortSignal): Promise<PlanStep> {
+    // Phase 13: a learned workflow may require FRESH screen state for this
+    // step — observe once before the tool runs (best-effort; the tool's own
+    // verification remains authoritative). Never replays stale observations.
+    if (step.observation?.requireFresh && this.adaptive) {
+      try {
+        await this.adaptive.observe(
+          {
+            trigger: 'learned_workflow_requirement',
+            priority: 'HIGH',
+            taskId: task.id,
+            stepId: step.id,
+            region: (step.observation.region as import('./observation/observationTypes').ObservationRegion) ?? 'full_screen',
+            requireFresh: true,
+            reason: 'reused workflow step requires fresh screen state',
+          },
+          signal
+        );
+      } catch {
+        // Observation failure must not block the step — verification still gates it.
+      }
+    }
+
     const resolved = this.resolveTool(step, task.id);
     if (!resolved) {
       step.status = 'failed';

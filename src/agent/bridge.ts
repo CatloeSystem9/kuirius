@@ -16,7 +16,10 @@ import { createBrowserTools } from './browserTools';
 import { createScreenTools } from './vision/screenTools';
 import { ScreenObserver } from './vision/screenObserver';
 import { BrowserCaptureSource } from './vision/browserCapture';
-import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent } from './planner';
+import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, HeuristicPlanner } from './planner';
+import { LearningService } from './learning/learningService';
+import { WorkflowAwarePlanner } from './learning/workflowPlanner';
+import { getMemoryService } from './memory/memoryService';
 import { ComputerControlService } from './computer/computerControl';
 import { PowerShellMouseBackend } from './computer/powerShellMouse';
 import { createMouseTools } from './computer/mouseTools';
@@ -25,7 +28,9 @@ import { PowerShellKeyboardBackend } from './computer/powerShellKeyboard';
 import { createKeyboardTools } from './computer/keyboardTools';
 import { ComputerUseAgent } from './computerUse/computerUseAgent';
 import { createComputerUseTools } from './computerUse/computerUseTools';
+import { AdaptiveObserver } from './observation/adaptiveObserver';
 import { BrowserAgent } from './browser/browserAgent';
+import { MultimodalService } from './multimodal/multimodalService';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -50,8 +55,14 @@ export interface AgentSystem {
   permissions?: PermissionManager;
   /** Screen observation service (Phase 4). */
   screenObserver?: ScreenObserver;
+  /** Adaptive observation layer (Phase 13). */
+  adaptiveObserver?: AdaptiveObserver;
   /** Keyboard control service (Phase 6). */
   keyboardControl?: KeyboardControlService;
+  /** Learning + workflow acquisition service (Phase 12). */
+  learning?: LearningService;
+  /** Multimodal intelligence service (Phase 14). */
+  multimodal?: MultimodalService;
   detach: () => void;
 }
 
@@ -61,7 +72,23 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   const registry = new ToolRegistry(bus);
   const store = new TaskStore();
   const permissions = new PermissionManager();
-  const core = new AgentCore({ registry, events: bus, store, permissions });
+
+  // Learning + workflow acquisition (Phase 12): learns from task outcomes and
+  // user corrections on the shared event bus; learned workflows are reuse
+  // suggestions layered under the existing planner — no second planning loop.
+  const learning = new LearningService({
+    registry,
+    events: bus,
+    memory: getMemoryService(),
+    taskResolver: (taskId) => store.get(taskId),
+  });
+  const core = new AgentCore({
+    registry,
+    events: bus,
+    store,
+    permissions,
+    planner: new WorkflowAwarePlanner(new HeuristicPlanner(), learning),
+  });
 
   registry.registerAll(createBrowserTools());
 
@@ -73,6 +100,12 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     permissions,
   });
   registry.registerAll(createScreenTools(screenObserver));
+
+  // Adaptive observation (Phase 13): event/task-driven scheduling ON TOP of
+  // the Phase 4 observer — decides when/how/whether to look at the screen.
+  // Budget-bounded, region-aware, no polling loop; respects the same
+  // 'screen.observation' permission through the underlying observer.
+  const adaptiveObserver = new AdaptiveObserver({ screenObserver, events: bus });
 
   // Mouse/cursor control (Phase 5): PowerShell backend via the local server,
   // gated by the 'mouse.control' permission (default-deny). Verification
@@ -100,6 +133,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // domains on the single `computer.use` tool.
   const computerUseAgent = new ComputerUseAgent({
     observer: screenObserver,
+    adaptive: adaptiveObserver,
     mouse: computerControl,
     keyboard: keyboardControl,
     events: bus,
@@ -113,6 +147,14 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     backend: new HttpBrowserBackend(),
     events: bus,
     computerUse: { run: (goal, signal) => computerUseAgent.run(goal, signal) },
+    // Phase 13: browser requests screen observation only when useful
+    // (after navigation / when CDP state is insufficient). Best-effort.
+    adaptiveObservation: {
+      observe: (trigger) =>
+        adaptiveObserver
+          .observe({ trigger: trigger === 'browser_navigation' ? 'browser_navigation' : 'screen_change', priority: 'NORMAL', reason: `browser agent: ${trigger}` })
+          .then(() => undefined),
+    },
   });
   registry.registerAll(createBrowserAgentTools(browserAgent));
 
@@ -123,10 +165,35 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   const applicationService = new ApplicationService({ fs: new HttpFsBackend(), apps: new HttpAppBackend(), events: bus });
   registry.registerAll(createSystemTools(filesystemService, applicationService));
 
+  // Multimodal intelligence (Phase 14): a task-scoped, bounded evidence
+  // context fed by text, Phase 4/13 screen evidence, Phase 8 browser state,
+  // Phase 9 application state, and Phase 3 tool results. Purely additive:
+  // Agent Core, permissions, recovery, learning safety, and adaptive
+  // observation remain authoritative for every decision.
+  const multimodal = new MultimodalService(
+    { adaptive: adaptiveObserver, browserAgent, applicationService },
+    {}
+  );
+  // Phase 14: CU observations also become multimodal evidence (read-only).
+  computerUseAgent.setMultimodal({ recordObservation: (state) => multimodal.context.addInput({ type: 'ui_state', state, source: 'phase7.computerUse' }) });
+
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal };
   }
+
+  // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
+  const detachLearning = learning.attach();
+
+  // Adaptive observation (Phase 13): event-driven triggers on the shared bus.
+  const detachObservation = adaptiveObserver.attach(bus);
+
+  // Multimodal intelligence (Phase 14): task lifecycle + tool results feed
+  // the bounded evidence context; purged on task end.
+  const detachMultimodal = multimodal.attach(bus);
+
+  // Learned workflows may require fresh screen state for specific steps.
+  core.setAdaptiveObserver(adaptiveObserver);
 
   // Apply declarative UI effects from completed steps onto the existing app state.
   const detachStepListener = bus.on('TASK_STEP_COMPLETED', (event: AgentEvent) => {
@@ -144,9 +211,15 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     registry,
     permissions,
     screenObserver,
+    adaptiveObserver,
     keyboardControl,
+    learning,
+    multimodal,
     detach: () => {
       detachStepListener();
+      detachLearning();
+      detachObservation();
+      detachMultimodal();
     },
   };
 }

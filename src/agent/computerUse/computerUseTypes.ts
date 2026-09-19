@@ -64,6 +64,13 @@ export interface FocusChange {
 
 export interface ComputerUseOptions {
   observer?: import('../vision/screenObserver').ScreenObserver;
+  /** Adaptive observation layer (Phase 13): when present, the OBSERVE step
+   * consults it for when/how to observe instead of the fixed stale-ms rule. */
+  adaptive?: import('../observation/adaptiveObserver').AdaptiveObserver;
+  /** Multimodal evidence hook (Phase 14): successful observations are
+   * recorded as ui_state evidence for cross-modal reasoning. Optional and
+   * read-only for the CU loop — it cannot bypass any CU behavior. */
+  multimodal?: { recordObservation(state: ScreenState): void };
   mouse: import('../computer/computerControl').ComputerControlService;
   keyboard: import('../computer/keyboardControl').KeyboardControlService;
   events?: import('../events').AgentEventBus;

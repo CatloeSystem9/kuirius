@@ -635,11 +635,17 @@ export default function App() {
     const isDanceCommand = /\b(dance|dancing|dances|waltz|ballet|tango|groove)\b/i.test(text);
     const isStopDanceCommand = /\b(stop\s+dancing|stop\s+dance|halt|pause\s+dance|enough\s+dancing)\b/i.test(text);
 
-    // Check for greeting command or greeting words
-    const isGreetingCommand = /\b(greet(\s+me)?|greeting|greetings|hello|hi|hey|good\s+morning|good\s+afternoon|good\s+evening|wave(\s+at\s+me|\s+to\s+me)?|say\s+hi|say\s+hello|welcome|howdy|sup|salute)\b/i.test(text);
+    // Check for greeting command or greeting words (English & Hindi)
+    const isGreetingCommand =
+      /\b(greet(\s+me)?|greeting|greetings|hello|hi|hey|good\s+morning|good\s+afternoon|good\s+evening|wave(\s+at\s+me|\s+to\s+me)?|say\s+hi|say\s+hello|welcome|howdy|sup|salute|namaste|namaskar|pranam|kaise\s+ho|kaisi\s+ho|kya\s+haal)\b/i.test(
+        text
+      ) || /(?:नमस्ते|प्रणाम|कैसी\s+हो|कैसे\s+हो)/.test(text);
 
-    // Check for thank you command or appreciation words
-    const isThankCommand = /\b(thank\s+you|thanks|thank\s+u|thx|arigato|appreciate\s+(you|it)|grateful|good\s+job|great\s+job)\b/i.test(text);
+    // Check for thank you command or appreciation words (English & Hindi)
+    const isThankCommand =
+      /\b(thank\s+you|thanks|thank\s+u|thx|arigato|appreciate\s+(you|it)|grateful|good\s+job|great\s+job|shukriya|dhanyawad|dhanyavad)\b/i.test(
+        text
+      ) || /(?:शुक्रिया|धन्यवाद|आभार)/.test(text);
 
     // Check for looking in different directions commands
     const isLookDifferentDirections = /\b(look\s+(in\s+|at\s+)?(different|various|all|multiple|other)\s+directions?|look\s+around|look\s+everywhere|look\s+around\s+you|look\s+in\s+all\s+directions|turn\s+around)\b/i.test(text);
@@ -988,6 +994,7 @@ export default function App() {
           locationError: locationAcquisitionError || undefined,
           isExplicitLocationQuery: isLocationQuery,
           wantsToOpenMaps,
+          languagePreference: settings.languagePreference || 'auto',
         }),
       });
 
@@ -1043,14 +1050,17 @@ export default function App() {
       setEmotionData(mergedEmotionData);
       setLastSpokenText(botReply);
 
-      // Trigger Voice TTS if enabled & animate talking
+      // Trigger Voice TTS if enabled & animate talking (with target language preference and sweet feminine pitch)
       if (settings.voiceEnabled) {
         speakKrishaText(
           botReply,
-          settings.voiceName,
+          settings.voiceName || 'Aoede',
           settings.voiceSpeed,
           () => setIsSpeaking(true),
-          () => setIsSpeaking(false)
+          () => setIsSpeaking(false),
+          undefined,
+          settings.languagePreference || 'auto',
+          settings.voicePitch ?? 1.25
         );
       } else {
         setIsSpeaking(true);
@@ -1121,10 +1131,13 @@ export default function App() {
 
     speakKrishaText(
       text,
-      settings.voiceName,
+      settings.voiceName || 'Aoede',
       settings.voiceSpeed,
       () => setIsSpeaking(true),
-      () => setIsSpeaking(false)
+      () => setIsSpeaking(false),
+      undefined,
+      settings.languagePreference || 'auto',
+      settings.voicePitch ?? 1.25
     );
   };
 
@@ -1172,21 +1185,31 @@ export default function App() {
       sendMessageRef.current(res.command.trim());
     } else {
       // She was just called by name: "Krisha!" / "Hey Krisha"
-      const wakeGreetings = [
-        `I'm right here, ${settings.userName || 'darling'}! What can I do for you?`,
-        `Yes! I'm listening~ What's on your mind?`,
-        `Hey ${settings.userName || 'there'}! I'm wide awake and listening.`,
-      ];
+      const isHindiMode = settings.languagePreference === 'hi';
+      const wakeGreetings = isHindiMode
+        ? [
+            `हाँ जी! मैं यहीं हूँ। बताइए क्या मदद करूँ?`,
+            `जी, मैं सुन रही हूँ! क्या चल रहा है?`,
+            `नमस्ते! मैं बिल्कुल तैयार और जाग रही हूँ।`,
+          ]
+        : [
+            `I'm right here, ${settings.userName || 'darling'}! What can I do for you?`,
+            `Yes! I'm listening~ What's on your mind?`,
+            `Hey ${settings.userName || 'there'}! I'm wide awake and listening.`,
+          ];
       const randomGreeting = wakeGreetings[Math.floor(Math.random() * wakeGreetings.length)];
       setLastSpokenText(randomGreeting);
 
       if (settings.voiceEnabled) {
         speakKrishaText(
           randomGreeting,
-          settings.voiceName,
+          settings.voiceName || 'Aoede',
           settings.voiceSpeed,
           () => setIsSpeaking(true),
-          () => setIsSpeaking(false)
+          () => setIsSpeaking(false),
+          undefined,
+          settings.languagePreference || 'auto',
+          settings.voicePitch ?? 1.25
         );
       } else {
         setIsSpeaking(true);
@@ -1201,7 +1224,8 @@ export default function App() {
       wakeWordManager.startListening(
         handleWakeWordDetected,
         (status) => setWakeWordStatus(status),
-        (transcript) => setLiveTranscript(transcript)
+        (transcript) => setLiveTranscript(transcript),
+        settings.languagePreference || 'auto'
       );
     } else {
       wakeWordManager.stopListening();
@@ -1211,7 +1235,7 @@ export default function App() {
     return () => {
       wakeWordManager.stopListening();
     };
-  }, [settings.wakeWordEnabled, settings.voiceEnabled, settings.voiceName, settings.voiceSpeed, settings.userName]);
+  }, [settings.wakeWordEnabled, settings.voiceEnabled, settings.voiceName, settings.voiceSpeed, settings.voicePitch, settings.userName, settings.languagePreference]);
 
   return (
     <div
@@ -1476,6 +1500,13 @@ export default function App() {
             wakeWordStatus={wakeWordStatus}
             wakeWordDetected={wakeWordDetectedAlert}
             liveTranscript={liveTranscript}
+            languagePreference={settings.languagePreference || 'auto'}
+            onChangeLanguage={(newLang) =>
+              handleSaveSettings({
+                ...settings,
+                languagePreference: newLang,
+              })
+            }
           />
         </div>
 
@@ -1562,6 +1593,12 @@ export default function App() {
         settings={settings}
         onSaveSettings={handleSaveSettings}
         onResetAllData={handleResetAllData}
+        onDataRestored={() => {
+          setSettings(getStoredSettings());
+          setConversations(getStoredConversations());
+          setActiveConvoId(getActiveConversationId());
+          setMemories(getMemoryService().displayMemories());
+        }}
       />
 
       <LocationDetailsModal

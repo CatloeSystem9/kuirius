@@ -16,7 +16,7 @@ export type WakeWordStatus = 'listening' | 'idle' | 'detected' | 'paused_speakin
 
 const WAKE_WORD_PATTERNS = [
   /\b(?:hey|hi|hello|ok|okay|wake\s+up|yo)?\s*krisha\b/i,
-  /\bkrisha\s*(?:wake\s+up|listen|are\s+you\s+there)?\b/i,
+  /\bkrisha\s*(?:wake\s+up|listen|are\s+you\s+there|suno|kya\s+kar\s+rahi\s+ho)?\b/i,
   /\b(?:hey|hi|hello|ok|okay)?\s*kreesha\b/i,
   /\b(?:hey|hi|hello|ok|okay)?\s*kreisha\b/i,
   /\b(?:hey|hi|hello|ok|okay)?\s*krishna\b/i,
@@ -24,10 +24,15 @@ const WAKE_WORD_PATTERNS = [
   /\b(?:hey|hi|hello|ok|okay)?\s*crisha\b/i,
   /\b(?:hey|hi|hello|ok|okay)?\s*karisha\b/i,
   /\b(?:hey|hi|hello|ok|okay)?\s*grisha\b/i,
+  // Hindi script & phonetics:
+  /(?:नमस्ते|सुनो|हे|अरे)?\s*कृषा/i,
+  /कृषा\s*(?:सुनो|नमस्ते|कैसी\s+हो)?/i,
+  /\b(?:suno|namaste|arey|are|sun)\s+krisha\b/i,
 ];
 
 export class WakeWordManager {
   private recognition: any = null;
+  private currentLanguage: string = 'en-IN';
   private isListeningDesired: boolean = false;
   private isKrishaSpeaking: boolean = false;
   private isTabHidden: boolean = false;
@@ -75,7 +80,7 @@ export class WakeWordManager {
       const rec = new SpeechRecognition();
       rec.continuous = true;
       rec.interimResults = true;
-      rec.lang = 'en-US';
+      rec.lang = this.currentLanguage || 'en-IN';
       rec.maxAlternatives = 1; // Lower alternatives to save RAM and CPU
 
       rec.onstart = () => {
@@ -207,12 +212,22 @@ export class WakeWordManager {
   public startListening(
     onWake: (res: WakeWordResult) => void,
     onStatusChange?: (status: WakeWordStatus) => void,
-    onTranscript?: (transcript: string) => void
+    onTranscript?: (transcript: string) => void,
+    languagePreference?: string
   ) {
     this.isListeningDesired = true;
     this.onWakeWordCallback = onWake;
     this.onStatusChangeCallback = onStatusChange || null;
     this.onTranscriptUpdateCallback = onTranscript || null;
+
+    const newLang =
+      languagePreference === 'hi' ? 'hi-IN' : languagePreference === 'en' ? 'en-US' : 'en-IN';
+    if (this.currentLanguage !== newLang && this.recognition) {
+      this.currentLanguage = newLang;
+      this.recognition.lang = newLang;
+    } else {
+      this.currentLanguage = newLang;
+    }
 
     if (!this.recognition) {
       this.initRecognition();

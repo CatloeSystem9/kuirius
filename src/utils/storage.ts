@@ -11,9 +11,11 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   userName: 'Darling',
   voiceEnabled: true,
   wakeWordEnabled: false,
-  voiceName: 'Kore',
+  voiceName: 'Aoede',
   voiceSpeed: 1.0,
-  companionNotes: 'Speaks warmly, enjoys late-night banter, caring yet playfully teasing.',
+  voicePitch: 1.25,
+  languagePreference: 'auto',
+  companionNotes: 'Speaks sweetly and warmly in English & Hindi with an affectionate, feminine charm.',
 };
 
 export const DEFAULT_MEMORIES: string[] = [
@@ -26,7 +28,13 @@ export function getStoredSettings(): CompanionSettings {
   try {
     const raw = localStorage.getItem(STORAGE_KEYS.SETTINGS);
     if (!raw) return DEFAULT_SETTINGS;
-    return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    const parsed = JSON.parse(raw);
+    // Upgrade legacy default 'Kore' to the sweeter feminine 'Aoede' voice
+    if (parsed.voiceName === 'Kore' && !parsed.voicePitch) {
+      parsed.voiceName = 'Aoede';
+      parsed.voicePitch = 1.25;
+    }
+    return { ...DEFAULT_SETTINGS, ...parsed };
   } catch {
     return DEFAULT_SETTINGS;
   }
@@ -98,5 +106,120 @@ export function setActiveConversationId(id: string | null): void {
     }
   } catch (e) {
     console.error('Failed to set active conversation:', e);
+  }
+}
+
+export interface KrishaBackupBundle {
+  version: number;
+  exportedAt: string;
+  sourceOrigin?: string;
+  conversations?: Conversation[];
+  activeConversationId?: string | null;
+  memories?: string[];
+  memoriesV2?: unknown;
+  settings?: CompanionSettings;
+  location?: unknown;
+}
+
+export function createKrishaBackupBundle(): KrishaBackupBundle {
+  let settings: CompanionSettings | undefined;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+    if (raw) settings = JSON.parse(raw);
+  } catch {}
+
+  let conversations: Conversation[] | undefined;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.CONVERSATIONS);
+    if (raw) conversations = JSON.parse(raw);
+  } catch {}
+
+  let memories: string[] | undefined;
+  try {
+    const raw = localStorage.getItem(STORAGE_KEYS.MEMORIES);
+    if (raw) memories = JSON.parse(raw);
+  } catch {}
+
+  let memoriesV2: unknown = undefined;
+  try {
+    const raw = localStorage.getItem('krisha_agent_memory_v2');
+    if (raw) memoriesV2 = JSON.parse(raw);
+  } catch {}
+
+  let activeId: string | null = null;
+  try {
+    activeId = localStorage.getItem(STORAGE_KEYS.ACTIVE_ID);
+  } catch {}
+
+  let location: unknown = undefined;
+  try {
+    const raw = localStorage.getItem('krisha_cached_location');
+    if (raw) location = JSON.parse(raw);
+  } catch {}
+
+  return {
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    sourceOrigin: typeof window !== 'undefined' ? window.location.origin : '',
+    settings,
+    conversations,
+    activeConversationId: activeId,
+    memories,
+    memoriesV2,
+    location,
+  };
+}
+
+export function restoreKrishaBackupBundle(bundle: KrishaBackupBundle): {
+  success: boolean;
+  restoredMemoriesCount: number;
+  restoredConversationsCount: number;
+  message?: string;
+} {
+  try {
+    if (!bundle || typeof bundle !== 'object') {
+      return { success: false, restoredMemoriesCount: 0, restoredConversationsCount: 0, message: 'Invalid backup file format' };
+    }
+
+    if (bundle.settings) {
+      localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(bundle.settings));
+    }
+
+    let convoCount = 0;
+    if (Array.isArray(bundle.conversations)) {
+      localStorage.setItem(STORAGE_KEYS.CONVERSATIONS, JSON.stringify(bundle.conversations));
+      convoCount = bundle.conversations.length;
+    }
+
+    if (bundle.activeConversationId) {
+      localStorage.setItem(STORAGE_KEYS.ACTIVE_ID, bundle.activeConversationId);
+    }
+
+    let memCount = 0;
+    if (Array.isArray(bundle.memories)) {
+      localStorage.setItem(STORAGE_KEYS.MEMORIES, JSON.stringify(bundle.memories));
+      memCount = bundle.memories.length;
+    }
+
+    if (bundle.memoriesV2) {
+      localStorage.setItem('krisha_agent_memory_v2', JSON.stringify(bundle.memoriesV2));
+    }
+
+    if (bundle.location) {
+      localStorage.setItem('krisha_cached_location', JSON.stringify(bundle.location));
+    }
+
+    return {
+      success: true,
+      restoredMemoriesCount: memCount,
+      restoredConversationsCount: convoCount,
+    };
+  } catch (err) {
+    return {
+      success: false,
+      restoredMemoriesCount: 0,
+      restoredConversationsCount: 0,
+      message: err instanceof Error ? err.message : String(err),
+    };
   }
 }

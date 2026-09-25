@@ -1,6 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { Send, Mic, MicOff, Volume2, VolumeX, Loader2, Sparkles, Radio, Paperclip } from 'lucide-react';
+import { Send, Mic, MicOff, Volume2, VolumeX, Loader2, Sparkles, Radio, Paperclip, Globe } from 'lucide-react';
+import { LanguagePreference } from '../types';
 
 interface DirectChatInputProps {
   onSendMessage: (text: string) => void;
@@ -16,6 +17,8 @@ interface DirectChatInputProps {
   wakeWordStatus?: string;
   wakeWordDetected?: boolean;
   liveTranscript?: string;
+  languagePreference?: LanguagePreference;
+  onChangeLanguage?: (lang: LanguagePreference) => void;
 }
 
 export const DirectChatInput: React.FC<DirectChatInputProps> = ({
@@ -32,6 +35,8 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   wakeWordStatus = 'listening',
   wakeWordDetected = false,
   liveTranscript = '',
+  languagePreference = 'auto',
+  onChangeLanguage,
 }) => {
   const [inputText, setInputText] = useState('');
   const [isRecording, setIsRecording] = useState(false);
@@ -47,7 +52,16 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
         const recognition = new SpeechRecognition();
         recognition.continuous = false;
         recognition.interimResults = true;
-        recognition.lang = 'en-US';
+
+        // Adapt recognition language to Hindi, English, or Indian English/Hinglish
+        if (languagePreference === 'hi') {
+          recognition.lang = 'hi-IN';
+        } else if (languagePreference === 'en') {
+          recognition.lang = 'en-US';
+        } else {
+          // 'auto' or 'multilingual': en-IN handles English, Hinglish, and Hindi phonetics seamlessly
+          recognition.lang = 'en-IN';
+        }
 
         recognition.onresult = (event: any) => {
           let trans = '';
@@ -79,7 +93,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
         recognitionRef.current = recognition;
       }
     }
-  }, [onSendMessage, onTypingChange]);
+  }, [onSendMessage, onTypingChange, languagePreference]);
 
   const toggleRecording = () => {
     if (!recognitionRef.current) {
@@ -218,6 +232,37 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
           </button>
         )}
 
+        {/* Quick Language Toggle Pill */}
+        <button
+          type="button"
+          onClick={() => {
+            const nextLang =
+              languagePreference === 'auto' ? 'hi' : languagePreference === 'hi' ? 'en' : 'auto';
+            onChangeLanguage?.(nextLang);
+          }}
+          className={`flex items-center gap-1 px-2.5 py-1.5 rounded-full text-[11px] font-medium transition-all cursor-pointer flex-shrink-0 ${
+            languagePreference === 'hi'
+              ? 'bg-amber-500/15 border border-amber-500/40 text-amber-300'
+              : languagePreference === 'en'
+              ? 'bg-blue-500/15 border border-blue-500/40 text-blue-300'
+              : isLightMode
+              ? 'bg-slate-100 border border-slate-200 text-slate-700 hover:bg-slate-200'
+              : 'bg-[#0b1020] border border-blue-900/30 text-slate-300 hover:bg-[#101830] hover:text-blue-300'
+          }`}
+          title={`Language mode: ${
+            languagePreference === 'hi'
+              ? 'Hindi (हिन्दी / Hinglish)'
+              : languagePreference === 'en'
+              ? 'English'
+              : 'Auto (English & Hindi)'
+          } - Click to switch speech & reply language`}
+        >
+          <Globe className="w-3 h-3 flex-shrink-0" />
+          <span className="font-mono text-[10px] tracking-wide uppercase">
+            {languagePreference === 'hi' ? 'हिन्दी' : languagePreference === 'en' ? 'EN' : 'Auto'}
+          </span>
+        </button>
+
         {/* Text Input directly on main screen */}
         <input
           ref={inputRef}
@@ -225,12 +270,20 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
           id="main-chat-input"
           placeholder={
             isLoading
-              ? 'Krisha is thinking...'
+              ? languagePreference === 'hi'
+                ? 'कृषा सोच रही है...'
+                : 'Krisha is thinking...'
               : isSpeaking
-              ? 'Krisha is speaking...'
+              ? languagePreference === 'hi'
+                ? 'कृषा बोल रही है...'
+                : 'Krisha is speaking...'
               : wakeWordEnabled
-              ? 'Say "Krisha open PDF" or type here...'
-              : 'Type "open pdf" or ask Krisha...'
+              ? languagePreference === 'hi'
+                ? 'कहिए "Krisha" या यहाँ टाइप कीजिए...'
+                : 'Say "Krisha" or type here...'
+              : languagePreference === 'hi'
+              ? 'यहाँ हिन्दी या English में लिखिए...'
+              : 'Type in English, Hindi, or ask Krisha...'
           }
           value={inputText}
           onChange={handleInputChange}

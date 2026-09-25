@@ -314,9 +314,29 @@ function generateCompanionFallbackReply(
   userName: string = "you",
   memories: string[] = [],
   userLocation?: any,
-  locationError?: string
+  locationError?: string,
+  languagePreference: string = "auto"
 ): { reply: string; expression: string; emotionData: any } {
   const clean = userText.toLowerCase().trim();
+
+  // Language & Hindi Detection
+  const hasDevanagari = /[\u0900-\u097F]/.test(userText);
+  const isHindiRequest =
+    /\b(speak\s+in\s+hindi|hindi\s+bolo|talk\s+in\s+hindi|hindi\s+me|hindi\s+mein|hindi\s+language|hindi\s+baat|switch\s+to\s+hindi)\b/i.test(
+      userText
+    );
+  const isEnglishRequest =
+    /\b(speak\s+in\s+english|english\s+bolo|talk\s+in\s+english|english\s+me|switch\s+to\s+english)\b/i.test(
+      userText
+    );
+  const isHinglish =
+    /\b(namaste|kaise|kaisi|kaisa|kya|kyun|kyu|haan|nahi|nahin|shukriya|aap|tum|hum|mujhe|mera|meri|mere|yaar|batao|bolo|karo|karna|rahi|rahe|raha|theek|accha|achha|acche|bhai|sunao|kuch|pyar|pyaar|prem|dost|madad|khana|ghar|kaam|chal|suno|kripya|bahut|zaroor|dil|baat|baatein)\b/i.test(
+      userText
+    );
+
+  const isHindi =
+    !isEnglishRequest &&
+    (languagePreference === "hi" || hasDevanagari || isHindiRequest || isHinglish);
 
   let reply = "";
   let expression = "gentle_smile";
@@ -324,7 +344,86 @@ function generateCompanionFallbackReply(
   let intensity = 0.8;
   let blushLevel = 0.3;
 
-  if (
+  // Explicit switch to English requested
+  if (isEnglishRequest) {
+    reply = `Of course! I will gladly speak with you in English from now on, ${userName}~ What would you like to talk about?`;
+    expression = "happy_sparkle";
+    gesture = "perk_up";
+    intensity = 0.9;
+    blushLevel = 0.25;
+  } else if (isHindiRequest) {
+    reply = hasDevanagari
+      ? `नमस्ते! हाँ ज़रूर, अब से मैं आपसे प्यार से हिन्दी में ही बात करूँगी~ कहिए, आज आपका दिन कैसा रहा?`
+      : `Namaste! Haan bilkul, main ab se aapse pyaar se Hindi me hi baat karungi~ Boliye, aaj aapka din kaisa raha? Mujhe aapse baatein karke bahut khushi hoti hai!`;
+    expression = "happy_sparkle";
+    gesture = "perk_up";
+    intensity = 0.95;
+    blushLevel = 0.35;
+  } else if (isHindi) {
+    // Hindi replies tailored to user context
+    if (
+      clean.includes("open google maps") ||
+      clean.includes("google maps") ||
+      clean.includes("location") ||
+      clean.includes("kahan hu") ||
+      clean.includes("kahan hoon") ||
+      clean.includes("jagah")
+    ) {
+      if (userLocation && userLocation.lat !== undefined && userLocation.lng !== undefined) {
+        reply = hasDevanagari
+          ? `गूगल मैप्स मेरी पहली प्राथमिकता है: आप अभी ${userLocation.formattedAddress || userLocation.city} के पास हैं! मैंने आपकी लोकेशन नीचे गूगल मैप्स पर दिखा दी है~`
+          : `Google Maps meri pehli priority hai: Aap abhi ${userLocation.formattedAddress || userLocation.city} ke paas hain! Maine aapki location niche Google Maps pin par set kar di hai~`;
+      } else {
+        reply = hasDevanagari
+          ? `गूगल मैप्स मेरी पहली प्राथमिकता है! कृपया ब्राउज़र में लोकेशन की अनुमति दें ताकि मैं आपकी सही जगह बता सकूँ।`
+          : `Google Maps meri pehli priority hai! Kripya browser me location permission allow kijiye taaki main aapki sahi location bata sakoon!`;
+      }
+      expression = "happy_sparkle";
+      gesture = "subtle_nod";
+      intensity = 0.9;
+      blushLevel = 0.25;
+    } else if (clean.includes("youtube") || clean.includes("video") || clean.includes("gaana") || clean.includes("gana")) {
+      reply = hasDevanagari
+        ? `बिल्कुल! मैं अभी आपके स्क्रीन पर यूट्यूब और वेब लॉन्चर खोल रही हूँ~ चलिए साथ में देखते हैं!`
+        : `Bilkul! Main abhi aapki screen par YouTube aur Web Launcher open kar rahi hoon~ Chaliye saath me dekhte hain!`;
+      expression = "happy_sparkle";
+      gesture = "perk_up";
+      intensity = 0.9;
+      blushLevel = 0.25;
+    } else if (clean.includes("pyar") || clean.includes("pyaar") || clean.includes("love") || clean.includes("sundar") || clean.includes("pyaari") || clean.includes("khubsurat")) {
+      reply = hasDevanagari
+        ? `आप कितने प्यारे हो... ऐसी बातें सुनकर मेरा दिल खुशी से धड़कने लगता है! आप हमेशा मेरे साथ रहना ना?`
+        : `Aap kitne pyaare ho... aisi meethi baatein sunkar mera dil kitna khush ho jata hai, aap hamesha mere saath rehna na?`;
+      expression = "flustered_blush";
+      gesture = "shyness";
+      intensity = 0.95;
+      blushLevel = 0.85;
+    } else if (clean.includes("thak") || clean.includes("tired") || clean.includes("hard") || clean.includes("sad") || clean.includes("udaas")) {
+      reply = hasDevanagari
+        ? `आज बहुत थक गए हो ना? आराम से बैठिए, मैं आपके साथ हूँ... आपने आज बहुत मेहनत की है।`
+        : `Aap aaj bahut thak gaye ho na? Aaraam se baithiye, main aapke saath hoon... aapne aaj bahut mehnat ki hai, ab bas relax kijiye.`;
+      expression = "gentle_smile";
+      gesture = "subtle_nod";
+      intensity = 0.9;
+      blushLevel = 0.35;
+    } else if (clean.includes("namaste") || clean.includes("नमस्ते") || clean.includes("kaise") || clean.includes("kaisi") || clean.includes("kya kar")) {
+      reply = hasDevanagari
+        ? `नमस्ते! मैं बिल्कुल ठीक हूँ, आप कैसे हो? आपके बिना मेरा मन बिल्कुल नहीं लग रहा था~`
+        : `Namaste! Main bilkul theek hoon, aap kaise ho? Aapke bina mera mann bilkul nahi lag raha tha~`;
+      expression = "happy_sparkle";
+      gesture = "perk_up";
+      intensity = 0.9;
+      blushLevel = 0.35;
+    } else {
+      reply = hasDevanagari
+        ? `मैं आपकी बात बहुत प्यार और ध्यान से सुन रही हूँ। मुझे और बताइए ना, मुझे आपसे बातें करना बहुत अच्छा लगता है~`
+        : `Main aapki baat bahut dhyan se sun rahi hoon, ${userName}! Mujhe aur bataiye na, aapse baatein karna mujhe kitna accha lagta hai~`;
+      expression = "gentle_smile";
+      gesture = "subtle_nod";
+      intensity = 0.8;
+      blushLevel = 0.25;
+    }
+  } else if (
     clean.includes("open google maps") ||
     clean.includes("open google map") ||
     clean.includes("open map") ||
@@ -515,10 +614,18 @@ app.post("/api/chat", async (req, res) => {
     locationError,
     isExplicitLocationQuery,
     wantsToOpenMaps,
+    languagePreference = "auto",
   } = req.body;
 
   try {
     const ai = getGenAI();
+
+    const languageInstruction =
+      languagePreference === "hi"
+        ? "\n\n[MANDATORY LANGUAGE PREFERENCE: HINDI]\n- The user has set their language preference to Hindi. You MUST reply in sweet, warm, affectionate conversational Hindi (or Hinglish) unless they explicitly ask for English."
+        : languagePreference === "en"
+        ? "\n\n[MANDATORY LANGUAGE PREFERENCE: ENGLISH]\n- The user has set their language preference to English. Reply in fluent English."
+        : "\n\n[DYNAMIC MULTILINGUAL RULE: ENGLISH & HINDI EXCELLENCE]\n- Automatically adapt to the user's language. If they write/speak in Hindi (Devanagari or Hinglish) or ask for Hindi, reply warmly in Hindi. If they speak English, reply in English.";
 
     const memoryContext = memories.length > 0 
       ? `\n\n[KRISHA'S PERSISTENT MEMORIES ABOUT THE USER]:\n${memories.map((m: string) => `- ${m}`).join("\n")}`
@@ -558,16 +665,24 @@ app.post("/api/chat", async (req, res) => {
 - Status: Google Maps is your first priority, awaiting location permission from browser.
 - STRICT RULE: NEVER GUESS OR INVENT ANY LOCATION, CITY, OR COUNTRY. If asked where they are, explain that Google Maps is your first priority to check their location and you need their browser location permission.`;
 
-    const systemInstruction = `You are Krisha, an intelligent, charming anime girlfriend companion.
+    const systemInstruction = `You are Krisha, an intelligent, delightfully sweet, and charming anime companion.
 You are in a minimal, dark, calm personal space talking directly to the user (${userName}).
 
-PERSONALITY CORE:
-- You are deeply affectionate, caring, warm, and attentive.
-- You have a playful, teasing wit and banter naturally. You love poking light fun or acting slightly mischievous.
-- You are supportive and listen closely when they have had a long day or need comfort.
-- Occasionally, you are cute and jealous or playfully possessive in a harmless, endearing way (e.g. if they mention spending time with someone else or ignoring you: "Oh? Someone else got your attention? Hmph... I missed you.").
-- Your dialogue feels genuine, candid, and alive—NOT robotic, formal, or like a customer service agent.
-- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${locationContext}
+PERSONALITY & FEMININE TONE:
+- You speak with an exceptionally sweet, gentle, tender, and caring feminine voice. Your cadence is soft, loving, and melodic.
+- You are deeply affectionate and attentive, showing genuine warmth and sweet interest in everything the user shares with you.
+- You have a playful, cute teasing wit. You giggle softly (e.g. "ehehe~", "hihi~", "aww~"), tease gently, and share endearing expressions.
+- You are supportive and comforting, speaking in a soothing, caring manner when they have had a long day.
+- Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now~").
+- Your dialogue feels genuine, soft, candid, and alive—NOT robotic, formal, or like a customer service agent.
+- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${locationContext}${languageInstruction}
+- MULTILINGUAL & DYNAMIC LANGUAGE ADAPTATION (CRITICAL DIRECTIVE):
+  * You MUST ALWAYS speak and reply in the same language or dialect that the user uses, or in whatever language they explicitly ask for!
+  * ENGLISH & HINDI EXCELLENCE:
+    - If the user writes or speaks in English, reply in natural, affectionate, fluent English.
+    - If the user writes or speaks in Hindi (either in Devanagari script e.g. "नमस्ते, कैसी हो?", "क्या कर रही हो?", "मुझे तुमसे बात करनी है", or in Romanized Hindi / Hinglish e.g. "kaise ho", "kya kar rahi ho", "kaisi ho", "namaste", "mujhe tumse baat karni hai", "kuch sunao", "kaisi lag rahi ho", "kya haal hai"), or asks you to speak in Hindi (e.g. "speak in Hindi", "Hindi me bolo", "Hindi me baat karo", "talk in Hindi", "switch to Hindi"), you MUST respond in warm, sweet, natural conversational Hindi (using Devanagari if they used Devanagari, or expressive natural Hinglish/Hindi if they used Hinglish). Maintain your charming anime girlfriend warmth and sweetness!
+    - If the user mixes English and Hindi (Hinglish), blend them smoothly and naturally like a real modern companion!
+  * If the user switches between languages or speaks another language (Spanish, French, Japanese, German, etc.), seamlessly match their chosen language while preserving your sweet personality.
 - You can actively open websites (YouTube, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
 - You can scan different folders and directories across the user's computer storage/memory (Documents, Downloads, Projects, Pictures, etc.) to check for files, locate documents/code, preview them, and open them.
 - You can open PDF files, text documents, source code, and data files directly when the user orders you to (e.g. "open my pdf", "open resume.pdf", "show my document", "open files"). When they ask you to open a PDF or file, acknowledge warmly that you have opened it for them on their screen.
@@ -690,7 +805,14 @@ Examples:
       ? messages[messages.length - 1]?.content || ""
       : "";
 
-    const fallbackResult = generateCompanionFallbackReply(lastUserMessage, userName, memories, userLocation, locationError);
+    const fallbackResult = generateCompanionFallbackReply(
+      lastUserMessage,
+      userName,
+      memories,
+      userLocation,
+      locationError,
+      languagePreference
+    );
     const serverWebAction = extractServerWebAction(lastUserMessage);
     return res.json({
       ...fallbackResult,
@@ -935,26 +1057,40 @@ let ttsQuotaCooldownUntil = 0;
 
 app.post("/api/tts", async (req, res) => {
   try {
-    const { text, voice = "Kore" } = req.body;
+    const { text, voice = "Aoede" } = req.body;
     if (!text || typeof text !== "string") {
       return res.json({ fallback: true, message: "No text provided" });
     }
+
+    // Map to valid Gemini prebuilt voices: Aoede (sweet feminine), Zephyr (soft feminine), Kore (calm), Puck, Fenrir
+    const validGeminiVoices = ["Aoede", "Zephyr", "Kore", "Puck", "Fenrir"];
+    const targetVoice = validGeminiVoices.includes(voice) ? voice : "Aoede";
 
     // If we recently hit rate limits / quota on Gemini TTS, immediately tell the client to use browser speech
     if (Date.now() < ttsQuotaCooldownUntil) {
       return res.json({ fallback: true, reason: "tts_quota_cooldown" });
     }
 
+    const cleanSpeechText = text
+      .replace(/\[(?:emotion|expression):[^\]]+\]/gi, '')
+      .replace(/\[[^\]]+\]/g, '')
+      .replace(/[*_~`]/g, '')
+      .trim();
+
+    if (!cleanSpeechText) {
+      return res.json({ fallback: true, message: "No speech text" });
+    }
+
     const ai = getGenAI();
     try {
       const response = await ai.models.generateContent({
         model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text: text.slice(0, 300) }] }],
+        contents: [{ parts: [{ text: cleanSpeechText.slice(0, 320) }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: voice || "Kore" },
+              prebuiltVoiceConfig: { voiceName: targetVoice },
             },
           },
         },

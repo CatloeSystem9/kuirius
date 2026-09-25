@@ -15,7 +15,7 @@ export type AvatarExpression =
   | 'happy'
   | 'listening';
 
-export type VoiceModel = 'Kore' | 'Zephyr' | 'Puck' | 'Fenrir' | string;
+export type VoiceModel = 'Aoede' | 'Zephyr' | 'Leda' | 'Kore' | 'Puck' | 'Fenrir' | string;
 
 export interface EmotionAnalysis {
   expression: AvatarExpression;
@@ -139,12 +139,16 @@ export interface Conversation {
   messages: Message[];
 }
 
+export type LanguagePreference = 'auto' | 'en' | 'hi' | 'multilingual';
+
 export interface CompanionSettings {
   userName: string;
   voiceEnabled: boolean;
   wakeWordEnabled: boolean;
   voiceName: string;
   voiceSpeed: number;
+  voicePitch?: number;
+  languagePreference?: LanguagePreference;
   companionNotes: string;
 }
 

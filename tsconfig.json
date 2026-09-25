@@ -22,5 +22,10 @@
     },
     "allowImportingTsExtensions": true,
     "noEmit": true
-  }
+  },
+  "exclude": [
+    "krisha-specialists/tests",
+    "dist",
+    "node_modules"
+  ]
 }

@@ -13,6 +13,7 @@ import {
   LaptopAppAction,
   MapsLocationAction,
   UserLocation,
+  GlobeAction,
 } from './types';
 import {
   getStoredSettings,
@@ -70,6 +71,7 @@ import { MapsLocationCard } from './components/MapsLocationCard';
 import { LocationDetailsModal } from './components/LocationDetailsModal';
 import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { WebBrowserModal } from './components/WebBrowserModal';
+import { GlobeModal } from './components/globe/GlobeModal';
 
 export default function App() {
   // State
@@ -111,6 +113,7 @@ export default function App() {
   const [activeWebAction, setActiveWebAction] = useState<WebAction | null>(null);
   const [activeFileAction, setActiveFileAction] = useState<LocalFileAction | null>(null);
   const [activeAppAction, setActiveAppAction] = useState<LaptopAppAction | null>(null);
+  const [activeGlobeAction, setActiveGlobeAction] = useState<GlobeAction | null>(null);
   const [initialAppSearch, setInitialAppSearch] = useState<string>('');
 
   const isWhiteBackground = isDancing || Boolean(lookDirection);
@@ -183,6 +186,10 @@ export default function App() {
       applyFileAction: (action) => setActiveFileAction(action),
       applyMapsAction: (action) => setActiveLocationAction(action),
       applyViewerFile: (file) => setActiveViewerFile(file),
+      applyGlobeAction: (action) => {
+        setActiveGlobeAction(action);
+        setActiveModal('globe');
+      },
       openModal: (modal) => setActiveModal(modal),
       setPose: (pose) => setForcedPose(pose as VideoAnimationPose),
     });
@@ -854,6 +861,52 @@ export default function App() {
       }
     }
 
+    // Check for 3D Earth / Globe interaction commands
+    let detectedGlobeAction: GlobeAction | null = null;
+    const isGlobeIntent =
+      /\b(globe|3d\s+earth|earth\s+view|satellite\s+view|explore\s+earth)\b/i.test(text) ||
+      /\b(?:take\s+me\s+to|fly\s+to|show)\s+[a-zA-Z\s]+?\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth)\b/i.test(text);
+
+    if (isGlobeIntent) {
+      if (/\b(return|reset|back\s+to\s+earth|full\s+earth)\b/i.test(text)) {
+        detectedGlobeAction = { type: 'reset_view' };
+      } else if (/\b(satellite)\b/i.test(text)) {
+        detectedGlobeAction = { type: 'set_layer', layer: 'satellite' };
+      } else if (/\b(dark|night)\b/i.test(text)) {
+        detectedGlobeAction = { type: 'set_layer', layer: 'dark' };
+      } else if (/\b(terrain|relief|topo)\b/i.test(text)) {
+        detectedGlobeAction = { type: 'set_layer', layer: 'terrain' };
+      } else if (/\b(standard|map)\b/i.test(text)) {
+        detectedGlobeAction = { type: 'set_layer', layer: 'standard' };
+      } else {
+        const placeMatch = text.match(
+          /\b(?:show|take\s+me\s+to|fly\s+to|zoom\s+into|locate)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe)|$)/i
+        );
+        const place = placeMatch ? placeMatch[1].trim() : undefined;
+        if (place && !['earth', 'the earth', 'globe', 'the globe', 'me', 'it'].includes(place.toLowerCase())) {
+          try {
+            const geocoded = await geocodeAddress(place);
+            detectedGlobeAction = {
+              type: 'fly_to',
+              locationName: place,
+              lat: geocoded?.lat,
+              lng: geocoded?.lng,
+            };
+          } catch {
+            detectedGlobeAction = { type: 'fly_to', locationName: place };
+          }
+        } else {
+          detectedGlobeAction = { type: 'open_globe' };
+        }
+      }
+
+      if (detectedGlobeAction) {
+        setActiveGlobeAction(detectedGlobeAction);
+        setActiveModal('globe');
+        setForcedPose('waving_greeting');
+      }
+    }
+
     // Analyze user message sentiment immediately
     const userEmotion = analyzeSentimentAndKeywords(text);
 
@@ -863,7 +916,7 @@ export default function App() {
       content: text.trim(),
       timestamp: Date.now(),
       expression:
-        detectedWebAction || detectedFileAction || detectedAppAction || detectedMapsAction
+        detectedWebAction || detectedFileAction || detectedAppAction || detectedMapsAction || detectedGlobeAction
           ? 'happy_sparkle'
           : userEmotion.expression,
       emotionData: userEmotion,
@@ -871,6 +924,7 @@ export default function App() {
       fileAction: detectedFileAction || undefined,
       appAction: detectedAppAction || undefined,
       mapsAction: detectedMapsAction || undefined,
+      globeAction: detectedGlobeAction || undefined,
     };
 
     let targetConvo = currentConversation;
@@ -1537,6 +1591,17 @@ export default function App() {
           setForcedPose('waving_greeting');
         }}
         isLightMode={isWhiteBackground}
+      />
+
+      <GlobeModal
+        isOpen={activeModal === 'globe'}
+        onClose={() => {
+          setActiveModal(null);
+          setActiveGlobeAction(null);
+        }}
+        userLocation={userLocation}
+        initialAction={activeGlobeAction}
+        onActionComplete={() => setActiveGlobeAction(null)}
       />
     </div>
   );

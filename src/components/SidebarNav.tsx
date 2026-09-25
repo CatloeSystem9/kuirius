@@ -1,5 +1,5 @@
 import React from 'react';
-import { History, BrainCircuit, Settings, HardDrive, Laptop, MapPin, Globe } from 'lucide-react';
+import { History, BrainCircuit, Settings, HardDrive, Laptop, MapPin, Globe, Orbit } from 'lucide-react';
 import { ActiveModal, UserLocation } from '../types';
 
 interface SidebarNavProps {
@@ -130,7 +130,24 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             )}
           </button>
 
-          {/* 7. Settings */}
+          {/* 7. Interactive 3D Earth */}
+          <button
+            id="nav-globe"
+            title="Interactive 3D Earth / Globe"
+            onClick={() => onSelectModal(activeModal === 'globe' ? null : 'globe')}
+            className={`relative p-3 rounded-2xl transition-all cursor-pointer group ${
+              activeModal === 'globe'
+                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
+                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+            }`}
+          >
+            <Orbit className="w-5 h-5 transition-transform group-hover:scale-110" />
+            {activeModal === 'globe' && (
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+            )}
+          </button>
+
+          {/* 8. Settings */}
           <button
             id="nav-settings"
             title="Settings"
@@ -240,6 +257,19 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             }`}
           >
             <Globe className="w-4 h-4" />
+          </button>
+
+          <button
+            id="mobile-nav-globe"
+            title="Interactive 3D Earth"
+            onClick={() => onSelectModal(activeModal === 'globe' ? null : 'globe')}
+            className={`p-2 rounded-lg text-xs transition-all ${
+              activeModal === 'globe'
+                ? 'text-blue-300 bg-blue-950/50'
+                : 'text-slate-400 hover:text-blue-300'
+            }`}
+          >
+            <Orbit className="w-4 h-4" />
           </button>
 
           <button

@@ -5,7 +5,7 @@
  * INPUT → GOAL → PLAN → TOOL → RESULT → VERIFY → NEXT STEP
  * with cancellation, per-step timeout, retry limits, and honest verification.
  */
-import type { WebAction, LocalFileAction, LaptopAppAction, MapsLocationAction, ActiveModal } from '../types';
+import type { WebAction, LocalFileAction, LaptopAppAction, MapsLocationAction, ActiveModal, GlobeAction } from '../types';
 import type { LocalIndexedFile } from '../utils/fileSystemAccess';
 
 export type TaskId = string;
@@ -244,6 +244,7 @@ export type UiEffect =
   | { kind: 'maps_action'; action: MapsLocationAction }
   | { kind: 'viewer_file'; file: LocalIndexedFile }
   | { kind: 'open_modal'; modal: ActiveModal }
+  | { kind: 'globe_action'; action: GlobeAction }
   | { kind: 'pose'; pose: string };
 
 export const ok = (result: Omit<ToolResult, 'success'> = {}): ToolResult => ({ success: true, retryable: false, ...result });

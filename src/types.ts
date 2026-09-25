@@ -108,6 +108,15 @@ export interface MapsLocationAction {
   gpsFailureReason?: string;
 }
 
+export interface GlobeAction {
+  type: 'fly_to' | 'set_layer' | 'reset_view' | 'open_globe';
+  lat?: number;
+  lng?: number;
+  zoom?: number;
+  locationName?: string;
+  layer?: 'satellite' | 'dark' | 'standard' | 'terrain';
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -119,6 +128,7 @@ export interface Message {
   fileAction?: LocalFileAction;
   appAction?: LaptopAppAction;
   mapsAction?: MapsLocationAction;
+  globeAction?: GlobeAction;
 }
 
 export interface Conversation {
@@ -138,4 +148,4 @@ export interface CompanionSettings {
   companionNotes: string;
 }
 
-export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer' | 'location' | 'web_browser';
+export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer' | 'location' | 'web_browser' | 'globe';

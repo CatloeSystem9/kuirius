@@ -36,6 +36,7 @@ import { createBrowserTools as createBrowserAgentTools } from './browser/browser
 import { FilesystemService, ApplicationService } from './system/systemServices';
 import { HttpFsBackend, HttpAppBackend } from './system/httpSystem';
 import { createSystemTools } from './system/systemTools';
+import { createGlobeTools } from './globeTools';
 
 export interface AgentHost {
   applyWebAction(action: import('../types').WebAction): void;
@@ -43,6 +44,7 @@ export interface AgentHost {
   applyFileAction(action: import('../types').LocalFileAction): void;
   applyMapsAction(action: import('../types').MapsLocationAction): void;
   applyViewerFile(file: import('../utils/fileSystemAccess').LocalIndexedFile): void;
+  applyGlobeAction(action: import('../types').GlobeAction): void;
   openModal(modal: import('../types').ActiveModal): void;
   setPose(pose: string): void;
 }
@@ -91,6 +93,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   });
 
   registry.registerAll(createBrowserTools());
+  registry.registerAll(createGlobeTools());
 
   // Screen vision (Phase 4): native Screen Capture API, gated by the
   // 'screen.observation' permission (default-deny).
@@ -243,6 +246,9 @@ function applyEffect(effect: UiEffect, host: AgentHost): void {
       break;
     case 'open_modal':
       host.openModal(effect.modal);
+      break;
+    case 'globe_action':
+      host.applyGlobeAction(effect.action);
       break;
     case 'pose':
       host.setPose(effect.pose);

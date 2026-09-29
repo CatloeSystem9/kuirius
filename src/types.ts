@@ -88,8 +88,15 @@ export interface UserLocation {
   gpsFailureReason?: string;
 }
 
+export interface MapsGroundingPlace {
+  title: string;
+  uri: string;
+  address?: string;
+  reviewSnippets?: string[];
+}
+
 export interface MapsLocationAction {
-  type: 'current_location' | 'search_place' | 'directions';
+  type: 'current_location' | 'search_place' | 'directions' | 'grounding';
   lat?: number;
   lng?: number;
   accuracy?: number;
@@ -106,6 +113,8 @@ export interface MapsLocationAction {
   source?: string;
   mapsFailureReason?: string;
   gpsFailureReason?: string;
+  mapsGrounding?: MapsGroundingPlace[];
+  groundingUsed?: boolean;
 }
 
 export interface GlobeAction {
@@ -129,6 +138,7 @@ export interface Message {
   appAction?: LaptopAppAction;
   mapsAction?: MapsLocationAction;
   globeAction?: GlobeAction;
+  mapsGrounding?: MapsGroundingPlace[];
 }
 
 export interface Conversation {
@@ -150,6 +160,18 @@ export interface CompanionSettings {
   voicePitch?: number;
   languagePreference?: LanguagePreference;
   companionNotes: string;
+  voiceEngine?: 'auto' | 'gemini' | 'browser';
 }
 
-export type ActiveModal = null | 'conversations' | 'memory' | 'settings' | 'files' | 'apps' | 'file_viewer' | 'location' | 'web_browser' | 'globe';
+export type ActiveModal =
+  | null
+  | 'conversations'
+  | 'memory'
+  | 'settings'
+  | 'files'
+  | 'apps'
+  | 'file_viewer'
+  | 'location'
+  | 'web_browser'
+  | 'globe'
+  | 'transcribe';

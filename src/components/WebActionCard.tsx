@@ -77,6 +77,11 @@ export const WebActionCard: React.FC<WebActionCardProps> = ({
       case 'search':
       case 'google':
         return <Search {...props} className="w-4 h-4 text-blue-400" />;
+      case 'globe':
+      case 'google_earth':
+      case 'google earth':
+      case 'earth':
+        return <Globe {...props} className="w-4 h-4 text-emerald-400" />;
       default:
         return <Globe {...props} className="w-4 h-4 text-blue-400" />;
     }

@@ -34,33 +34,39 @@ interface SettingsModalProps {
 const AVAILABLE_VOICES: { id: VoiceModel; name: string; tag: string; description: string }[] = [
   {
     id: 'Aoede',
-    name: 'Aoede (Sweet Muse)',
-    tag: 'Sweetest Feminine',
-    description: 'Bright, sweet, melodic & charming tone (Recommended)',
+    name: 'Aoede (Melodic)',
+    tag: 'Sweet Melodic',
+    description: 'Bright, sweet, melodic & clear tone (Recommended)',
   },
   {
     id: 'Zephyr',
-    name: 'Zephyr (Soft Breeze)',
-    tag: 'Whisper Soft',
-    description: 'Gentle, airy & peaceful feminine cadence',
+    name: 'Zephyr (Soft Whisper)',
+    tag: 'Gentle & Calm',
+    description: 'Gentle, airy & peaceful cadence',
   },
   {
     id: 'Leda',
     name: 'Leda (Graceful)',
-    tag: 'Delicate',
+    tag: 'Warm & Delicate',
     description: 'Sweet, graceful & soft-spoken tone',
   },
   {
     id: 'Kore',
     name: 'Kore (Warm Bloom)',
-    tag: 'Calm Feminine',
+    tag: 'Calm & Serene',
     description: 'Calm, comforting & gentle warmth',
   },
   {
     id: 'Puck',
     name: 'Puck (Playful)',
-    tag: 'Energetic',
-    description: 'Cheerful, lively & bubbly pace',
+    tag: 'Upbeat & Lively',
+    description: 'Cheerful, lively & energetic pace',
+  },
+  {
+    id: 'Fenrir',
+    name: 'Fenrir (Deep Resonance)',
+    tag: 'Grounded & Deep',
+    description: 'Deeper, calm & confident resonant voice',
   },
 ];
 
@@ -79,7 +85,10 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   );
   const [voiceName, setVoiceName] = useState<VoiceModel>(settings.voiceName || 'Aoede');
   const [voiceSpeed, setVoiceSpeed] = useState(settings.voiceSpeed);
-  const [voicePitch, setVoicePitch] = useState(settings.voicePitch ?? 1.25);
+  const [voicePitch, setVoicePitch] = useState(settings.voicePitch ?? 1.0);
+  const [voiceEngine, setVoiceEngine] = useState<'auto' | 'gemini' | 'browser'>(
+    settings.voiceEngine || 'auto'
+  );
   const [languagePreference, setLanguagePreference] = useState<LanguagePreference>(
     settings.languagePreference || 'auto'
   );
@@ -163,8 +172,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
     const samplePhrase =
       languagePreference === 'hi'
-        ? 'नमस्ते जी! मैं कृषा हूँ, आपकी प्यारी और मीठी साथी~ क्या हाल है आपका?'
-        : "Hi darling~ I'm Krisha! I've tuned my voice to sound extra sweet and feminine, just for you~";
+        ? 'नमस्ते जी! मैं कृषा हूँ, आपकी साथी। क्या हाल है आपका?'
+        : "Hi! I am Krisha, your personal companion. I am speaking clearly in your selected voice model.";
 
     speakKrishaText(
       samplePhrase,
@@ -174,7 +183,8 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       () => setIsPreviewSpeaking(false),
       undefined,
       languagePreference,
-      voicePitch
+      voicePitch,
+      voiceEngine
     );
   };
 
@@ -187,6 +197,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       voiceName,
       voiceSpeed,
       voicePitch,
+      voiceEngine,
       languagePreference,
       companionNotes: companionNotes.trim(),
     });
@@ -342,31 +353,31 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div className="pt-1">
                     <div className="flex justify-between text-[11px] text-slate-400 mb-1.5">
                       <span className="flex items-center gap-1.5">
-                        <span>Voice Sweetness & Pitch</span>
+                        <span>Voice Pitch Tuning</span>
                         <Sparkles className="w-3 h-3 text-pink-400" />
                       </span>
                       <span className="font-mono text-pink-400 font-medium">
-                        {voicePitch >= 1.28
-                          ? 'Ultra-Sweet & Feminine'
-                          : voicePitch >= 1.18
-                          ? 'Sweet Feminine'
-                          : 'Soft Natural'}{' '}
+                        {voicePitch >= 1.15
+                          ? 'Higher / Cheerful'
+                          : voicePitch <= 0.92
+                          ? 'Deeper / Calm'
+                          : 'Natural Balance'}{' '}
                         ({voicePitch.toFixed(2)}x)
                       </span>
                     </div>
                     <input
                       type="range"
-                      min="0.95"
-                      max="1.45"
+                      min="0.85"
+                      max="1.25"
                       step="0.05"
                       value={voicePitch}
                       onChange={(e) => setVoicePitch(parseFloat(e.target.value))}
                       className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-pink-500"
                     />
                     <div className="flex justify-between text-[10px] text-slate-500 mt-1">
-                      <span>Deeper/Natural</span>
-                      <span className="text-pink-400/80 font-medium">Sweet Feminine (Default)</span>
-                      <span>Bright Anime Sweet</span>
+                      <span>Deeper / Resonant</span>
+                      <span className="text-pink-400/80 font-medium">Natural (1.0x)</span>
+                      <span>Higher / Melodic</span>
                     </div>
                   </div>
 
@@ -385,6 +396,46 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                       onChange={(e) => setVoiceSpeed(parseFloat(e.target.value))}
                       className="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-blue-500"
                     />
+                  </div>
+
+                  {/* Voice Engine Architecture */}
+                  <div className="pt-1.5">
+                    <div className="flex justify-between text-[11px] text-slate-400 mb-1.5">
+                      <span>Voice Generation Engine</span>
+                      <span className="text-[10px] text-pink-400 font-medium">
+                        {voiceEngine === 'auto'
+                          ? 'Smart Hybrid (Cloud AI + Fallback)'
+                          : voiceEngine === 'browser'
+                          ? 'Instant Local (Unlimited)'
+                          : 'Gemini Cloud Only'}
+                      </span>
+                    </div>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setVoiceEngine('auto')}
+                        className={`p-2 rounded-xl text-left border transition-all cursor-pointer ${
+                          voiceEngine === 'auto'
+                            ? 'bg-blue-950/40 border-blue-500 text-blue-200'
+                            : 'bg-[#060a14] border-blue-900/20 text-slate-400 hover:border-blue-900/50'
+                        }`}
+                      >
+                        <div className="font-medium text-slate-200 text-xs">Smart Hybrid (Default)</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">Gemini Cloud with Instant Local Fallback</div>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setVoiceEngine('browser')}
+                        className={`p-2 rounded-xl text-left border transition-all cursor-pointer ${
+                          voiceEngine === 'browser'
+                            ? 'bg-blue-950/40 border-blue-500 text-blue-200'
+                            : 'bg-[#060a14] border-blue-900/20 text-slate-400 hover:border-blue-900/50'
+                        }`}
+                      >
+                        <div className="font-medium text-slate-200 text-xs">Instant Local Voice</div>
+                        <div className="text-[10px] text-slate-400 mt-0.5">Fast speech, zero cloud quota limits</div>
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}

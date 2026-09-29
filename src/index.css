@@ -1,1 +1,52 @@
 @import "tailwindcss";
+
+/* High-performance GPU-accelerated scrolling styles */
+@layer utilities {
+  .smooth-scroll {
+    -webkit-overflow-scrolling: touch;
+    overscroll-behavior: contain;
+    transform: translateZ(0);
+    will-change: scroll-position;
+  }
+}
+
+/* Custom sleek, GPU-composited scrollbar for sidebar nav */
+.nav-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(59, 130, 246, 0.35) transparent;
+  transform: translateZ(0);
+}
+
+.nav-scrollbar::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+.nav-scrollbar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.nav-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(59, 130, 246, 0.25);
+  border-radius: 9999px;
+  transition: background-color 0.15s ease;
+}
+
+.nav-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(59, 130, 246, 0.55);
+}
+
+.nav-scrollbar::-webkit-scrollbar-thumb:active {
+  background: rgba(59, 130, 246, 0.85);
+}
+
+/* Subtle pulse glow for drag/scroll overflow indicator */
+@keyframes fluid-glow {
+  0%, 100% { opacity: 0.35; transform: scale(1); }
+  50% { opacity: 0.85; transform: scale(1.08); }
+}
+
+.animate-fluid-glow {
+  animation: fluid-glow 2.5s ease-in-out infinite;
+}
+

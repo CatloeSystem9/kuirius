@@ -14,6 +14,38 @@ export interface WebPlatformInfo {
 
 export const SUPPORTED_PLATFORMS: WebPlatformInfo[] = [
   {
+    id: 'google_earth',
+    name: 'Google Earth',
+    baseUrl: 'https://earth.google.com/web/',
+    searchUrl: (q) => `https://earth.google.com/web/search/${encodeURIComponent(q)}`,
+    icon: 'Globe',
+    category: 'knowledge',
+    color: '#4285f4',
+    aliases: [
+      'google earth',
+      'google earth web',
+      'google earth 3d',
+      'googleearth',
+      'google earth pro',
+      'earth.google.com',
+      'google earth satellite',
+      'earth web',
+      'earth globe',
+    ],
+    description: 'Explore the world in 3D satellite imagery and terrain',
+  },
+  {
+    id: 'google_maps',
+    name: 'Google Maps',
+    baseUrl: 'https://www.google.com/maps',
+    searchUrl: (q) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`,
+    icon: 'Search',
+    category: 'productivity',
+    color: '#34a853',
+    aliases: ['google maps', 'google map', 'googlemaps', 'maps.google.com'],
+    description: 'World maps, satellite photos, traffic and directions',
+  },
+  {
     id: 'youtube',
     name: 'YouTube',
     baseUrl: 'https://www.youtube.com',
@@ -209,7 +241,62 @@ export function detectAndParseWebAction(text: string): WebAction | null {
     };
   }
 
-  // 3. Questions about inability to open websites or generic requests for "websites like youtube"
+  // 3. Dedicated High-Priority Google Earth Detection
+  // Ensures Google Earth requests are NEVER hijacked by generic Google search!
+  if (
+    lower.includes('google earth') ||
+    lower.includes('googleearth') ||
+    lower.includes('earth.google.com') ||
+    /\b(?:open|launch|explore|show|go\s*to)\s+(?:the\s+)?earth\b/i.test(lower) ||
+    /\b3d\s+earth\b/i.test(lower)
+  ) {
+    const ge = SUPPORTED_PLATFORMS.find((p) => p.id === 'google_earth')!;
+
+    // Case 1: "explore/search/view <location> on/in google earth"
+    const exploreOnEarthMatch = clean.match(
+      /(?:explore|search|find|view|visit|fly\s*to|locate|show)\s+(?:for\s+)?(.+?)\s+(?:on|in|at|using)\s+(?:the\s+)?(?:google\s*earth|earth\.google|the\s+earth\s+globe)\b/i
+    );
+
+    // Case 2: "google earth [to/for/explore] <location>"
+    const earthLocMatch = clean.match(
+      /(?:(?:open|launch|go\s*to|visit|show)\s+)?(?:the\s+)?(?:google\s*earth|earth\.google\.com|googleearth)(?:\s+(?:web|app|3d|satellite))?\s*(?:\b(?:and|to|for|in|at)\b\s*)?(?:search\s+(?:for\s+)?|find\s+|explore\s+|fly\s+to\s+|view\s+|locate\s+)?(.+)$/i
+    );
+
+    let rawLoc = '';
+    if (exploreOnEarthMatch && exploreOnEarthMatch[1]) {
+      rawLoc = exploreOnEarthMatch[1].trim();
+    } else if (earthLocMatch && earthLocMatch[1]) {
+      rawLoc = earthLocMatch[1].trim();
+    }
+
+    let targetLoc = rawLoc
+      .replace(/^['"]|['"]$/g, '')
+      .replace(/^(?:for\s+me|please|for|in|to|at)\s+/i, '')
+      .replace(/\s+(?:please|for\s+me|web|app)$/i, '')
+      .trim();
+
+    const ignored = ['it', 'me', 'please', 'app', 'website', 'web', 'site', 'browser', 'page', 'now', 'earth', 'the earth', 'globe'];
+    if (targetLoc && targetLoc.length > 1 && !ignored.includes(targetLoc.toLowerCase())) {
+      return {
+        type: 'search_website',
+        siteName: ge.name,
+        query: targetLoc,
+        url: ge.searchUrl(targetLoc),
+        icon: ge.icon,
+        category: ge.category,
+      };
+    }
+
+    return {
+      type: 'open_website',
+      siteName: ge.name,
+      url: ge.baseUrl,
+      icon: ge.icon,
+      category: ge.category,
+    };
+  }
+
+  // 4. Questions about inability to open websites or generic requests for "websites like youtube"
   // e.g. "she is unable to open websites like youtube or any other thing", "open websites like youtube", "open youtube or anything"
   if (
     lower.includes('unable to open website') ||
@@ -233,8 +320,19 @@ export function detectAndParseWebAction(text: string): WebAction | null {
     };
   }
 
-  // 4. Check for platform-specific intents (YouTube, Google, Spotify, etc.)
+  // 5. Check for platform-specific intents (YouTube, Google Earth, Spotify, etc.)
   for (const platform of SUPPORTED_PLATFORMS) {
+    // Prevent generic 'google' from ever matching 'google earth', 'google maps', 'google drive', etc.
+    if (platform.id === 'google') {
+      if (
+        /\bgoogle\s+(?:earth|maps|map|drive|docs|doc|sheets|sheet|slides|slide|photos|photo|translate|meet|calendar|keep|classroom|colab|gemini)\b/i.test(
+          clean
+        )
+      ) {
+        continue;
+      }
+    }
+
     for (const alias of platform.aliases) {
       const aliasPattern = alias.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
@@ -341,7 +439,10 @@ export function detectAndParseWebAction(text: string): WebAction | null {
   const genericSearchMatch = clean.match(/^(?:please\s+)?(?:search|look\s*up|find|google)\s+(?:for\s+)?(.+)$/i);
   if (genericSearchMatch && genericSearchMatch[1].trim()) {
     const rawQuery = genericSearchMatch[1].trim();
-    if (!/^(dancing|dance|me|different directions|around|quietly)/i.test(rawQuery)) {
+    if (
+      !/^(dancing|dance|me|different directions|around|quietly)/i.test(rawQuery) &&
+      !/^(earth|google\s+earth|maps|map|drive|docs|sheets|photos)/i.test(rawQuery)
+    ) {
       const query = rawQuery.replace(/^['"]|['"]$/g, '');
       const isVideoQuery = /\b(video|song|music|trailer|clip|gameplay|stream|vlog|anime episode|mv|ost)\b/i.test(query);
 

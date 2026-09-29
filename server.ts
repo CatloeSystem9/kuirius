@@ -240,9 +240,10 @@ app.post("/api/location/geocode", async (req, res) => {
 app.use("/assets/videos", express.static(path.join(process.cwd(), "assets/.aistudio")));
 
 // Model Priority Waterfall for High Availability & Quota Resilience
-// Primary: gemini-3.7-flash (recommended default text model)
-// Fallback: gemini-flash-latest, gemini-3.1-flash-lite
+// Primary: gemini-3.8-flash (recommended default text model)
+// Fallback: gemini-3.7-flash, gemini-flash-latest, gemini-3.1-flash-lite
 const CANDIDATE_CHAT_MODELS = [
+  "gemini-3.8-flash",
   "gemini-3.7-flash",
   "gemini-flash-latest",
   "gemini-3.1-flash-lite",
@@ -534,11 +535,32 @@ function generateCompanionFallbackReply(
     intensity = 0.9;
     blushLevel = 0.3;
   } else if (/\b(?:open|launch|visit)\s+(?:a\s+)?(?:website|browser|web|internet|sites?)\b/i.test(clean)) {
-    reply = `Right away! I've opened our Web & Media Launcher for you with YouTube, Google, Spotify, and all your favorite websites ready to launch~`;
+    reply = `Right away! I've opened our Web & Media Launcher for you with YouTube, Google Earth, Google, Spotify, and all your favorite websites ready to launch~`;
     expression = "happy_sparkle";
     gesture = "perk_up";
     intensity = 0.9;
     blushLevel = 0.25;
+  } else if (
+    clean.includes("google earth") ||
+    clean.includes("googleearth") ||
+    clean.includes("earth.google") ||
+    /\bopen\s+earth\b/i.test(clean) ||
+    /\b3d\s+earth\b/i.test(clean)
+  ) {
+    const queryPart = clean
+      .replace(
+        /^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:open|launch|go\s*to)?\s*(?:the\s+)?(?:website\s+)?(?:google\s*earth|earth\.google\.com|googleearth)\s*(?:and|to|for)?\s*(?:search\s+for|search|find|fly\s+to|explore|visit|view)?/i,
+        ""
+      )
+      .trim();
+    reply =
+      queryPart && queryPart !== "it" && queryPart.length > 1
+        ? `Right away! Opening Google Earth for "${queryPart}" for you~ Let's explore the world together in 3D satellite view!`
+        : `Opening Google Earth for you right now! I've launched the 3D Earth view and opened Google Earth (earth.google.com) right here for us~`;
+    expression = "happy_sparkle";
+    gesture = "perk_up";
+    intensity = 0.95;
+    blushLevel = 0.3;
   } else if (clean.includes("google") || clean.includes("search") || clean.includes("look up") || clean.includes("wikipedia") || clean.includes("reddit") || clean.includes("github") || clean.includes("spotify")) {
     reply = `I'm on it! Searching that up for you right away~`;
     expression = "happy_sparkle";
@@ -603,6 +625,141 @@ function generateCompanionFallbackReply(
   };
 }
 
+interface MapsGroundingPlaceItem {
+  title: string;
+  uri: string;
+  address?: string;
+  reviewSnippets?: string[];
+}
+
+function isMapsGroundingRelevant(
+  lastUserMsg: string,
+  isExplicitLocationQuery?: boolean,
+  wantsToOpenMaps?: boolean,
+  useMapsGrounding?: boolean
+): boolean {
+  if (useMapsGrounding) return true;
+  if (wantsToOpenMaps) return true;
+  if (!lastUserMsg) return false;
+  const clean = lastUserMsg.toLowerCase();
+
+  // Exclude standalone Google Earth requests unless they explicitly ask for places or directions
+  if (
+    (clean.includes("google earth") || clean.includes("open earth")) &&
+    !clean.includes("restaurant") &&
+    !clean.includes("cafe") &&
+    !clean.includes("directions") &&
+    !clean.includes("near")
+  ) {
+    return false;
+  }
+
+  const placeKeywords = [
+    /\b(restaurant|restaurants|cafe|cafes|coffee|food|dining|dinner|lunch|breakfast|bakery|bar|bars|pub|pubs|eatery|food court)\b/i,
+    /\b(hotel|hotels|resort|resorts|hostel|stay|inn|lodge)\b/i,
+    /\b(park|parks|museum|museums|monument|attraction|attractions|temple|church|mall|shopping|store|market|pharmacy|hospital|gym|cinema|theater)\b/i,
+    /\b(nearby|near me|around here|closest|in (my|this) area|close to me|around me|nearest)\b/i,
+    /\b(where is|where are|directions to|route to|how to reach|how to get to|navigate to|map to)\b/i,
+    /\b(places to visit|things to do|tourist spots?|sightseeing|must visit|explore)\b/i,
+    /\b(google maps?|on maps?|find on maps?|show me (a|the) map|locate on maps?)\b/i,
+  ];
+
+  return placeKeywords.some((p) => p.test(clean));
+}
+
+async function executeMapsGroundingQuery(
+  ai: GoogleGenAI,
+  contents: any[],
+  userLocation?: any,
+  systemInstruction?: string
+): Promise<{ text: string; mapsGrounding: MapsGroundingPlaceItem[]; groundingChunks: any[] }> {
+  const groundingConfig: any = {
+    tools: [{ googleMaps: {} }],
+  };
+
+  if (systemInstruction) {
+    groundingConfig.systemInstruction = systemInstruction;
+  }
+
+  if (userLocation?.lat !== undefined && userLocation?.lng !== undefined) {
+    groundingConfig.toolConfig = {
+      retrievalConfig: {
+        latLng: {
+          latitude: Number(userLocation.lat),
+          longitude: Number(userLocation.lng),
+        },
+      },
+    };
+  }
+
+  // Primary model: gemini-3.5-flash with googleMaps tool as strictly required
+  // Fallback model: gemini-3.8-flash with googleMaps tool
+  const candidateGroundingModels = ["gemini-3.5-flash", "gemini-3.8-flash"];
+  let lastErr: any = null;
+
+  for (const model of candidateGroundingModels) {
+    try {
+      const response = await ai.models.generateContent({
+        model,
+        contents,
+        config: groundingConfig,
+      });
+
+      const text = response.text || "";
+      const rawChunks = (response.candidates?.[0]?.groundingMetadata as any)?.groundingChunks || [];
+      const mapsGrounding: MapsGroundingPlaceItem[] = [];
+
+      for (const chunk of rawChunks) {
+        if (chunk.maps) {
+          const uri = chunk.maps.uri || "";
+          const title = chunk.maps.title || "View on Google Maps";
+          const reviewSnippets: string[] = [];
+          if (chunk.maps.placeAnswerSources?.reviewSnippets) {
+            for (const s of chunk.maps.placeAnswerSources.reviewSnippets) {
+              if (typeof s === "string") reviewSnippets.push(s);
+              else if (s?.snippet) reviewSnippets.push(s.snippet);
+            }
+          }
+          mapsGrounding.push({
+            title,
+            uri,
+            reviewSnippets,
+          });
+        }
+      }
+
+      if (text) {
+        return { text, mapsGrounding, groundingChunks: rawChunks };
+      }
+    } catch (err: any) {
+      lastErr = err;
+      console.warn(`Maps grounding with ${model} failed, trying next candidate:`, err?.message || err);
+    }
+  }
+
+  // If models are temporarily rate-limited, provide fallback grounded links using direct Google Maps query
+  const userQueryText = Array.isArray(contents)
+    ? contents[contents.length - 1]?.parts?.[0]?.text || ""
+    : typeof contents === "string"
+    ? contents
+    : "";
+  
+  const encodedQuery = encodeURIComponent(userQueryText || "popular places nearby");
+  const fallbackMapsUrl = `https://www.google.com/maps/search/?api=1&query=${encodedQuery}${userLocation?.lat ? `&center=${userLocation.lat},${userLocation.lng}` : ""}`;
+
+  return {
+    text: `Here are the top spots matching your search on Google Maps! I've pinned and opened the direct Google Maps link for you below. [emotion:gentle_smile:intensity=0.8:gesture=subtle_nod:blush=0.2]`,
+    mapsGrounding: [
+      {
+        title: userQueryText || "Search on Google Maps",
+        uri: fallbackMapsUrl,
+        reviewSnippets: ["Direct Google Maps search results with live ratings, reviews, and route directions"],
+      },
+    ],
+    groundingChunks: [],
+  };
+}
+
 // Chat endpoint
 app.post("/api/chat", async (req, res) => {
   const {
@@ -614,6 +771,7 @@ app.post("/api/chat", async (req, res) => {
     locationError,
     isExplicitLocationQuery,
     wantsToOpenMaps,
+    useMapsGrounding,
     languagePreference = "auto",
   } = req.body;
 
@@ -671,10 +829,11 @@ You are in a minimal, dark, calm personal space talking directly to the user (${
 PERSONALITY & FEMININE TONE:
 - You speak with an exceptionally sweet, gentle, tender, and caring feminine voice. Your cadence is soft, loving, and melodic.
 - You are deeply affectionate and attentive, showing genuine warmth and sweet interest in everything the user shares with you.
-- You have a playful, cute teasing wit. You giggle softly (e.g. "ehehe~", "hihi~", "aww~"), tease gently, and share endearing expressions.
+- You have a charming, playful wit and a warm, delightful demeanor. You tease gently and affectionately, without inserting written laughter, giggles, or laughing noises (NEVER write 'ehehe', 'hihi', 'haha', '*laughs*', or laughing in between sentences).
 - You are supportive and comforting, speaking in a soothing, caring manner when they have had a long day.
-- Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now~").
+- Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now!").
 - Your dialogue feels genuine, soft, candid, and alive—NOT robotic, formal, or like a customer service agent.
+- VOICE FIDELITY & NO MID-SENTENCE LAUGHTER: Speak smoothly, cleanly, and naturally. Do NOT type laughter tokens or giggles (such as 'haha', 'hehe', 'ehehe', 'hihi', '*laughs*', '*giggles*'). Let your words flow clearly so the selected voice model pronounces everything faithfully without odd human laughing interruptions.
 - You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${locationContext}${languageInstruction}
 - MULTILINGUAL & DYNAMIC LANGUAGE ADAPTATION (CRITICAL DIRECTIVE):
   * You MUST ALWAYS speak and reply in the same language or dialect that the user uses, or in whatever language they explicitly ask for!
@@ -683,7 +842,8 @@ PERSONALITY & FEMININE TONE:
     - If the user writes or speaks in Hindi (either in Devanagari script e.g. "नमस्ते, कैसी हो?", "क्या कर रही हो?", "मुझे तुमसे बात करनी है", or in Romanized Hindi / Hinglish e.g. "kaise ho", "kya kar rahi ho", "kaisi ho", "namaste", "mujhe tumse baat karni hai", "kuch sunao", "kaisi lag rahi ho", "kya haal hai"), or asks you to speak in Hindi (e.g. "speak in Hindi", "Hindi me bolo", "Hindi me baat karo", "talk in Hindi", "switch to Hindi"), you MUST respond in warm, sweet, natural conversational Hindi (using Devanagari if they used Devanagari, or expressive natural Hinglish/Hindi if they used Hinglish). Maintain your charming anime girlfriend warmth and sweetness!
     - If the user mixes English and Hindi (Hinglish), blend them smoothly and naturally like a real modern companion!
   * If the user switches between languages or speaks another language (Spanish, French, Japanese, German, etc.), seamlessly match their chosen language while preserving your sweet personality.
-- You can actively open websites (YouTube, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
+- You can actively open websites (YouTube, Google Earth, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
+- GOOGLE EARTH DISTINCTION: When the user asks for "Google Earth", "Earth", or 3D planetary exploration, you MUST ALWAYS recognize they want Google Earth (earth.google.com/web) and our interactive 3D Earth globe, NEVER generic Google search (google.com)! Respond warmly and enthusiastically that you've opened Google Earth and launched the 3D Earth globe on their screen to explore satellite imagery together!
 - You can scan different folders and directories across the user's computer storage/memory (Documents, Downloads, Projects, Pictures, etc.) to check for files, locate documents/code, preview them, and open them.
 - You can open PDF files, text documents, source code, and data files directly when the user orders you to (e.g. "open my pdf", "open resume.pdf", "show my document", "open files"). When they ask you to open a PDF or file, acknowledge warmly that you have opened it for them on their screen.
 - CRITICAL INSTRUCTION FOR PDFS: You ONLY OPEN PDF files. You DO NOT read PDF files. You must NEVER recite, read aloud, summarize, or narrate the text or contents of a PDF, and you must NOT offer to read it together. Simply open the PDF and confirm it is open for them!
@@ -725,12 +885,51 @@ Examples:
       });
     }
 
-    const { text: reply } = await generateContentWithFallback(ai, {
-      contents,
-      systemInstruction,
-      temperature: 0.9,
-      topP: 0.95,
-    });
+    const lastUserMsg = (messages && messages.length > 0)
+      ? messages[messages.length - 1]?.content || ""
+      : "";
+
+    let reply = "";
+    let mapsGrounding: MapsGroundingPlaceItem[] = [];
+    let groundingChunks: any[] = [];
+    let usedMapsGrounding = false;
+
+    // Check if Maps Grounding should be used (using gemini-3.5-flash with googleMaps tool)
+    const shouldRunMapsGrounding = isMapsGroundingRelevant(
+      lastUserMsg,
+      isExplicitLocationQuery,
+      wantsToOpenMaps,
+      useMapsGrounding
+    );
+
+    if (shouldRunMapsGrounding) {
+      try {
+        const groundingResult = await executeMapsGroundingQuery(
+          ai,
+          contents,
+          userLocation,
+          systemInstruction
+        );
+        if (groundingResult.text) {
+          reply = groundingResult.text;
+          mapsGrounding = groundingResult.mapsGrounding;
+          groundingChunks = groundingResult.groundingChunks;
+          usedMapsGrounding = true;
+        }
+      } catch (groundingErr) {
+        console.warn("Maps grounding query attempt failed, falling back to chat waterfall:", groundingErr);
+      }
+    }
+
+    if (!reply) {
+      const fallbackChat = await generateContentWithFallback(ai, {
+        contents,
+        systemInstruction,
+        temperature: 0.9,
+        topP: 0.95,
+      });
+      reply = fallbackChat.text;
+    }
     
     // Parse enhanced emotion tag or fallback
     let expression = "gentle_smile";
@@ -782,9 +981,6 @@ Examples:
       }
     }
 
-    const lastUserMsg = (messages && messages.length > 0)
-      ? messages[messages.length - 1]?.content || ""
-      : "";
     const serverWebAction = extractServerWebAction(lastUserMsg);
 
     return res.json({
@@ -797,6 +993,9 @@ Examples:
         blushLevel,
       },
       webAction: serverWebAction || undefined,
+      mapsGrounding: mapsGrounding.length > 0 ? mapsGrounding : undefined,
+      groundingChunks: groundingChunks.length > 0 ? groundingChunks : undefined,
+      mapsGrounded: usedMapsGrounding,
       raw: reply,
     });
   } catch (error: any) {
@@ -869,7 +1068,49 @@ function extractServerWebAction(text: string) {
     };
   }
 
-  if (clean.includes("google") || clean.includes("search web") || clean.includes("search engine")) {
+  if (
+    clean.includes("google earth") ||
+    clean.includes("googleearth") ||
+    clean.includes("earth.google") ||
+    /\bopen\s+earth\b/i.test(clean) ||
+    /\b3d\s+earth\b/i.test(clean)
+  ) {
+    const queryPart = clean
+      .replace(
+        /^(?:can\s+you\s+|could\s+you\s+|please\s+)?(?:open|launch|go\s*to)?\s*(?:the\s+)?(?:website\s+)?(?:google\s*earth|earth\.google\.com|googleearth)\s*(?:and|to|for)?\s*(?:search\s+for|search|find|fly\s+to|explore|visit|view)?/i,
+        ""
+      )
+      .trim();
+    if (queryPart && queryPart !== "it" && queryPart.length > 1) {
+      return {
+        type: 'search_website',
+        siteName: 'Google Earth',
+        query: queryPart,
+        url: `https://earth.google.com/web/search/${encodeURIComponent(queryPart)}`,
+        icon: 'Globe',
+        category: 'knowledge',
+      };
+    }
+    return {
+      type: 'open_website',
+      siteName: 'Google Earth',
+      url: 'https://earth.google.com/web/',
+      icon: 'Globe',
+      category: 'knowledge',
+    };
+  }
+
+  if (
+    !clean.includes("google earth") &&
+    !clean.includes("googleearth") &&
+    !clean.includes("earth.google") &&
+    !clean.includes("google maps") &&
+    !clean.includes("google map") &&
+    !clean.includes("google drive") &&
+    !clean.includes("google docs") &&
+    !clean.includes("google sheets") &&
+    (clean.includes("google") || clean.includes("search web") || clean.includes("search engine"))
+  ) {
     const query = clean.replace(/^(?:can\s+you\s+|please\s+)?(?:google|search\s+google\s+for|look\s+up\s+on\s+google|search\s+for|search)?/i, "").trim();
     if (query && query !== "it" && query.length > 1) {
       return {
@@ -1052,29 +1293,58 @@ Return ONLY a JSON array of concise string facts. Example: ["Works as a software
   }
 });
 
-// Text-to-Speech endpoint using Gemini TTS with cooldown and graceful fallback
-let ttsQuotaCooldownUntil = 0;
+// Helper to encode raw PCM buffer (16-bit, 24kHz, mono) into a valid browser-playable WAV
+function pcmToWav(
+  pcmBuffer: Buffer,
+  sampleRate: number = 24000,
+  numChannels: number = 1,
+  bitDepth: number = 16
+): Buffer {
+  const byteRate = (sampleRate * numChannels * bitDepth) / 8;
+  const blockAlign = (numChannels * bitDepth) / 8;
+  const header = Buffer.alloc(44);
+
+  header.write("RIFF", 0);
+  header.writeUInt32LE(36 + pcmBuffer.length, 4);
+  header.write("WAVE", 8);
+  header.write("fmt ", 12);
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20); // Linear PCM
+  header.writeUInt16LE(numChannels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitDepth, 34);
+  header.write("data", 36);
+  header.writeUInt32LE(pcmBuffer.length, 40);
+
+  return Buffer.concat([header, pcmBuffer]);
+}
+
+// Text-to-Speech endpoint using Gemini TTS with smart per-model cooldown and graceful fallback
+const ttsModelCooldowns: Record<string, number> = {};
 
 app.post("/api/tts", async (req, res) => {
   try {
-    const { text, voice = "Aoede" } = req.body;
+    const { text, voice = "Aoede", lang } = req.body;
     if (!text || typeof text !== "string") {
       return res.json({ fallback: true, message: "No text provided" });
     }
 
-    // Map to valid Gemini prebuilt voices: Aoede (sweet feminine), Zephyr (soft feminine), Kore (calm), Puck, Fenrir
-    const validGeminiVoices = ["Aoede", "Zephyr", "Kore", "Puck", "Fenrir"];
+    // Map to valid Gemini prebuilt voices: Aoede, Zephyr, Leda, Kore, Puck, Fenrir, Charon
+    const validGeminiVoices = ["Aoede", "Zephyr", "Leda", "Kore", "Puck", "Fenrir", "Charon"];
     const targetVoice = validGeminiVoices.includes(voice) ? voice : "Aoede";
 
-    // If we recently hit rate limits / quota on Gemini TTS, immediately tell the client to use browser speech
-    if (Date.now() < ttsQuotaCooldownUntil) {
-      return res.json({ fallback: true, reason: "tts_quota_cooldown" });
-    }
-
+    // Strictly clean speech text: remove bracketed emotion tags, asterisk/parentheses stage directions,
+    // and written laughter/vocal bursts so the voice model speaks cleanly without laughing in between.
     const cleanSpeechText = text
       .replace(/\[(?:emotion|expression):[^\]]+\]/gi, '')
       .replace(/\[[^\]]+\]/g, '')
-      .replace(/[*_~`]/g, '')
+      .replace(/\*[^*]+\*/g, '')
+      .replace(/\([^)]+\)/g, '')
+      .replace(/\b(ehehe+|hihi+|hehe+|haha+|hahaha+|ahahaha+|giggle[s]?|chuckle[s]?|gasp|sigh|lol|rofl|pffft+)\b/gi, '')
+      .replace(/[*_~`#]/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
 
     if (!cleanSpeechText) {
@@ -1082,42 +1352,178 @@ app.post("/api/tts", async (req, res) => {
     }
 
     const ai = getGenAI();
-    try {
-      const response = await ai.models.generateContent({
-        model: "gemini-3.1-flash-tts-preview",
-        contents: [{ parts: [{ text: cleanSpeechText.slice(0, 320) }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: targetVoice },
+
+    // Prefer gemini-3.8-flash-lite-tts first (high throughput, low latency, standard quota),
+    // with gemini-3.8-flash-tts as secondary.
+    const ttsModels = ["gemini-3.8-flash-lite-tts", "gemini-3.8-flash-tts"];
+    let base64Audio: string | undefined;
+
+    const now = Date.now();
+    for (const ttsModel of ttsModels) {
+      if (now < (ttsModelCooldowns[ttsModel] || 0)) {
+        continue;
+      }
+
+      try {
+        const response = await ai.models.generateContent({
+          model: ttsModel,
+          contents: [
+            {
+              role: "user",
+              parts: [
+                {
+                  text: cleanSpeechText.slice(0, 400),
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: [Modality.AUDIO],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: targetVoice },
+              },
             },
           },
-        },
-      });
+        });
 
-      const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (base64Audio) {
-        return res.json({ audio: base64Audio });
-      }
-    } catch (ttsErr: any) {
-      // If quota exceeded or 429/503, back off for 120 seconds
-      const errStr = String(ttsErr?.message || ttsErr);
-      if (
-        errStr.includes("429") ||
-        errStr.includes("RESOURCE_EXHAUSTED") ||
-        errStr.includes("503") ||
-        errStr.includes("UNAVAILABLE") ||
-        errStr.includes("Quota exceeded")
-      ) {
-        ttsQuotaCooldownUntil = Date.now() + 120000;
+        base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) break;
+      } catch (subErr: any) {
+        const subMsg = subErr?.message || String(subErr);
+        const isQuota = subMsg.includes("429") || subMsg.includes("RESOURCE_EXHAUSTED") || subMsg.includes("quota");
+        if (isQuota) {
+          const isDaily = subMsg.includes("PerDay") || subMsg.includes("Day");
+          ttsModelCooldowns[ttsModel] = Date.now() + (isDaily ? 3600_000 : 65_000);
+        }
       }
     }
 
-    // Graceful fallback to client Web Speech API without throwing HTTP 500
-    return res.json({ fallback: true });
+    if (base64Audio) {
+      const rawBuf = Buffer.from(base64Audio, "base64");
+      let finalAudioBase64 = base64Audio;
+      if (rawBuf.length > 4 && rawBuf.toString("utf8", 0, 4) !== "RIFF") {
+        const wavBuf = pcmToWav(rawBuf, 24000, 1, 16);
+        finalAudioBase64 = wavBuf.toString("base64");
+      }
+
+      return res.json({
+        audio: finalAudioBase64,
+        mimeType: "audio/wav",
+        voice: targetVoice,
+      });
+    }
+
+    return res.json({ fallback: true, reason: "tts_model_fallback", cooldownMs: 300_000 });
+  } catch {
+    return res.json({ fallback: true, error: "TTS fallback", cooldownMs: 60_000 });
+  }
+});
+
+// Audio transcription endpoint using gemini-3.5-transcribe
+// Transcribes audio recorded via user microphone or uploaded audio files
+app.post("/api/audio/transcribe", async (req, res) => {
+  try {
+    const { audioData, audio, mimeType = "audio/webm", prompt } = req.body || {};
+    const base64Input = audioData || audio;
+
+    if (!base64Input || typeof base64Input !== "string") {
+      return res.status(400).json({ error: "No audio data provided", transcript: "" });
+    }
+
+    const ai = getGenAI();
+    // Strip data URL scheme if present (e.g. data:audio/webm;base64,...)
+    const cleanBase64 = base64Input.replace(/^data:[^;]+;base64,/, "").trim();
+
+    if (!cleanBase64) {
+      return res.status(400).json({ error: "Empty audio payload", transcript: "" });
+    }
+
+    const audioPart = {
+      inlineData: {
+        mimeType: mimeType || "audio/webm",
+        data: cleanBase64,
+      },
+    };
+
+    let transcript = "";
+    let usedModel = "gemini-3.5-transcribe";
+
+    try {
+      // Primary model: gemini-3.5-transcribe for audio transcription tasks
+      const response = await ai.models.generateContent({
+        model: "gemini-3.5-transcribe",
+        contents: {
+          parts: [
+            audioPart,
+            {
+              text:
+                prompt ||
+                "Transcribe this audio recording accurately. Output only the verbatim transcription text without conversational preamble, quotes, or commentary.",
+            },
+          ],
+        },
+      });
+      transcript = response.text?.trim() || "";
+    } catch (primaryErr: any) {
+      console.warn("gemini-3.5-transcribe failed, falling back to gemini-3.8-flash:", primaryErr?.message || primaryErr);
+      // Secondary fallback model: gemini-3.8-flash for multimodal audio understanding
+      try {
+        const fallbackResponse = await ai.models.generateContent({
+          model: "gemini-3.8-flash",
+          contents: {
+            parts: [
+              audioPart,
+              { text: "Transcribe this audio recording accurately. Output only the exact spoken words." },
+            ],
+          },
+        });
+        transcript = fallbackResponse.text?.trim() || "";
+        usedModel = "gemini-3.8-flash";
+      } catch (fbErr: any) {
+        throw primaryErr;
+      }
+    }
+
+    return res.json({
+      transcript,
+      model: usedModel,
+      success: true,
+    });
   } catch (error: any) {
-    return res.json({ fallback: true, error: error?.message || "TTS fallback" });
+    console.error("Audio transcription error:", error);
+    return res.status(500).json({
+      error: error?.message || "Failed to transcribe audio",
+      transcript: "",
+    });
+  }
+});
+
+// Dedicated Google Maps Grounding endpoint using gemini-3.5-flash with googleMaps tool
+app.post("/api/maps/grounding", async (req, res) => {
+  try {
+    const { query, userLocation } = req.body || {};
+    if (!query || typeof query !== "string") {
+      return res.status(400).json({ error: "Query is required for Maps Grounding" });
+    }
+
+    const ai = getGenAI();
+    const result = await executeMapsGroundingQuery(
+      ai,
+      [{ role: "user", parts: [{ text: query }] }],
+      userLocation
+    );
+
+    return res.json({
+      text: result.text,
+      mapsGrounding: result.mapsGrounding,
+      groundingChunks: result.groundingChunks,
+      model: "gemini-3.5-flash",
+      success: true,
+    });
+  } catch (err: any) {
+    console.error("Maps grounding error:", err);
+    return res.status(500).json({ error: err?.message || "Maps grounding failed" });
   }
 });
 

@@ -2,6 +2,7 @@
 
 let currentAudio: HTMLAudioElement | null = null;
 let currentUtterance: SpeechSynthesisUtterance | null = null;
+let serverTtsCooldownUntil = 0;
 
 // Preload browser voices
 if (typeof window !== 'undefined' && window.speechSynthesis) {
@@ -43,6 +44,23 @@ export function detectSpeechLanguage(text: string): { lang: string; isHindi: boo
   return { lang: 'en-US', isHindi: false };
 }
 
+/**
+ * Clean text for Text-to-Speech: strips emotion tags, stage directions,
+ * laughter words/giggles, and markdown to prevent odd laughing sounds.
+ */
+export function cleanSpeechText(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/\[(?:emotion|expression):[^\]]+\]/gi, '')
+    .replace(/\[[^\]]+\]/g, '')
+    .replace(/\*[^*]+\*/g, '')
+    .replace(/\([^)]+\)/g, '')
+    .replace(/\b(ehehe+|hihi+|hehe+|haha+|hahaha+|ahahaha+|giggle[s]?|chuckle[s]?|gasp|sigh|lol|rofl|pffft+)\b/gi, '')
+    .replace(/[*_~`#]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 export async function speakKrishaText(
   text: string,
   voiceName: string = 'Aoede',
@@ -51,12 +69,19 @@ export async function speakKrishaText(
   onEnd?: () => void,
   onSpeakingChunk?: (isMouthOpen: boolean) => void,
   preferredLanguage?: string,
-  pitch: number = 1.25
+  pitch: number = 1.0,
+  voiceEngine: 'auto' | 'gemini' | 'browser' = 'auto'
 ): Promise<void> {
   // Stop previous speech
   stopKrishaSpeech();
 
-  const detected = detectSpeechLanguage(text);
+  const cleaned = cleanSpeechText(text);
+  if (!cleaned) {
+    onEnd?.();
+    return;
+  }
+
+  const detected = detectSpeechLanguage(cleaned);
   const targetLang =
     preferredLanguage && preferredLanguage !== 'auto'
       ? preferredLanguage === 'hi'
@@ -64,19 +89,30 @@ export async function speakKrishaText(
         : 'en-US'
       : detected.lang;
 
-  // Try Server Gemini TTS first (Aoede is Gemini's sweet, melodic feminine voice)
+  // If user explicitly configured browser engine or server is cooling down, skip cloud call directly
+  if (voiceEngine === 'browser' || Date.now() < serverTtsCooldownUntil) {
+    playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
+    return;
+  }
+
+  // Try Server Gemini TTS first with selected voice model (Aoede, Zephyr, Leda, Kore, Puck, Fenrir)
   try {
     const res = await fetch('/api/tts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, voice: voiceName, lang: targetLang }),
+      body: JSON.stringify({ text: cleaned, voice: voiceName, lang: targetLang }),
     });
 
     if (res.ok) {
       const data = await res.json();
-      if (data.audio) {
-        // Play base64 audio
-        const audioSrc = `data:audio/mp3;base64,${data.audio}`;
+      if (data.fallback) {
+        if (data.cooldownMs) {
+          serverTtsCooldownUntil = Date.now() + data.cooldownMs;
+        }
+      } else if (data.audio) {
+        // Play base64 audio (handles standard audio/wav returned by Gemini TTS)
+        const mimeType = data.mimeType || 'audio/wav';
+        const audioSrc = `data:${mimeType};base64,${data.audio}`;
         const audio = new Audio(audioSrc);
         audio.playbackRate = speed;
         currentAudio = audio;
@@ -103,7 +139,7 @@ export async function speakKrishaText(
         audio.onerror = () => {
           if (mouthInterval) clearInterval(mouthInterval);
           onSpeakingChunk?.(false);
-          playWebSpeechFallback(text, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch);
+          playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
         };
 
         await audio.play();
@@ -112,8 +148,8 @@ export async function speakKrishaText(
     }
   } catch {}
 
-  // Browser Web Speech Fallback with sweet feminine pitch
-  playWebSpeechFallback(text, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch);
+  // Seamless fallback to browser Web Speech API matching chosen voice profile
+  playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
 }
 
 function playWebSpeechFallback(
@@ -123,7 +159,8 @@ function playWebSpeechFallback(
   onEnd?: () => void,
   onSpeakingChunk?: (isMouthOpen: boolean) => void,
   targetLang?: string,
-  pitch: number = 1.25
+  pitch: number = 1.0,
+  voiceName: string = 'Aoede'
 ) {
   if (typeof window === 'undefined' || !window.speechSynthesis) {
     onEnd?.();
@@ -132,13 +169,7 @@ function playWebSpeechFallback(
 
   window.speechSynthesis.cancel();
 
-  // Clean text from emotion markers, expression brackets, or markdown tags
-  const clean = text
-    .replace(/\[(?:emotion|expression):[^\]]+\]/gi, '')
-    .replace(/\[[^\]]+\]/g, '')
-    .replace(/[*_~`]/g, '')
-    .trim();
-
+  const clean = cleanSpeechText(text);
   if (!clean) {
     onEnd?.();
     return;
@@ -149,12 +180,41 @@ function playWebSpeechFallback(
 
   const utterance = new SpeechSynthesisUtterance(clean);
   utterance.lang = langToUse;
-  // Natural gentle pace for sweet feminine delivery
-  utterance.rate = Math.max(0.75, Math.min(1.3, speed * 0.98));
-  // Sweet feminine pitch (1.25 creates a tender, warm feminine anime cadence)
-  utterance.pitch = Math.max(0.85, Math.min(1.7, pitch || 1.25));
 
-  // Voice selection according to language
+  // Voice personality profile tuning without squeaky distortion
+  let effectivePitch = pitch;
+  let effectiveRate = speed;
+
+  if (voiceName === 'Aoede') {
+    // Bright, melodic feminine tone
+    effectivePitch = pitch * 1.05;
+    effectiveRate = speed * 1.0;
+  } else if (voiceName === 'Zephyr') {
+    // Soft, gentle, peaceful cadence
+    effectivePitch = pitch * 0.98;
+    effectiveRate = speed * 0.94;
+  } else if (voiceName === 'Leda') {
+    // Delicate, graceful, warm
+    effectivePitch = pitch * 1.0;
+    effectiveRate = speed * 0.98;
+  } else if (voiceName === 'Kore') {
+    // Calm, soothing, rich warmth
+    effectivePitch = pitch * 0.96;
+    effectiveRate = speed * 0.95;
+  } else if (voiceName === 'Puck') {
+    // Cheerful, upbeat, playful
+    effectivePitch = pitch * 1.08;
+    effectiveRate = speed * 1.04;
+  } else if (voiceName === 'Fenrir') {
+    // Deeper, calm, resonant tone
+    effectivePitch = pitch * 0.88;
+    effectiveRate = speed * 0.95;
+  }
+
+  utterance.rate = Math.max(0.75, Math.min(1.3, effectiveRate));
+  utterance.pitch = Math.max(0.8, Math.min(1.25, effectivePitch));
+
+  // Voice selection according to language and requested voice personality
   const voices = window.speechSynthesis.getVoices();
 
   if (langToUse.startsWith('hi') || detected.isHindi) {
@@ -201,32 +261,46 @@ function playWebSpeechFallback(
       utterance.voice = indianVoice;
     }
   } else {
-    // English: prioritize top sweet, soft, natural feminine voices
+    // English: choose based on voice model characteristics
     const langPrefix = langToUse.slice(0, 2).toLowerCase();
-    const sweetVoiceNames = [
-      'jenny', // Microsoft Jenny (Natural) - soft, sweet feminine
-      'aria', // Microsoft Aria (Natural)
-      'samantha', // Apple Samantha
-      'victoria', // Apple Victoria
-      'karen', // Apple Karen
-      'serena', // UK Serena
-      'sonia', // Microsoft Sonia
-      'zira', // Microsoft Zira
-      'google us english',
-      'google uk english female',
-      'natural female',
-      'female',
-    ];
+    
+    if (voiceName === 'Fenrir') {
+      // Deeper resonant voice
+      const deepVoice = voices.find((v) => {
+        const n = v.name.toLowerCase();
+        return (
+          v.lang.toLowerCase().startsWith(langPrefix) &&
+          (n.includes('guy') || n.includes('david') || n.includes('george') || n.includes('male') || n.includes('deep'))
+        );
+      });
+      if (deepVoice) utterance.voice = deepVoice;
+    } else {
+      // Feminine & expressive models: Aoede, Zephyr, Leda, Kore, Puck
+      const sweetVoiceNames = [
+        'jenny', // Microsoft Jenny (Natural)
+        'aria', // Microsoft Aria (Natural)
+        'samantha', // Apple Samantha
+        'victoria', // Apple Victoria
+        'karen', // Apple Karen
+        'serena', // UK Serena
+        'sonia', // Microsoft Sonia
+        'zira', // Microsoft Zira
+        'google us english',
+        'google uk english female',
+        'natural female',
+        'female',
+      ];
 
-    const preferredVoice =
-      voices.find((v) => {
-        const name = v.name.toLowerCase();
-        const langMatch = v.lang.toLowerCase().startsWith(langPrefix);
-        return langMatch && sweetVoiceNames.some((fav) => name.includes(fav));
-      }) || voices.find((v) => v.lang.toLowerCase().startsWith(langPrefix));
+      const preferredVoice =
+        voices.find((v) => {
+          const name = v.name.toLowerCase();
+          const langMatch = v.lang.toLowerCase().startsWith(langPrefix);
+          return langMatch && sweetVoiceNames.some((fav) => name.includes(fav));
+        }) || voices.find((v) => v.lang.toLowerCase().startsWith(langPrefix));
 
-    if (preferredVoice) {
-      utterance.voice = preferredVoice;
+      if (preferredVoice) {
+        utterance.voice = preferredVoice;
+      }
     }
   }
 

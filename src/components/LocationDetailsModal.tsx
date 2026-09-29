@@ -14,8 +14,9 @@ import {
   Crosshair,
   AlertCircle,
   ShieldCheck,
+  Sparkles,
 } from 'lucide-react';
-import { UserLocation } from '../types';
+import { UserLocation, MapsGroundingPlace } from '../types';
 import { geocodeAddress, requestBrowserGps } from '../utils/locationService';
 
 interface LocationDetailsModalProps {
@@ -44,7 +45,47 @@ export const LocationDetailsModal: React.FC<LocationDetailsModalProps> = ({
   const [isSearching, setIsSearching] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
+  // Maps Grounding state
+  const [groundingQuery, setGroundingQuery] = useState('');
+  const [isGroundingLoading, setIsGroundingLoading] = useState(false);
+  const [groundingAnswer, setGroundingAnswer] = useState<string | null>(null);
+  const [groundedPlaces, setGroundedPlaces] = useState<MapsGroundingPlace[]>([]);
+  const [groundingError, setGroundingError] = useState<string | null>(null);
+
   if (!isOpen) return null;
+
+  const handleExecuteMapsGrounding = async (q?: string) => {
+    const queryToRun = (q || groundingQuery).trim();
+    if (!queryToRun || isGroundingLoading) return;
+
+    setIsGroundingLoading(true);
+    setGroundingError(null);
+    setGroundingAnswer(null);
+    setGroundedPlaces([]);
+
+    try {
+      const res = await fetch('/api/maps/grounding', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          query: queryToRun,
+          userLocation: location ? { lat: location.lat, lng: location.lng } : undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Maps grounding query failed');
+      }
+
+      setGroundingAnswer(data.text || '');
+      setGroundedPlaces(data.mapsGrounding || []);
+    } catch (err: any) {
+      setGroundingError(err?.message || 'Failed to get Google Maps data');
+    } finally {
+      setIsGroundingLoading(false);
+    }
+  };
 
   const handleCopyCoords = () => {
     if (location) {
@@ -349,6 +390,117 @@ export const LocationDetailsModal: React.FC<LocationDetailsModalProps> = ({
                     <div className="w-full h-full flex flex-col items-center justify-center text-slate-400 gap-2 p-4 text-center">
                       <Globe className="w-8 h-8 text-blue-400/50" />
                       <p className="text-xs">Location coordinates resolved</p>
+                    </div>
+                  )}
+                </div>
+
+                {/* Google Maps Grounding Exploration Tool */}
+                <div className="p-4 rounded-xl bg-blue-950/25 border border-blue-500/30 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-semibold uppercase tracking-wider text-emerald-400 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5" />
+                      Explore with Google Maps Grounding
+                    </span>
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                      gemini-3.5-flash
+                    </span>
+                  </div>
+
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      handleExecuteMapsGrounding();
+                    }}
+                    className="flex items-center gap-2"
+                  >
+                    <div className="relative flex-1">
+                      <Search className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                      <input
+                        type="text"
+                        placeholder="Search nearby cafes, restaurants, sights with Google Maps..."
+                        value={groundingQuery}
+                        onChange={(e) => setGroundingQuery(e.target.value)}
+                        className={`w-full pl-9 pr-3 py-2 rounded-xl text-xs focus:outline-none transition-colors border ${
+                          isLightMode
+                            ? 'bg-white border-slate-300 text-slate-800'
+                            : 'bg-black/40 border-blue-900/40 text-slate-100 placeholder-slate-500 focus:border-blue-500'
+                        }`}
+                      />
+                    </div>
+                    <button
+                      type="submit"
+                      disabled={isGroundingLoading || !groundingQuery.trim()}
+                      className="px-3.5 py-2 rounded-xl text-xs font-semibold text-white bg-emerald-600 hover:bg-emerald-500 disabled:opacity-50 transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer shadow-sm shadow-emerald-900/30"
+                    >
+                      {isGroundingLoading ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Navigation className="w-3.5 h-3.5" />}
+                      Search
+                    </button>
+                  </form>
+
+                  {/* Suggestion Chips */}
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    {[
+                      'Top cafes near me',
+                      'Best dinner restaurants',
+                      'Must-visit sights and attractions',
+                      'Popular shopping spots',
+                    ].map((chip, idx) => (
+                      <button
+                        key={idx}
+                        type="button"
+                        onClick={() => {
+                          setGroundingQuery(chip);
+                          handleExecuteMapsGrounding(chip);
+                        }}
+                        className="text-[11px] px-2.5 py-1 rounded-lg bg-blue-900/30 hover:bg-blue-800/40 text-blue-200 border border-blue-500/20 transition-colors cursor-pointer"
+                      >
+                        {chip}
+                      </button>
+                    ))}
+                  </div>
+
+                  {/* Grounding Error */}
+                  {groundingError && (
+                    <div className="p-2.5 rounded-lg bg-red-500/10 border border-red-500/25 text-xs text-red-300">
+                      {groundingError}
+                    </div>
+                  )}
+
+                  {/* Grounded Answer and Place Links */}
+                  {groundingAnswer && (
+                    <div className="space-y-2 pt-2 border-t border-blue-900/30">
+                      <p className="text-xs text-slate-200 leading-relaxed whitespace-pre-wrap">
+                        {groundingAnswer}
+                      </p>
+
+                      {groundedPlaces.length > 0 && (
+                        <div className="space-y-1.5 pt-2">
+                          <span className="text-[11px] font-semibold text-emerald-400 block">
+                            Direct Google Maps Links:
+                          </span>
+                          <div className="space-y-1.5 max-h-40 overflow-y-auto pr-1">
+                            {groundedPlaces.map((place, pIdx) => (
+                              <div
+                                key={pIdx}
+                                className="p-2 rounded-lg bg-black/40 border border-blue-500/20 flex items-start justify-between gap-2"
+                              >
+                                <span className="text-xs font-medium text-white">{place.title}</span>
+                                {place.uri && (
+                                  <a
+                                    href={place.uri}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="text-[11px] text-blue-400 hover:text-blue-300 inline-flex items-center gap-1 shrink-0 font-mono bg-blue-500/15 px-2 py-0.5 rounded"
+                                  >
+                                    <ExternalLink className="w-3 h-3" />
+                                    Maps
+                                  </a>
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
                     </div>
                   )}
                 </div>

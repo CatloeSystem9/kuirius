@@ -72,6 +72,7 @@ import { LocationDetailsModal } from './components/LocationDetailsModal';
 import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { WebBrowserModal } from './components/WebBrowserModal';
 import { GlobeModal } from './components/globe/GlobeModal';
+import { AudioTranscriptionModal } from './components/AudioTranscriptionModal';
 
 export default function App() {
   // State
@@ -490,10 +491,14 @@ export default function App() {
     if (settings.voiceEnabled) {
       speakKrishaText(
         text,
-        settings.voiceName,
+        settings.voiceName || 'Aoede',
         settings.voiceSpeed,
         () => setIsSpeaking(true),
-        () => setIsSpeaking(false)
+        () => setIsSpeaking(false),
+        undefined,
+        settings.languagePreference || 'auto',
+        settings.voicePitch ?? 1.0,
+        settings.voiceEngine || 'auto'
       );
     } else {
       setIsSpeaking(true);
@@ -584,10 +589,14 @@ export default function App() {
       if (settings.voiceEnabled) {
         speakKrishaText(
           reportText,
-          settings.voiceName,
+          settings.voiceName || 'Aoede',
           settings.voiceSpeed,
           () => setIsSpeaking(true),
-          () => setIsSpeaking(false)
+          () => setIsSpeaking(false),
+          undefined,
+          settings.languagePreference || 'auto',
+          settings.voicePitch ?? 1.0,
+          settings.voiceEngine || 'auto'
         );
       } else {
         setIsSpeaking(true);
@@ -619,7 +628,7 @@ export default function App() {
   };
 
   // Send message to Krisha
-  const handleSendMessage = async (text: string) => {
+  const handleSendMessage = async (text: string, forceMapsGrounding?: boolean) => {
     if (!text.trim() || isLoading) return;
 
     // ---- Agent Core delegation (Phase 1 / 4 / 5 / 6) ----
@@ -870,8 +879,9 @@ export default function App() {
     // Check for 3D Earth / Globe interaction commands
     let detectedGlobeAction: GlobeAction | null = null;
     const isGlobeIntent =
-      /\b(globe|3d\s+earth|earth\s+view|satellite\s+view|explore\s+earth)\b/i.test(text) ||
-      /\b(?:take\s+me\s+to|fly\s+to|show)\s+[a-zA-Z\s]+?\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth)\b/i.test(text);
+      /\b(globe|3d\s+earth|earth\s+view|satellite\s+view|explore\s+earth|google\s+earth|googleearth|earth\.google|open\s+earth)\b/i.test(text) ||
+      /\b(?:take\s+me\s+to|fly\s+to|show)\s+[a-zA-Z\s]+?\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth|google\s+earth)\b/i.test(text) ||
+      (detectedWebAction?.siteName === 'Google Earth');
 
     if (isGlobeIntent) {
       if (/\b(return|reset|back\s+to\s+earth|full\s+earth)\b/i.test(text)) {
@@ -886,10 +896,12 @@ export default function App() {
         detectedGlobeAction = { type: 'set_layer', layer: 'standard' };
       } else {
         const placeMatch = text.match(
-          /\b(?:show|take\s+me\s+to|fly\s+to|zoom\s+into|locate)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe)|$)/i
+          /\b(?:show|take\s+me\s+to|fly\s+to|zoom\s+into|locate|explore)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe|google\s+earth)|$)/i
         );
-        const place = placeMatch ? placeMatch[1].trim() : undefined;
-        if (place && !['earth', 'the earth', 'globe', 'the globe', 'me', 'it'].includes(place.toLowerCase())) {
+        const place = placeMatch
+          ? placeMatch[1].trim()
+          : (detectedWebAction?.siteName === 'Google Earth' && detectedWebAction.query ? detectedWebAction.query : undefined);
+        if (place && !['earth', 'the earth', 'globe', 'the globe', 'google earth', 'me', 'it'].includes(place.toLowerCase())) {
           try {
             const geocoded = await geocodeAddress(place);
             detectedGlobeAction = {
@@ -994,6 +1006,7 @@ export default function App() {
           locationError: locationAcquisitionError || undefined,
           isExplicitLocationQuery: isLocationQuery,
           wantsToOpenMaps,
+          useMapsGrounding: Boolean(forceMapsGrounding),
           languagePreference: settings.languagePreference || 'auto',
         }),
       });
@@ -1020,6 +1033,24 @@ export default function App() {
         openExternalUrl(resolvedWebAction.url);
       }
 
+      // Handle Maps Grounding places returned by gemini-3.5-flash with googleMaps tool
+      let resolvedMapsAction = detectedMapsAction;
+      const mapsGroundingData = data.mapsGrounding || undefined;
+      if (mapsGroundingData && mapsGroundingData.length > 0) {
+        resolvedMapsAction = {
+          type: 'grounding',
+          googleMapsUrl: mapsGroundingData[0]?.uri || (currentActiveLocation ? currentActiveLocation.googleMapsUrl : 'https://www.google.com/maps'),
+          city: currentActiveLocation?.city || 'Google Maps Grounded Places',
+          formattedAddress: mapsGroundingData.map((p: any) => p.title).slice(0, 3).join(', '),
+          mapsGrounding: mapsGroundingData,
+          groundingUsed: true,
+          lat: currentActiveLocation?.lat,
+          lng: currentActiveLocation?.lng,
+        };
+        detectedMapsAction = resolvedMapsAction;
+        setActiveLocationAction(resolvedMapsAction);
+      }
+
       const botMsg: Message = {
         id: 'msg_' + (Date.now() + 1),
         role: 'model',
@@ -1030,7 +1061,8 @@ export default function App() {
         webAction: resolvedWebAction || undefined,
         fileAction: detectedFileAction || undefined,
         appAction: detectedAppAction || undefined,
-        mapsAction: detectedMapsAction || undefined,
+        mapsAction: resolvedMapsAction || undefined,
+        mapsGrounding: mapsGroundingData,
       };
 
       const finalMessages = [...targetConvo.messages, botMsg];
@@ -1060,7 +1092,8 @@ export default function App() {
           () => setIsSpeaking(false),
           undefined,
           settings.languagePreference || 'auto',
-          settings.voicePitch ?? 1.25
+          settings.voicePitch ?? 1.0,
+          settings.voiceEngine || 'auto'
         );
       } else {
         setIsSpeaking(true);
@@ -1137,7 +1170,8 @@ export default function App() {
       () => setIsSpeaking(false),
       undefined,
       settings.languagePreference || 'auto',
-      settings.voicePitch ?? 1.25
+      settings.voicePitch ?? 1.0,
+      settings.voiceEngine || 'auto'
     );
   };
 
@@ -1209,7 +1243,8 @@ export default function App() {
           () => setIsSpeaking(false),
           undefined,
           settings.languagePreference || 'auto',
-          settings.voicePitch ?? 1.25
+          settings.voicePitch ?? 1.0,
+          settings.voiceEngine || 'auto'
         );
       } else {
         setIsSpeaking(true);
@@ -1483,6 +1518,7 @@ export default function App() {
               setActiveModal('files');
               setInitialFolderFilter('ALL');
             }}
+            onOpenTranscribeModal={() => setActiveModal('transcribe')}
             isLoading={isLoading}
             isSpeaking={isSpeaking}
             isLightMode={isWhiteBackground}
@@ -1639,6 +1675,13 @@ export default function App() {
         userLocation={userLocation}
         initialAction={activeGlobeAction}
         onActionComplete={() => setActiveGlobeAction(null)}
+      />
+
+      <AudioTranscriptionModal
+        isOpen={activeModal === 'transcribe'}
+        onClose={() => setActiveModal(null)}
+        onSendToChat={(txt) => handleSendMessage(txt)}
+        isLightMode={isWhiteBackground}
       />
     </div>
   );

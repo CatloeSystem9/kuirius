@@ -122,6 +122,9 @@ export const WebBrowserModal: React.FC<WebBrowserModalProps> = ({
     } else if (/^[a-zA-Z0-9-]+\.[a-zA-Z]{2,}/i.test(query)) {
       targetUrl = `https://${query}`;
       siteName = query.split('.')[0];
+    } else if (/\b(?:google\s+earth|earth\.google|3d\s+earth)\b/i.test(query)) {
+      targetUrl = `https://earth.google.com/web/`;
+      siteName = 'Google Earth';
     } else {
       // Default to Google search or YouTube search if query mentions video/music
       const isVideo = /\b(video|song|music|watch|youtube|trailer|stream)\b/i.test(query);

@@ -556,7 +556,7 @@ export function parseFileCommand(text: string): {
   const m1 = clean.match(fileOpenRegex);
   if (m1) {
     const rawTarget = m1[1] ? m1[1].trim() : '';
-    if (!/^(youtube|google|reddit|spotify|twitter|netflix|wikipedia|dancing|dance|directions|left|right|around)/i.test(rawTarget)) {
+    if (!/^(youtube|google|earth|globe|reddit|spotify|twitter|netflix|wikipedia|dancing|dance|directions|left|right|around)/i.test(rawTarget)) {
       const isExplicitOpen = /^\s*open\b/i.test(clean);
       return {
         isFileCommand: true,

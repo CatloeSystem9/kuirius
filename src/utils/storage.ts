@@ -13,9 +13,9 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   wakeWordEnabled: false,
   voiceName: 'Aoede',
   voiceSpeed: 1.0,
-  voicePitch: 1.25,
+  voicePitch: 1.0,
   languagePreference: 'auto',
-  companionNotes: 'Speaks sweetly and warmly in English & Hindi with an affectionate, feminine charm.',
+  companionNotes: 'Speaks sweetly and warmly in English & Hindi with an affectionate, natural charm.',
 };
 
 export const DEFAULT_MEMORIES: string[] = [

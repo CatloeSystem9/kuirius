@@ -92,6 +92,16 @@ export const PRESET_LAPTOP_APPS: LaptopApp[] = [
     aliases: ['obsidian', 'obsidian notes'],
   },
   {
+    id: 'googleearth',
+    name: 'Google Earth Pro / Web',
+    category: 'productivity',
+    protocol: 'googleearth:',
+    fallbackUrl: 'https://earth.google.com/web/',
+    iconName: 'Globe',
+    description: '3D satellite imagery, planetary navigation, and terrain',
+    aliases: ['google earth', 'google earth pro', 'googleearth', 'earth app', 'google earth desktop'],
+  },
+  {
     id: 'calculator',
     name: 'Calculator',
     category: 'system',

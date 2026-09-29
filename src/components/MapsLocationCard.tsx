@@ -132,6 +132,59 @@ export const MapsLocationCard: React.FC<MapsLocationCardProps> = ({
           </div>
         )}
 
+        {/* Google Maps Grounding Places & Links */}
+        {action.mapsGrounding && action.mapsGrounding.length > 0 && (
+          <div className="mt-3 pl-11 space-y-2 border-t border-blue-500/20 pt-2.5">
+            <div className="flex items-center justify-between">
+              <span className="text-[10px] font-bold uppercase tracking-wider text-emerald-400 flex items-center gap-1">
+                <Navigation className="w-3 h-3" />
+                Google Maps Grounded Places ({action.mapsGrounding.length})
+              </span>
+              <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                Live Data
+              </span>
+            </div>
+
+            <div className="space-y-2 max-h-48 overflow-y-auto pr-1">
+              {action.mapsGrounding.map((place, idx) => (
+                <div
+                  key={idx}
+                  className="p-2.5 rounded-xl bg-blue-950/40 border border-blue-500/20 hover:border-blue-400/50 transition-colors"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <span className="text-xs font-semibold text-white">
+                      {place.title}
+                    </span>
+                    {place.uri && (
+                      <a
+                        href={place.uri}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="text-[11px] text-blue-400 hover:text-blue-300 inline-flex items-center gap-1 font-medium bg-blue-500/10 hover:bg-blue-500/20 px-2 py-0.5 rounded-lg border border-blue-500/25 shrink-0"
+                        title={`Open ${place.title} on Google Maps`}
+                      >
+                        <ExternalLink className="w-3 h-3" />
+                        <span>View</span>
+                      </a>
+                    )}
+                  </div>
+
+                  {/* Review Snippets from Maps Grounding */}
+                  {place.reviewSnippets && place.reviewSnippets.length > 0 && (
+                    <div className="mt-1.5 space-y-1">
+                      {place.reviewSnippets.map((snippet, sIdx) => (
+                        <p key={sIdx} className="text-[11px] text-slate-300 italic bg-blue-900/20 p-1.5 rounded-lg border border-blue-500/10">
+                          "{snippet}"
+                        </p>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {action.usedAlternative && (
           <div className="mt-1 pl-11">
             <p className="text-[10px] text-amber-400/80 font-mono">

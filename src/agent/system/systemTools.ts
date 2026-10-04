@@ -439,3 +439,33 @@ export function createSystemTools(fs: FilesystemService, apps: ApplicationServic
     },
   ];
 }
+
+/**
+ * The planner's honest fallback (Phase 1): any clause that cannot be
+ * classified becomes a `system.note` step. This tool makes that step real —
+ * it records the clause in the task result and succeeds with self-reported
+ * evidence. No permissions (read-only, no side effects beyond the report).
+ * Registered by the bridge (Phase 16 plan validation requires it to exist).
+ */
+export function createSystemNoteTool(): AgentTool {
+  return {
+    name: 'system.note',
+    description: 'Record an unclassified request clause as an honest note in the task report (no side effects).',
+    category: 'system',
+    riskLevel: 'low',
+    cost: 'cheap',
+    reliability: 1,
+    capabilities: ['system.note'],
+    permissions: [],
+    inputSchema: {
+      optional: ['text'],
+      types: { text: 'string' } as Record<string, 'string' | 'number' | 'boolean' | 'object' | 'array'>,
+    },
+    verification: { strategy: 'self_reported', description: 'The note is returned verbatim as the result.' },
+    timeoutMs: 5_000,
+    async execute(input): Promise<ToolResult> {
+      const text = String(input.text ?? '').slice(0, 300);
+      return ok({ output: { noted: true, text, summary: text ? `Noted: ${text}` : 'Noted (no detail provided).' } });
+    },
+  };
+}

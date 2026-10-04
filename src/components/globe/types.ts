@@ -54,6 +54,24 @@ export interface GlobeControllerHandle {
   getCameraCoordinates: () => GlobeCoordinates;
   addMarker: (marker: GlobeMarker) => void;
   clearMarkers: () => void;
+  getWindReadingAt: (lat: number, lng: number) => Promise<WindInfoReading | null>;
+  isWindDataReady: () => boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Live environmental readings (structurally matches envService.WindReading)
+// ---------------------------------------------------------------------------
+
+export interface WindInfoReading {
+  lat: number;
+  lng: number;
+  speedMs: number;
+  speedKmh: number;
+  directionDeg: number; // FROM-direction (0 = from north)
+  cardinal: string;
+  timestamp: number; // epoch ms of the reading
+  source: string;
+  stale: boolean; // true if served from an older cached fetch
 }
 
 // ---------------------------------------------------------------------------

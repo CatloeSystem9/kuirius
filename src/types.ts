@@ -118,7 +118,7 @@ export interface MapsLocationAction {
 }
 
 export interface GlobeAction {
-  type: 'fly_to' | 'set_layer' | 'reset_view' | 'open_globe';
+  type: 'fly_to' | 'set_layer' | 'reset_view' | 'open_globe' | 'wind_on' | 'wind_off';
   lat?: number;
   lng?: number;
   zoom?: number;

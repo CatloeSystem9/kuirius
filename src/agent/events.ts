@@ -89,7 +89,39 @@ export type AgentEventName =
   | 'STRATEGY_UPDATED'
   | 'WORKFLOW_DETECTED'
   | 'WORKFLOW_LEARNED'
-  | 'WORKFLOW_REUSED';
+  | 'WORKFLOW_REUSED'
+  // Phase 16 — Advanced Planning (hierarchical, adaptive, bounded)
+  | 'PLAN_CREATED'
+  | 'PLAN_UPDATED'
+  | 'PLAN_NODE_STARTED'
+  | 'PLAN_NODE_COMPLETED'
+  | 'PLAN_NODE_FAILED'
+  | 'PLAN_REPLAN_REQUESTED'
+  | 'PLAN_REPLANNED'
+  | 'PLAN_BLOCKED'
+  | 'PLAN_CLARIFICATION_REQUESTED'
+  | 'PLAN_COMPLETED'
+  | 'PLAN_CANCELLED'
+  // Phase 19 — Long-Run Autonomy (persistent bounded sessions)
+  | 'TASK_RESUMED'
+  | 'TASK_PAUSED'
+  | 'TASK_WAITING'
+  | 'TASK_WAIT_COMPLETED'
+  | 'TASK_CHECKPOINTED'
+  | 'TASK_BUDGET_EXHAUSTED'
+  // Deep Research Intelligence — additional capability, outside the numbered
+  // roadmap (NOT roadmap Phase 16; Phase 16 = Advanced Planning above)
+  | 'RESEARCH_STARTED'
+  | 'RESEARCH_PLAN_CREATED'
+  | 'RESEARCH_SEARCH_COMPLETED'
+  | 'RESEARCH_SOURCE_INSPECTED'
+  | 'RESEARCH_EVIDENCE_EXTRACTED'
+  | 'RESEARCH_ANALYSIS_COMPLETED'
+  | 'RESEARCH_FOLLOWUP_QUEUED'
+  | 'RESEARCH_ROUND_COMPLETED'
+  | 'RESEARCH_COMPLETED'
+  | 'RESEARCH_INSUFFICIENT_EVIDENCE'
+  | 'RESEARCH_FAILED';
 
 export interface AgentEvent<P = unknown> {
   name: AgentEventName;

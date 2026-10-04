@@ -3,6 +3,14 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
+import {
+  CachedClassifier,
+  createDefaultModelRegistry,
+  getPerformanceTelemetry,
+  hashKey,
+  ModelRouter,
+  RequestCoalescer,
+} from "./src/agent/routing";
 
 dotenv.config();
 
@@ -28,9 +36,9 @@ function getGenAI(): GoogleGenAI {
   return genAIClient;
 }
 
-// Health check
+// Health check (Phase 17: includes a passive performance snapshot)
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok" });
+  res.json({ status: "ok", perf: getPerformanceTelemetry().snapshot() });
 });
 
 // Google Maps background status
@@ -249,6 +257,17 @@ const CANDIDATE_CHAT_MODELS = [
   "gemini-3.1-flash-lite",
 ];
 
+// Phase 17 — Model Routing + Performance: deterministic classification picks
+// the smallest capable model first and the router reorders THIS waterfall per
+// task (the full candidate list always stays behind the selection, so the
+// existing fallback resilience is never reduced). Routing produces decisions
+// only — execution, retries and safety behavior below are unchanged.
+const modelRoutingRegistry = createDefaultModelRegistry();
+const modelRouter = new ModelRouter(modelRoutingRegistry, getPerformanceTelemetry());
+const chatClassifier = new CachedClassifier({ telemetry: getPerformanceTelemetry() });
+const perf = getPerformanceTelemetry();
+const visionCoalescer = new RequestCoalescer<any>(perf);
+
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 // Helper to call Gemini with multi-model fallback and backoff retry on 503/429
@@ -260,13 +279,19 @@ async function generateContentWithFallback(
     temperature?: number;
     topP?: number;
     responseMimeType?: string;
+    /** Routing (Phase 17): optional per-task model order. The default
+     *  waterfall is used when routing did not run. */
+    models?: string[];
   }
 ): Promise<{ text: string; usedModel: string }> {
   let lastError: any = null;
+  const candidateModels = options.models && options.models.length > 0 ? options.models : CANDIDATE_CHAT_MODELS;
+  const primaryModel = candidateModels[0];
 
-  for (const model of CANDIDATE_CHAT_MODELS) {
+  for (const model of candidateModels) {
     // Attempt up to 2 times per model with backoff on 503 / 429
     for (let attempt = 0; attempt < 2; attempt++) {
+      const callStart = Date.now();
       try {
         const config: any = {};
         if (options.systemInstruction) config.systemInstruction = options.systemInstruction;
@@ -282,8 +307,23 @@ async function generateContentWithFallback(
 
         const text = response.text || "";
         if (text) {
+          perf.recordModelCall({
+            at: Date.now(),
+            model,
+            latencyMs: Date.now() - callStart,
+            ok: true,
+            via: model === primaryModel ? "primary" : "fallback",
+          });
           return { text, usedModel: model };
         }
+        perf.recordModelCall({
+          at: Date.now(),
+          model,
+          latencyMs: Date.now() - callStart,
+          ok: false,
+          via: model === primaryModel ? "primary" : "fallback",
+          errorKind: "empty_response",
+        });
       } catch (err: any) {
         lastError = err;
         const errMessage = String(err?.message || err);
@@ -295,6 +335,14 @@ async function generateContentWithFallback(
           errMessage.includes("high demand") ||
           errMessage.includes("quota");
 
+        perf.recordModelCall({
+          at: Date.now(),
+          model,
+          latencyMs: Date.now() - callStart,
+          ok: false,
+          via: model === primaryModel ? "primary" : "fallback",
+          errorKind: isTransient ? "transient" : "error",
+        });
         if (isTransient && attempt === 0) {
           // Short backoff before retrying this model
           await sleep(500);
@@ -889,6 +937,11 @@ Examples:
       ? messages[messages.length - 1]?.content || ""
       : "";
 
+    // Phase 17: deterministic task classification → route. The selected model
+    // goes first in the waterfall; the full candidate list stays behind it.
+    const chatComplexity = chatClassifier.classify(lastUserMsg || "");
+    const chatRoute = modelRouter.route({ classification: chatComplexity });
+
     let reply = "";
     let mapsGrounding: MapsGroundingPlaceItem[] = [];
     let groundingChunks: any[] = [];
@@ -921,14 +974,17 @@ Examples:
       }
     }
 
+    let usedChatModel: string | undefined;
     if (!reply) {
       const fallbackChat = await generateContentWithFallback(ai, {
         contents,
         systemInstruction,
         temperature: 0.9,
         topP: 0.95,
+        models: chatRoute.orderedModels,
       });
       reply = fallbackChat.text;
+      usedChatModel = fallbackChat.usedModel;
     }
     
     // Parse enhanced emotion tag or fallback
@@ -997,6 +1053,17 @@ Examples:
       groundingChunks: groundingChunks.length > 0 ? groundingChunks : undefined,
       mapsGrounded: usedMapsGrounding,
       raw: reply,
+      // Phase 17: routing metadata (additive) — what was classified, the
+      // preferred model, and the model that actually served the reply.
+      route: {
+        complexity: chatComplexity.tier,
+        tier: chatRoute.tier,
+        preferred: chatRoute.model,
+        used: usedChatModel,
+        reason: chatRoute.reason,
+        orderedModels: chatRoute.orderedModels,
+        recommendedTimeoutMs: chatRoute.recommendedTimeoutMs,
+      },
     });
   } catch (error: any) {
     // Seamless fallback to companion generator if all Gemini API models are temporarily exhausted
@@ -1016,6 +1083,13 @@ Examples:
     return res.json({
       ...fallbackResult,
       webAction: serverWebAction || undefined,
+      // Phase 17: routing metadata survives the local fallback (additive).
+      route: {
+        complexity: chatClassifier.classify(lastUserMessage).tier,
+        preferred: modelRouter.route({ text: lastUserMessage }).model,
+        used: "local-fallback",
+        reason: "all models exhausted — in-character local fallback",
+      },
     });
   }
 });
@@ -1574,22 +1648,40 @@ Return ONLY a JSON object with exactly this shape:
 Rules: report only what is actually visible; use empty arrays when nothing applies; never invent text or elements. Bounds are normalized 0..1 relative to the whole image.
 ${question ? `User question: "${question}"` : ""}`;
 
-    const { text } = await generateContentWithFallback(ai, {
-      contents: [
-        {
-          role: "user",
-          parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: base64 } }],
-        },
-      ],
-      responseMimeType: "application/json",
-      temperature: 0.2,
+    // Phase 17: identical concurrent analyses are coalesced into ONE model
+    // call (read-only, deterministic request → safe to share). Independent
+    // requests are never affected.
+    const visionStart = Date.now();
+    const analysis = await visionCoalescer.run(`${hashKey(base64)}|${question ?? ""}`, async () => {
+      const { text } = await generateContentWithFallback(ai, {
+        contents: [
+          {
+            role: "user",
+            parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: base64 } }],
+          },
+        ],
+        responseMimeType: "application/json",
+        temperature: 0.2,
+      });
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(text || "{}");
+      } catch {
+        return { fallback: true as const, reason: "malformed_model_output" };
+      }
+      perf.recordModelCall({
+        at: Date.now(),
+        model: "vision-waterfall",
+        latencyMs: Date.now() - visionStart,
+        ok: !parsed.fallback,
+        via: "primary",
+      });
+      return parsed;
     });
 
-    let analysis: any;
-    try {
-      analysis = JSON.parse(text || "{}");
-    } catch {
-      return res.json({ fallback: true, reason: "malformed_model_output" });
+    if (analysis?.fallback) {
+      return res.json({ fallback: true, reason: analysis.reason });
     }
 
     return res.json({ analysis });
@@ -2137,6 +2229,240 @@ app.post("/api/browser/tabs", async (req, res) => {
     res.json({ success: true, tabs });
   } catch (err: any) {
     res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+// ---- Deep research capability endpoints (additional capability, outside the
+// numbered roadmap — NOT roadmap Phase 16) ----
+// Server-side search + page fetch for the research subsystem: same-origin
+// pattern used by every other agent backend (no browser CORS limits, no new
+// dependencies — regex HTML parsing only). Everything is bounded (timeouts,
+// response caps) and refuses private network targets (server-side SSRF guard).
+const RESEARCH_FETCH_TIMEOUT_MS = 15_000;
+const RESEARCH_MAX_BYTES = 1_500_000;
+const RESEARCH_TEXT_MAX_CHARS = 40_000;
+
+const RESEARCH_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36 KrishaResearch/1.0";
+
+function isPrivateResearchHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  if (host === "localhost" || host.endsWith(".localhost") || host.endsWith(".local")) return true;
+  if (host === "::1" || host === "[::1]" || host === "0.0.0.0") return true;
+  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const [a, b] = [Number(ipv4[1]), Number(ipv4[2])];
+    if (a === 127 || a === 10 || a === 0) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+    if (a === 169 && b === 254) return true;
+  }
+  return false;
+}
+
+function decodeResearchEntities(text: string): string {
+  return text
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;|&apos;|&#x27;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_, code) => {
+      const num = Number(code);
+      return num > 0 && num < 0x10ffff ? String.fromCodePoint(num) : "";
+    });
+}
+
+function stripResearchTags(html: string): string {
+  return decodeResearchEntities(html.replace(/<[^>]*>/g, " "));
+}
+
+/** Resolve a DuckDuckGo result href (direct URL or /l/?uddg= redirect). */
+function resolveDdgHref(href: string): string | null {
+  let value = href.trim();
+  if (value.startsWith("//")) value = `https:${value}`;
+  try {
+    const parsed = new URL(value, "https://duckduckgo.com");
+    const uddg = parsed.searchParams.get("uddg");
+    if (uddg) return decodeURIComponent(uddg);
+    if (parsed.hostname.includes("duckduckgo.com")) return null;
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function duckDuckGoSearch(query: string, variant: "html" | "lite"): Promise<{ url: string; title: string; snippet: string }[]> {
+  const target =
+    variant === "html"
+      ? `https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`
+      : `https://lite.duckduckgo.com/lite/?q=${encodeURIComponent(query)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESEARCH_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(target, {
+      headers: { "User-Agent": RESEARCH_UA, "Accept": "text/html" },
+      signal: controller.signal,
+    });
+    if (!resp.ok) return [];
+    const html = (await resp.text()).slice(0, RESEARCH_MAX_BYTES);
+
+    const anchorRe =
+      variant === "html"
+        ? /<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g
+        : /<a[^>]+class="result-link"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const snippetRe =
+      variant === "html"
+        ? /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g
+        : /<td[^>]+class="result-snippet"[^>]*>([\s\S]*?)<\/td>/g;
+
+    const anchors = [...html.matchAll(anchorRe)].slice(0, 10);
+    const snippets = [...html.matchAll(snippetRe)].slice(0, 10);
+
+    const results: { url: string; title: string; snippet: string }[] = [];
+    const seen = new Set<string>();
+    for (let i = 0; i < anchors.length; i++) {
+      // Skip sponsored/internal links before resolving (ads, y.js redirects).
+      if (/duckduckgo\.com\/y\.js|[?&]ad_domain=|ad_provider=/i.test(anchors[i][1])) continue;
+      const url = resolveDdgHref(anchors[i][1]);
+      if (!url || seen.has(url)) continue;
+      seen.add(url);
+      const snippet = snippets[i] ? stripResearchTags(snippets[i][1]).replace(/\s+/g, " ").trim().slice(0, 300) : "";
+      results.push({
+        url,
+        title: stripResearchTags(anchors[i][2]).replace(/\s+/g, " ").trim().slice(0, 200),
+        snippet,
+      });
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** HTML → bounded readable text (scripts/styles/comments stripped). */
+function researchHtmlToText(html: string): string {
+  return decodeResearchEntities(
+    html
+      .replace(/<!--[\s\S]*?-->/g, " ")
+      .replace(/<(script|style|noscript|svg|head)[\s\S]*?<\/\1>/gi, " ")
+      .replace(/<\/(?:p|div|section|article|li|h[1-6]|tr|blockquote)>/gi, "\n")
+      .replace(/<br\s*\/?>/gi, "\n")
+      .replace(/<[^>]*>/g, " ")
+  )
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n\s*\n\s*\n+/g, "\n\n")
+    .trim();
+}
+
+/** Bing search via its stable RSS output (bot-tolerant fallback engine). */
+async function bingSearch(query: string): Promise<{ url: string; title: string; snippet: string }[]> {
+  const target = `https://www.bing.com/search?q=${encodeURIComponent(query)}&format=rss&count=10`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESEARCH_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(target, {
+      headers: { "User-Agent": RESEARCH_UA, "Accept": "application/rss+xml, application/xml, text/xml" },
+      signal: controller.signal,
+    });
+    if (!resp.ok) return [];
+    const xml = (await resp.text()).slice(0, RESEARCH_MAX_BYTES).replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+
+    const results: { url: string; title: string; snippet: string }[] = [];
+    const seen = new Set<string>();
+    for (const item of xml.matchAll(/<item>([\s\S]*?)<\/item>/g)) {
+      const block = item[1];
+      const tag = (name: string): string => {
+        const m = block.match(new RegExp(`<${name}[^>]*>([\\s\\S]*?)<\\/${name}>`, "i"));
+        return m ? m[1].trim() : "";
+      };
+      const url = decodeResearchEntities(tag("link"));
+      if (!/^https?:\/\//i.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      results.push({
+        url,
+        title: decodeResearchEntities(tag("title")).replace(/\s+/g, " ").slice(0, 200),
+        snippet: stripResearchTags(decodeResearchEntities(tag("description"))).replace(/\s+/g, " ").slice(0, 300),
+      });
+      if (results.length >= 8) break;
+    }
+    return results;
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.post("/api/research/search", async (req, res) => {
+  const query = String(req.body?.query ?? "").trim().slice(0, 300);
+  if (!query) {
+    return res.json({ success: false, error: "Missing search query" });
+  }
+  try {
+    // Engine waterfall: DuckDuckGo (html → lite) then Bing RSS. The public
+    // engines rate-limit by IP, so a fallback keeps research working.
+    const engines: { name: string; run: () => Promise<{ url: string; title: string; snippet: string }[]> }[] = [
+      { name: "duckduckgo-html", run: () => duckDuckGoSearch(query, "html") },
+      { name: "duckduckgo-lite", run: () => duckDuckGoSearch(query, "lite") },
+      { name: "bing", run: () => bingSearch(query) },
+    ];
+    for (const engine of engines) {
+      const results = await engine.run();
+      if (results.length > 0) {
+        return res.json({ success: true, engine: engine.name, results });
+      }
+    }
+    return res.json({ success: false, error: "No search results (search engines unreachable or blocked)" });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
+
+app.post("/api/research/fetch", async (req, res) => {
+  let parsed: URL;
+  try {
+    parsed = assertSafeHttpUrl(String(req.body?.url ?? ""));
+  } catch (err: any) {
+    return res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+  if (isPrivateResearchHost(parsed.hostname)) {
+    return res.json({ success: false, error: "Refusing to fetch private network addresses" });
+  }
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), RESEARCH_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(parsed.toString(), {
+      headers: { "User-Agent": RESEARCH_UA, "Accept": "text/html,text/plain" },
+      signal: controller.signal,
+      redirect: "follow",
+    });
+    const contentType = resp.headers.get("content-type") ?? "";
+    if (!/text\/html|text\/plain|application\/xhtml|application\/json/i.test(contentType)) {
+      return res.json({ success: false, error: `Unsupported content type "${contentType.split(";")[0] || "unknown"}" — only readable pages can be inspected` });
+    }
+    if (!resp.ok) {
+      return res.json({ success: false, error: `Source responded with HTTP ${resp.status}` });
+    }
+    const raw = (await resp.text()).slice(0, RESEARCH_MAX_BYTES);
+    const titleMatch = raw.match(/<title[^>]*>([\s\S]*?)<\/title>/i);
+    const title = titleMatch ? decodeResearchEntities(titleMatch[1]).replace(/\s+/g, " ").trim().slice(0, 200) : "";
+    const isHtml = /text\/html|application\/xhtml/i.test(contentType);
+    const text = (isHtml ? researchHtmlToText(raw) : decodeResearchEntities(raw).replace(/[ \t]+/g, " ")).slice(0, RESEARCH_TEXT_MAX_CHARS);
+    if (text.trim().length < 40) {
+      return res.json({ success: false, error: "Page contained no readable text" });
+    }
+    res.json({ success: true, url: resp.url || parsed.toString(), title, text });
+  } catch (err: any) {
+    const reason = controller.signal.aborted ? "Source fetch timed out" : String(err?.message || err);
+    res.json({ success: false, error: reason.slice(0, 300) });
+  } finally {
+    clearTimeout(timer);
   }
 });
 

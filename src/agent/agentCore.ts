@@ -22,6 +22,7 @@ import { selectToolForCapability } from './toolSelector';
 import { PermissionManager } from './permissions';
 import { evaluateCondition, resolveContextRefs, resolveContextPath, boundContextValue } from './context';
 import { RecoveryManager } from './recovery';
+import type { PlanEngine } from './planning';
 
 export interface AgentCoreOptions {
   registry: ToolRegistry;
@@ -30,6 +31,8 @@ export interface AgentCoreOptions {
   planner?: Planner;
   permissions?: PermissionManager;
   recovery?: RecoveryManager;
+  /** Phase 16: hierarchical planning layer (validation, node lifecycle, bounded replanning). */
+  planning?: PlanEngine;
   stepTimeoutMs?: number;
   maxAttemptsPerStep?: number;
   retryDelayMs?: number;
@@ -45,11 +48,14 @@ export class AgentCore {
   readonly permissions: PermissionManager;
   readonly recovery: RecoveryManager;
   private planner: Planner;
+  private planning?: PlanEngine;
   private stepTimeoutMs: number;
   private maxAttemptsPerStep: number;
   private retryDelayMs: number;
   private maxSteps: number;
   private controllers = new Map<string, AbortController>();
+  /** Cancel mode per task (Phase 19): 'pause' records 'interrupted' (resumable). */
+  private cancelModes = new Map<string, 'cancel' | 'pause'>();
   /** Adaptive observation layer (Phase 13) — optional; honors learned-workflow freshness. */
   private adaptive?: import('./observation/adaptiveObserver').AdaptiveObserver;
 
@@ -64,6 +70,7 @@ export class AgentCore {
       events: this.events,
       permissions: this.permissions,
     });
+    this.planning = options.planning;
     this.stepTimeoutMs = options.stepTimeoutMs ?? 30_000;
     this.maxAttemptsPerStep = options.maxAttemptsPerStep ?? 2;
     this.retryDelayMs = options.retryDelayMs ?? 300;
@@ -77,6 +84,16 @@ export class AgentCore {
 
   /** Submit a user request. Resolves when the task reaches a terminal state. */
   async submit(input: string): Promise<AgentTask> {
+    const { promise } = this.startTask(input);
+    return promise;
+  }
+
+  /**
+   * Phase 19: start a task WITHOUT awaiting its completion — the detached
+   * entry point long-running sessions use. The returned promise still
+   * resolves at the terminal state.
+   */
+  startTask(input: string): { taskId: string; promise: Promise<AgentTask> } {
     const now = Date.now();
     const goal = extractGoal(input);
     const task = this.store.create(goal, now);
@@ -87,43 +104,142 @@ export class AgentCore {
 
     const controller = new AbortController();
     this.controllers.set(task.id, controller);
+    const promise = this.executeTask(task.id, controller);
+    return { taskId: task.id, promise };
+  }
+
+  /**
+   * Phase 19: resume a previously interrupted/paused task from its recorded
+   * plan. Already-completed/skipped steps are NOT re-run; failed steps are
+   * retried (the long-run manager performs safety/idempotency validation
+   * BEFORE calling this — resume is never blind).
+   */
+  async resumeTask(taskId: string): Promise<AgentTask> {
+    const task = this.store.get(taskId);
+    if (!task || !task.plan) {
+      const message = `Cannot resume: task "${taskId}" not found or has no plan`;
+      this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: message, reason: 'resume_invalid' }, timestamp: Date.now() });
+      throw new Error(message);
+    }
+    if (this.controllers.has(taskId)) {
+      const message = `Cannot resume: task "${taskId}" is already running`;
+      this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: message, reason: 'resume_running' }, timestamp: Date.now() });
+      throw new Error(message);
+    }
+    if (task.status === 'cancelled') {
+      const message = `Cannot resume: task "${taskId}" was cancelled (cancellation is terminal)`;
+      this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: message, reason: 'resume_cancelled' }, timestamp: Date.now() });
+      throw new Error(message);
+    }
+
+    // Revalidate the plan through the Phase 16 planning layer — a resumed
+    // task runs under the same plan-validity rules as a fresh one.
+    if (this.planning) {
+      const attached = this.planning.attachPlan(taskId, task.goal.description, task.plan.steps);
+      if (!attached.ok) {
+        this.store.update(taskId, (t) => {
+          t.status = 'failed';
+          t.error = attached.reason;
+          t.completedAt = Date.now();
+          t.summary = this.buildSummary(t);
+        });
+        this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: attached.reason, reason: 'resume_plan_invalid' }, timestamp: Date.now() });
+        throw new Error(`Cannot resume: ${attached.reason}`);
+      }
+    }
+
+    this.recovery.resetTask(taskId);
+    const controller = new AbortController();
+    this.controllers.set(taskId, controller);
+    this.events.emit({ name: 'TASK_RESUMED', taskId, payload: { goal: task.goal }, timestamp: Date.now() });
 
     try {
+      await this.runLoop(this.store.get(taskId)!);
+      return this.store.get(taskId)!;
+    } catch (err: any) {
+      const mode = this.cancelModes.get(taskId) ?? 'cancel';
+      const aborted = controller.signal.aborted;
+      const message = err?.name === 'AbortError' || aborted ? (mode === 'pause' ? 'Task paused' : 'Task cancelled') : String(err?.message || err);
+      this.planning?.cancelTask(taskId);
+      this.planning?.finishTask(taskId, aborted ? 'cancelled' : 'failed');
+      this.store.update(taskId, (t) => {
+        t.status = aborted ? (mode === 'pause' ? 'interrupted' : 'cancelled') : 'failed';
+        t.error = message;
+        if (!(aborted && mode === 'pause')) t.completedAt = Date.now();
+        t.summary = this.buildSummary(t);
+      });
+      this.events.emit({ name: aborted && mode === 'pause' ? 'TASK_PAUSED' : aborted ? 'TASK_CANCELLED' : 'TASK_FAILED', taskId, payload: { error: message }, timestamp: Date.now() });
+      return this.store.get(taskId)!;
+    } finally {
+      this.controllers.delete(taskId);
+      this.cancelModes.delete(taskId);
+    }
+  }
+
+  /** Shared execution body for submit/startTask (single execution loop). */
+  private async executeTask(taskId: string, controller: AbortController): Promise<AgentTask> {
+    try {
+      const task = this.store.get(taskId)!;
       // PLAN
-      const plan = this.planner.makePlan(goal);
+      const plan = this.planner.makePlan(task.goal);
       if (plan.steps.length > this.maxSteps) {
         plan.steps = plan.steps.slice(0, this.maxSteps);
       }
-      this.store.update(task.id, (t) => {
+      this.store.update(taskId, (t) => {
         t.plan = plan;
         t.status = 'running';
       });
-      this.events.emit({ name: 'TASK_PLANNED', taskId: task.id, payload: { steps: plan.steps.map((s) => ({ id: s.id, toolName: s.toolName, description: s.description })) }, timestamp: Date.now() });
+      this.events.emit({ name: 'TASK_PLANNED', taskId, payload: { steps: plan.steps.map((s) => ({ id: s.id, toolName: s.toolName, description: s.description })) }, timestamp: Date.now() });
+
+      // PHASE 16: derive + validate the hierarchical plan. Malformed plans
+      // never execute (spec §8) — the task fails honestly with the reason.
+      if (this.planning) {
+        const attached = this.planning.attachPlan(taskId, plan.goal.description, plan.steps);
+        if (!attached.ok) {
+          this.store.update(taskId, (t) => {
+            t.status = 'failed';
+            t.error = attached.reason;
+            t.completedAt = Date.now();
+            t.summary = this.buildSummary(t);
+          });
+          this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: attached.reason, reason: 'plan_validation_failed' }, timestamp: Date.now() });
+          return this.store.get(taskId)!;
+        }
+      }
 
       // ACTION LOOP
       await this.runLoop(task);
-
-      return this.store.get(task.id)!;
+      return this.store.get(taskId)!;
     } catch (err: any) {
-      const message = err?.name === 'AbortError' || controller.signal.aborted ? 'Task cancelled' : String(err?.message || err);
-      this.store.update(task.id, (t) => {
-        t.status = controller.signal.aborted ? 'cancelled' : 'failed';
+      const aborted = controller.signal.aborted;
+      const message = err?.name === 'AbortError' || aborted ? 'Task cancelled' : String(err?.message || err);
+      this.planning?.cancelTask(taskId);
+      this.planning?.finishTask(taskId, aborted ? 'cancelled' : 'failed');
+      this.store.update(taskId, (t) => {
+        t.status = aborted ? 'cancelled' : 'failed';
         t.error = message;
         t.completedAt = Date.now();
         t.summary = this.buildSummary(t);
       });
-      this.events.emit({ name: controller.signal.aborted ? 'TASK_CANCELLED' : 'TASK_FAILED', taskId: task.id, payload: { error: message }, timestamp: Date.now() });
-      return this.store.get(task.id)!;
+      this.events.emit({ name: aborted ? 'TASK_CANCELLED' : 'TASK_FAILED', taskId, payload: { error: message }, timestamp: Date.now() });
+      return this.store.get(taskId)!;
     } finally {
-      this.controllers.delete(task.id);
+      this.controllers.delete(taskId);
+      this.cancelModes.delete(taskId);
     }
   }
 
-  /** Request cancellation of a running task. */
-  cancel(taskId: string): boolean {
+  /**
+   * Request cancellation of a running task. mode 'pause' (Phase 19) records
+   * the task as 'interrupted' (resumable) instead of terminally cancelled —
+   * the long-run manager translates the event into a PAUSED session.
+   */
+  cancel(taskId: string, mode: 'cancel' | 'pause' = 'cancel'): boolean {
     const controller = this.controllers.get(taskId);
     if (!controller) return false;
+    this.cancelModes.set(taskId, mode);
     controller.abort();
+    this.planning?.cancelTask(taskId);
     return true;
   }
 
@@ -146,10 +262,19 @@ export class AgentCore {
 
     for (let index = 0; index < plan.steps.length; index++) {
       if (signal.aborted) {
-        this.markRemaining(plan, index, 'cancelled');
+        // Phase 19: cancellation mode is read AT cancellation time — a pause
+        // request may arrive long after the loop started. Pause leaves pending
+        // steps 'pending' (resumable) and stores the task as 'interrupted';
+        // cancel marks them terminally 'cancelled'.
+        const cancelMode = this.cancelModes.get(task.id) ?? 'cancel';
+        if (cancelMode !== 'pause') {
+          this.markRemaining(plan, index, 'cancelled');
+        }
+        this.planning?.cancelTask(task.id);
+        this.planning?.finishTask(task.id, 'cancelled');
         this.store.update(task.id, (t) => {
-          t.status = 'cancelled';
-          t.completedAt = Date.now();
+          t.status = cancelMode === 'pause' ? 'interrupted' : 'cancelled';
+          if (cancelMode !== 'pause') t.completedAt = Date.now();
           t.summary = this.buildSummary(t);
         });
         this.events.emit({ name: 'TASK_CANCELLED', taskId: task.id, timestamp: Date.now() });
@@ -157,6 +282,13 @@ export class AgentCore {
       }
 
       const step = plan.steps[index];
+      // Phase 19 (resume): steps that already completed/skipped in a previous
+      // execution are never re-run; 'failed' and 'cancelled' steps ARE
+      // retried on resume (that is the point of resuming — duplicate-action
+      // safety is validated by the long-run manager BEFORE resume).
+      if (step.status === 'completed' || step.status === 'skipped' || step.status === 'uncertain') {
+        continue;
+      }
       this.store.update(task.id, (t) => {
         t.currentStepIndex = index;
       });
@@ -171,6 +303,7 @@ export class AgentCore {
       });
       if (unmetDeps.length > 0) {
         step.status = 'skipped';
+        this.planning?.nodeSkipped(task.id, step.id, `unmet dependencies: ${unmetDeps.join(', ')}`);
         this.events.emit({
           name: 'TASK_STEP_SKIPPED',
           taskId: task.id,
@@ -187,6 +320,7 @@ export class AgentCore {
       const condition = evaluateCondition(step.condition, taskBeforeStep.context ?? {});
       if (!condition.run) {
         step.status = 'skipped';
+        this.planning?.nodeSkipped(task.id, step.id, condition.reason);
         this.events.emit({
           name: 'TASK_STEP_SKIPPED',
           taskId: task.id,
@@ -204,6 +338,8 @@ export class AgentCore {
       if (!validation.safe) {
         step.status = 'failed';
         step.error = `Context reference invalid or missing: ${[...validation.invalidKeys, ...validation.missingKeys].join(', ')}`;
+        this.planning?.nodeFailed(task.id, step.id, step.error, 'invalid_input');
+        this.planning?.finishTask(task.id, 'failed');
         const rec = await this.recovery.handleFailure({
           taskId: task.id,
           step,
@@ -232,6 +368,7 @@ export class AgentCore {
       }
       step.input = resolveContextRefs(step.input, taskContext);
 
+      this.planning?.nodeStarted(task.id, step.id);
       const finishedStep = await this.runStepWithRetry(step, taskNow, signal);
 
       // ---- Context store (Phase 10): bounded output preserved for later steps.
@@ -248,18 +385,37 @@ export class AgentCore {
         }
       }
 
+      // PHASE 16: node outcome — verification-aware completion (spec §11).
+      if (finishedStep.status === 'completed' || finishedStep.status === 'uncertain') {
+        this.planning?.nodeCompleted(
+          task.id,
+          step.id,
+          finishedStep.result,
+          finishedStep.status === 'completed' ? 'completed' : 'uncertain'
+        );
+      }
+
       if (finishedStep.status === 'cancelled') {
-        this.markRemaining(plan, index + 1, 'cancelled');
+        // Phase 19: pause-mode cancellation stores the task as 'interrupted'
+        // (resumable); pending steps stay 'pending' for the validated resume;
+        // the long-run manager translates the event to PAUSED. Mode is read
+        // AT cancellation time (a pause may arrive mid-step).
+        const pauseMode = (this.cancelModes.get(task.id) ?? 'cancel') === 'pause';
+        if (!pauseMode) this.markRemaining(plan, index + 1, 'cancelled');
+        this.planning?.cancelTask(task.id);
+        this.planning?.finishTask(task.id, 'cancelled');
         this.store.update(task.id, (t) => {
-          t.status = 'cancelled';
-          t.completedAt = Date.now();
-          t.summary = this.buildSummary(t);
+          t.status = pauseMode ? 'interrupted' : 'cancelled';
+          if (!pauseMode) t.completedAt = Date.now();
+          t.summary = pauseMode ? `Paused: ${step.description}` : this.buildSummary(t);
         });
         this.events.emit({ name: 'TASK_CANCELLED', taskId: task.id, timestamp: Date.now() });
         return;
       }
 
       if (finishedStep.status !== 'completed' && finishedStep.status !== 'uncertain') {
+        // PHASE 16: record the failure in the plan tree (root-keyed signature).
+        this.planning?.nodeFailed(task.id, step.id, finishedStep.error || 'unknown error', finishedStep.result?.errorKind ?? 'unknown');
         // Invalidate failed step output in context immediately (Phase 11 context safety)
         if (step.outputKey) {
           this.recovery.getContextManager().invalidateOutput(this.store.get(task.id)?.context ?? {}, step.outputKey);
@@ -286,6 +442,7 @@ export class AgentCore {
           if (recovery.alternativeStep) {
             plan.steps.splice(index + 1, 0, recovery.alternativeStep);
             plan.revision += 1;
+            this.planning?.adoptSplicedSteps(task.id, [recovery.alternativeStep]);
             this.events.emit({
               name: 'NOTICE',
               taskId: task.id,
@@ -308,6 +465,12 @@ export class AgentCore {
                 });
                 this.recovery.getContextManager().markValid(key);
               }
+              this.planning?.nodeCompleted(
+                task.id,
+                step.id,
+                retried.result,
+                retried.status === 'completed' ? 'completed' : 'uncertain'
+              );
               continue;
             }
           }
@@ -332,21 +495,51 @@ export class AgentCore {
                 });
                 this.recovery.getContextManager().markValid(key);
               }
+              this.planning?.nodeCompleted(
+                task.id,
+                step.id,
+                retried.result,
+                retried.status === 'completed' ? 'completed' : 'uncertain'
+              );
               continue;
             }
           }
         }
 
-        // Planner alternative hook (legacy fallback)
-        const alternative = this.planner.proposeAlternative(step, finishedStep.error || 'unknown error');
-        if (alternative) {
-          plan.steps.splice(index + 1, 0, alternative);
-          plan.revision += 1;
-          this.events.emit({ name: 'NOTICE', taskId: task.id, payload: { message: `Retrying with alternative strategy: ${alternative.description}` }, timestamp: Date.now() });
-          continue;
+        // PHASE 16: bounded hierarchical replanning — Phase 11 recovery had its
+        // chance; now the planner may insert a corrective subtree (diagnose →
+        // one retry). When planning is wired, this REPLACES the legacy
+        // unbounded fallback so the FAIL→REPLAN loop can never run forever
+        // (spec §7). Budget exhausted → honest stop below.
+        if (this.planning) {
+          const replan = this.planning.proposeReplan(task.id, step.id, finishedStep.error || 'unknown error', finishedStep.result?.errorKind);
+          if (replan.replanned && replan.correctiveSteps && replan.correctiveSteps.length > 0) {
+            plan.steps.splice(index + 1, 0, ...replan.correctiveSteps);
+            this.planning.commitReplan(task.id, step.id, replan.correctiveSteps);
+            this.events.emit({
+              name: 'NOTICE',
+              taskId: task.id,
+              payload: { message: `Replanning: ${replan.reason}` },
+              timestamp: Date.now(),
+            });
+            continue;
+          }
+          // Replan refused (budget/duplicate/permission) → fall through to the
+          // honest failure below. The legacy fallback must NOT run after a
+          // bounded planner has refused — that would defeat the bound.
+        } else {
+          // Planner alternative hook (legacy fallback, only without Phase 16)
+          const alternative = this.planner.proposeAlternative(step, finishedStep.error || 'unknown error');
+          if (alternative) {
+            plan.steps.splice(index + 1, 0, alternative);
+            plan.revision += 1;
+            this.events.emit({ name: 'NOTICE', taskId: task.id, payload: { message: `Retrying with alternative strategy: ${alternative.description}` }, timestamp: Date.now() });
+            continue;
+          }
         }
 
         this.markRemaining(plan, index + 1, 'skipped');
+        this.planning?.finishTask(task.id, 'failed');
         this.store.update(task.id, (t) => {
           t.status = 'failed';
           // Preserve the actual failure (retry attempts overwrite step.error);
@@ -366,6 +559,7 @@ export class AgentCore {
         const ctxNow = this.store.get(task.id)!.context ?? {};
         if (resolveContextPath(ctxNow, plan.evidenceKey) !== undefined) {
           this.markRemaining(plan, index + 1, 'skipped');
+          this.planning?.finishTask(task.id, 'completed');
           this.store.update(task.id, (t) => {
             t.status = 'completed';
             t.completedAt = Date.now();
@@ -382,6 +576,7 @@ export class AgentCore {
       }
     }
 
+    this.planning?.finishTask(task.id, 'completed');
     this.store.update(task.id, (t) => {
       t.status = 'completed';
       t.completedAt = Date.now();

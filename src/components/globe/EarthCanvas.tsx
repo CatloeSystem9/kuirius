@@ -1,7 +1,9 @@
 import React, { useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import * as THREE from 'three';
-import { GlobeCoordinates, GlobeMarker, MapLayerType, GlobeControllerHandle } from './types';
+import { GlobeCoordinates, GlobeMarker, MapLayerType, GlobeControllerHandle, WindInfoReading } from './types';
 import { AVAILABLE_LAYERS, createFallbackProceduralTexture } from './layerManager';
+import { WindService, WindStatusMeta, prepareGrid } from './environment/envService';
+import { WindParticleField } from './environment/windParticles';
 
 interface EarthCanvasProps {
   activeLayer: MapLayerType;
@@ -10,6 +12,8 @@ interface EarthCanvasProps {
   initialLat?: number;
   initialLng?: number;
   selectedMarker?: GlobeMarker | null;
+  windEnabled?: boolean;
+  onWindStatusChange?: (meta: WindStatusMeta) => void;
 }
 
 const GLOBE_RADIUS = 100;
@@ -49,7 +53,7 @@ export function vector3ToLatLng(point: THREE.Vector3, radius: number = GLOBE_RAD
 }
 
 export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
-  ({ activeLayer, onCoordinatesChange, onLocationSelect, initialLat = 20, initialLng = 0, selectedMarker }, ref) => {
+  ({ activeLayer, onCoordinatesChange, onLocationSelect, initialLat = 20, initialLng = 0, selectedMarker, windEnabled = false, onWindStatusChange }, ref) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const sceneRef = useRef<THREE.Scene | null>(null);
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -101,6 +105,14 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
     const raycasterRef = useRef(new THREE.Raycaster());
     const mouseNdcRef = useRef(new THREE.Vector2(-999, -999));
     const currentCoordsRef = useRef<GlobeCoordinates | null>(null);
+
+    // Environmental (wind) layer state
+    const windServiceRef = useRef<WindService | null>(null);
+    const windFieldRef = useRef<WindParticleField | null>(null);
+    const windActiveRef = useRef(false);
+    const lastWindBoundsKeyRef = useRef<string>('');
+    const cameraSettledFramesRef = useRef(0);
+    const lastWindTickRef = useRef(0);
 
     // Imperative Controller Handle exposed to Krisha Agent & Parent UI
     useImperativeHandle(ref, () => ({
@@ -231,6 +243,15 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
           isDirtyRef.current = true;
         }
       },
+
+      getWindReadingAt: async (lat: number, lng: number): Promise<WindInfoReading | null> => {
+        const service = windServiceRef.current;
+        if (!service) return null;
+        const field = windFieldRef.current;
+        return service.getReadingAt(lat, lng, field?.preparedLayer ?? null);
+      },
+
+      isWindDataReady: () => !!windFieldRef.current?.isReady,
     }));
 
     // Texture loader with caching & offline fallback
@@ -475,12 +496,38 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
           idleFrames++;
         }
 
-        // Update Camera Position based on Spherical Coordinates
+        // Update Camera Position based on Spherical Coordinates.
+        // IMPORTANT: this parameterization MUST match latLngToVector3 above
+        // (x = -sin(phi)cos(theta), z = sin(phi)sin(theta)); otherwise the
+        // camera hovers over a different geographic point than the (lat,lng)
+        // it carries (a constant 90-degree longitude offset).
         const s = sphericalRef.current;
-        camera.position.x = s.radius * Math.sin(s.phi) * Math.sin(s.theta);
+        camera.position.x = -s.radius * Math.sin(s.phi) * Math.cos(s.theta);
         camera.position.y = s.radius * Math.cos(s.phi);
-        camera.position.z = s.radius * Math.sin(s.phi) * Math.cos(s.theta);
+        camera.position.z = s.radius * Math.sin(s.phi) * Math.sin(s.theta);
         camera.lookAt(0, 0, 0);
+
+        // Advance the environmental (wind) engine when active. The engine
+        // interpolates between the latest real data points locally; network
+        // refresh happens separately (see requestWindForCurrentView).
+        const windField = windFieldRef.current;
+        if (windField && windActiveRef.current) {
+          windField.setCameraRadius(s.radius);
+          const nowTick = performance.now();
+          const windDt = Math.min(Math.max(nowTick - (lastWindTickRef.current || nowTick), 0.5), 100);
+          lastWindTickRef.current = nowTick;
+          if (windField.update(windDt)) {
+            isDirtyRef.current = true; // flow advanced -> draw next frame
+          }
+          if (!isMoving) {
+            cameraSettledFramesRef.current++;
+            if (cameraSettledFramesRef.current === 30) {
+              requestWindForCurrentView();
+            }
+          } else {
+            cameraSettledFramesRef.current = 0;
+          }
+        }
 
         // Only draw frame when dirty or gently decaying idle frames (saves GPU on laptops!)
         if (isDirtyRef.current || idleFrames < 10) {
@@ -499,6 +546,12 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
         if (renderer.domElement && container.contains(renderer.domElement)) {
           container.removeChild(renderer.domElement);
         }
+        // Release environmental layer animation & network resources.
+        windActiveRef.current = false;
+        windServiceRef.current?.dispose();
+        windFieldRef.current?.dispose();
+        windServiceRef.current = null;
+        windFieldRef.current = null;
         renderer.dispose();
         earthGeo.dispose();
         earthMat.dispose();
@@ -520,6 +573,76 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
         renderMarkerOnGlobe(selectedMarker);
       }
     }, [selectedMarker]);
+
+    // -------------------------------------------------------------------------
+    // Environmental (wind) layer lifecycle
+    // -------------------------------------------------------------------------
+
+    // View span from the horizon angle: closer camera -> smaller bounds.
+    const computeCurrentViewBounds = () => {
+      const s = sphericalRef.current;
+      const lat = Math.max(-85, Math.min(85, 90 - (s.phi * 180) / Math.PI));
+      const lng = Math.max(-180, Math.min(180, (s.theta * 180) / Math.PI - 180));
+      const horizonDeg = (Math.acos(Math.min(1, Math.max(-1, GLOBE_RADIUS / s.radius))) * 180) / Math.PI;
+      const span = Math.max(6, Math.min(170, horizonDeg * 1.7));
+      return {
+        minLat: Math.max(-85, lat - span / 2),
+        maxLat: Math.min(85, lat + span / 2),
+        minLng: lng - span / 2,
+        maxLng: lng + span / 2,
+      };
+    };
+
+    const handleWindStatus = (meta: WindStatusMeta) => {
+      onWindStatusChange?.(meta);
+      if (meta.status === 'live') {
+        const field = windFieldRef.current;
+        const service = windServiceRef.current;
+        const cached = service?.cachedField;
+        if (field && cached) {
+          field.updateField(prepareGrid(cached));
+          field.show();
+        }
+      }
+    };
+
+    const requestWindForCurrentView = (force = false) => {
+      const service = windServiceRef.current;
+      if (!service) return;
+      const bounds = computeCurrentViewBounds();
+      const key = `lat:${bounds.minLat.toFixed(0)}..${bounds.maxLat.toFixed(0)}|lng:${bounds.minLng.toFixed(0)}..${bounds.maxLng.toFixed(0)}`;
+      if (!force) {
+        const cached = service.cachedField;
+        const freshEnough = cached && Date.now() - cached.timestamp < 2 * 60_000;
+        if (freshEnough && lastWindBoundsKeyRef.current === key) return;
+      }
+      lastWindBoundsKeyRef.current = key;
+      // Network calls are throttled/debounced inside WindService.
+      service.requestWindField(bounds, handleWindStatus);
+    };
+
+    // Enable / disable the wind layer (React prop drives the engine).
+    useEffect(() => {
+      const scene = sceneRef.current;
+      if (!scene) return;
+
+      if (windEnabled) {
+        if (!windFieldRef.current) {
+          windFieldRef.current = new WindParticleField(scene);
+        }
+        if (!windServiceRef.current) {
+          windServiceRef.current = new WindService();
+        }
+        windFieldRef.current.setLayerEnabled(true);
+        windActiveRef.current = true;
+        cameraSettledFramesRef.current = 0;
+        requestWindForCurrentView(true);
+      } else if (windFieldRef.current) {
+        windFieldRef.current.setLayerEnabled(false);
+        windActiveRef.current = false;
+        lastWindBoundsKeyRef.current = '';
+      }
+    }, [windEnabled]);
 
     // -------------------------------------------------------------------------
     // Mouse Drag, Wheel Zoom & Cursor Raycasting Handlers

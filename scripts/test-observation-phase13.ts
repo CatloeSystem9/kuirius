@@ -1,5 +1,5 @@
-/**
- * Phase 13 verification suite — Adaptive Screen Observation.
+﻿/**
+ * Phase 13 verification suite â€” Adaptive Screen Observation.
  * Usage: npx tsx scripts/test-observation-phase13.ts
  * Exits non-zero on any failure.
  */
@@ -37,7 +37,7 @@ function assert(condition: boolean, label: string) {
   } else {
     failed++;
     failures.push(label);
-    console.error(`  ✗ ${label}`);
+    console.error(`  âœ— ${label}`);
   }
 }
 function assertEqual<T>(actual: T, expected: T, label: string) {
@@ -77,13 +77,13 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   };
   assertEqual(resolvePolicy({ ...base, taskActive: false }).mode, 'idle', 'idle mode when no task');
   assertEqual(resolvePolicy(base).mode, 'active_task', 'active_task by default');
-  assertEqual(resolvePolicy({ ...base, verificationStatus: 'inconclusive' }).mode, 'uncertain', 'uncertain → observe sooner');
-  assertEqual(resolvePolicy({ ...base, changeStreak: 3 }).mode, 'rapid_change', 'rapid change streak → tighter loop');
-  assertEqual(resolvePolicy({ ...base, justActed: true }).mode, 'after_action', 'just acted → after_action');
-  assertEqual(resolvePolicy({ ...base, quietStreak: 3 }).mode, 'settled', 'stable UI → settled');
+  assertEqual(resolvePolicy({ ...base, verificationStatus: 'inconclusive' }).mode, 'uncertain', 'uncertain â†’ observe sooner');
+  assertEqual(resolvePolicy({ ...base, changeStreak: 3 }).mode, 'rapid_change', 'rapid change streak â†’ tighter loop');
+  assertEqual(resolvePolicy({ ...base, justActed: true }).mode, 'after_action', 'just acted â†’ after_action');
+  assertEqual(resolvePolicy({ ...base, quietStreak: 3 }).mode, 'settled', 'stable UI â†’ settled');
   assertEqual(MODE_MAX_AGE_MS.rapid_change < MODE_MAX_AGE_MS.active_task, true, 'rapid change window tighter than active task');
   assertEqual(MODE_MAX_AGE_MS.settled > MODE_MAX_AGE_MS.active_task, true, 'settled window looser than active task');
-  // Determinism: same context → same policy
+  // Determinism: same context â†’ same policy
   const a = resolvePolicy(base);
   const b = resolvePolicy(base);
   assertEqual(a, b, 'policy is deterministic');
@@ -91,7 +91,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 
 // ---------------------------------------------------------- decision engine
 {
-  console.log('Decision engine — deterministic rules');
+  console.log('Decision engine â€” deterministic rules');
   const clock = makeClock();
   const policy = resolvePolicy({
     taskActive: true, changeStreak: 0, quietStreak: 0, verificationStatus: 'none', lastActionKind: 'none', justActed: false,
@@ -111,47 +111,47 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
     ...over,
   });
 
-  assertEqual(decide(mk({})).action, 'OBSERVE_NOW', 'no prior observation → observe');
+  assertEqual(decide(mk({})).action, 'OBSERVE_NOW', 'no prior observation â†’ observe');
   assertEqual(
     decide(mk({ workflow: { reused: true, requireFresh: true }, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'OBSERVE_NOW',
-    'learned workflow requireFresh → observe even when cache fresh'
+    'learned workflow requireFresh â†’ observe even when cache fresh'
   );
   assertEqual(
     decide(mk({ recovery: { active: true }, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'OBSERVE_NOW',
-    'recovery → re-observe'
+    'recovery â†’ re-observe'
   );
   assertEqual(
     decide(mk({ verification: { status: 'failed' }, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'OBSERVE_NOW',
-    'failed verification → re-observe'
+    'failed verification â†’ re-observe'
   );
   assertEqual(
     decide(mk({ lastObservation: { stateId: 's1', timestamp: clock.now() - 100 } })).action,
     'REUSE_VALID_STATE',
-    'fresh cache, no change info → reuse'
+    'fresh cache, no change info â†’ reuse'
   );
   clock.advance(MODE_MAX_AGE_MS.active_task + 1);
   assertEqual(
     decide(mk({ lastObservation: { stateId: 's1', timestamp: clock.now() - MODE_MAX_AGE_MS.active_task - 1 } })).action,
     'OBSERVE_NOW',
-    'stale cache → observe'
+    'stale cache â†’ observe'
   );
   assertEqual(
     decide(mk({ changedFraction: 0.5, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'OBSERVE_REGION',
-    'major change with fresh cache → focused region re-observation'
+    'major change with fresh cache â†’ focused region re-observation'
   );
   assertEqual(
     decide(mk({ changedFraction: 0.0, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'REUSE_VALID_STATE',
-    'no change → reuse'
+    'no change â†’ reuse'
   );
   assertEqual(
     decide(mk({ changedFraction: 0.005, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'DELAY_OBSERVATION',
-    'minor change → delay'
+    'minor change â†’ delay'
   );
   assertEqual(
     decide(mk({ task: { active: true, stepToolName: 'files.scan' }, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
@@ -161,30 +161,30 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   assertEqual(
     decide(mk({ trigger: 'after_mouse_action', lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'OBSERVE_AFTER_ACTION',
-    'post-action with fresh cache → observe after action'
+    'post-action with fresh cache â†’ observe after action'
   );
   assertEqual(
     decide(mk({ task: { active: false }, lastObservation: { stateId: 's1', timestamp: clock.now() } })).action,
     'STOP_OBSERVATION',
-    'idle → stop observation'
+    'idle â†’ stop observation'
   );
   assertEqual(
     decide(mk({ budget: { allowed: false, reason: 'task_limit', used: 24, remaining: 0, windowUsed: 0, consecutive: 0, unchangedStreak: 0, retries: 0 } })).action,
     'STOP_OBSERVATION',
-    'exhausted budget → stop (never loops)'
+    'exhausted budget â†’ stop (never loops)'
   );
   // Determinism
   const input = mk({ lastObservation: { stateId: 's1', timestamp: 123 } });
-  assertEqual(decide(input), decide(input), 'same input → identical decision');
+  assertEqual(decide(input), decide(input), 'same input â†’ identical decision');
   // Region suggestion
-  assertEqual(suggestRegion(mk({ trigger: 'browser_navigation' })), 'browser_content' as ObservationRegion, 'browser navigation → browser_content region');
-  assertEqual(suggestRegion(mk({ verification: { status: 'failed' } })), 'verification_region' as ObservationRegion, 'failed verification → verification_region');
+  assertEqual(suggestRegion(mk({ trigger: 'browser_navigation' })), 'browser_content' as ObservationRegion, 'browser navigation â†’ browser_content region');
+  assertEqual(suggestRegion(mk({ verification: { status: 'failed' } })), 'verification_region' as ObservationRegion, 'failed verification â†’ verification_region');
   // Change classification
-  assertEqual(classifyChange(0), 'none', '0 fraction → none');
-  assertEqual(classifyChange(0.01), 'minor', 'small fraction → minor');
-  assertEqual(classifyChange(0.1), 'relevant', 'medium fraction → relevant');
-  assertEqual(classifyChange(0.9), 'major', 'large fraction → major');
-  assertEqual(classifyChange(undefined), 'unknown', 'missing fraction → unknown');
+  assertEqual(classifyChange(0), 'none', '0 fraction â†’ none');
+  assertEqual(classifyChange(0.01), 'minor', 'small fraction â†’ minor');
+  assertEqual(classifyChange(0.1), 'relevant', 'medium fraction â†’ relevant');
+  assertEqual(classifyChange(0.9), 'major', 'large fraction â†’ major');
+  assertEqual(classifyChange(undefined), 'unknown', 'missing fraction â†’ unknown');
 }
 
 // ------------------------------------------------------------- region crop
@@ -208,7 +208,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 
 // ------------------------------------------------------ adaptive observer core
 {
-  console.log('AdaptiveObserver — active task / reuse / stale');
+  console.log('AdaptiveObserver â€” active task / reuse / stale');
   const clock = makeClock();
   const { captureSource, screenObserver, adaptive } = makeObserver([solidFrame()], clock);
   adaptive.beginTask('task-1');
@@ -219,22 +219,22 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   const capturesAfterFirst = captureSource.captures;
 
   const r2 = await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL', taskId: 'task-1' });
-  assertEqual(r2.status, 'reused', 'unchanged fresh screen → reuse');
+  assertEqual(r2.status, 'reused', 'unchanged fresh screen â†’ reuse');
   assertEqual(r2.reusedFromCache, true, 'reused flag set');
   assertEqual(captureSource.captures, capturesAfterFirst, 'no new capture on reuse');
 
-  clock.advance(MODE_MAX_AGE_MS.active_task + 10);
+  clock.advance(MODE_MAX_AGE_MS.active_task + 250);
   const r3 = await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL', taskId: 'task-1' });
-  assertEqual(r3.status, 'observed', 'stale state → fresh capture');
+  assertEqual(r3.status, 'observed', 'stale state â†’ fresh capture');
   assert(captureSource.captures > capturesAfterFirst, 'stale state triggered a real capture');
 }
 
 {
-  console.log('AdaptiveObserver — idle behavior');
+  console.log('AdaptiveObserver â€” idle behavior');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   const r = await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL' });
-  assertEqual(r.status, 'stopped', 'no active task → no observation');
+  assertEqual(r.status, 'stopped', 'no active task â†’ no observation');
   assertEqual(captureSource.captures, 0, 'idle produced zero captures');
 
   // Idle stays quiet over time (no polling loop).
@@ -243,7 +243,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 }
 
 {
-  console.log('AdaptiveObserver — post-action observation');
+  console.log('AdaptiveObserver â€” post-action observation');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   adaptive.beginTask('task-2');
@@ -254,20 +254,20 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   assertEqual(after.status, 'reused', 'fresh post-action state reused (cheap)');
   assertEqual(captureSource.captures, captures, 'no capture when state is fresh');
 
-  clock.advance(MODE_MAX_AGE_MS.active_task + 50);
+  clock.advance(MODE_MAX_AGE_MS.active_task + 250);
   const after2 = await adaptive.observe({ trigger: 'after_mouse_action', priority: 'HIGH', taskId: 'task-2' });
-  assertEqual(after2.status, 'observed', 'stale post-action state → fresh capture');
+  assertEqual(after2.status, 'observed', 'stale post-action state â†’ fresh capture');
 }
 
 {
-  console.log('AdaptiveObserver — change awareness');
+  console.log('AdaptiveObserver â€” change awareness');
   const clock = makeClock();
   const frames = [solidFrame(192, 108, 40), splitFrame(192, 108, 30, 200)];
   const { captureSource, screenObserver, adaptive } = makeObserver(frames, clock);
   adaptive.beginTask('task-3');
   await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL', taskId: 'task-3' });
 
-  // Simulate consecutive meaningful changes → rapid_change policy
+  // Simulate consecutive meaningful changes â†’ rapid_change policy
   adaptive.notifyChange('relevant');
   adaptive.notifyChange('relevant');
   adaptive.notifyChange('relevant');
@@ -275,13 +275,13 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   assertEqual(diag.mode, 'rapid_change', 'change streak escalates to rapid_change mode');
 
   const r = await adaptive.observe({ trigger: 'screen_change', priority: 'NORMAL', taskId: 'task-3' });
-  assertEqual(r.status, 'observed', 'meaningful change → fresh capture');
+  assertEqual(r.status, 'observed', 'meaningful change â†’ fresh capture');
   assert(captureSource.captures >= 2, 'capture really happened after change');
   void screenObserver;
 }
 
 {
-  console.log('AdaptiveObserver — event-driven triggers');
+  console.log('AdaptiveObserver â€” event-driven triggers');
   const clock = makeClock();
   const bus = new AgentEventBus();
   const { captureSource, screenObserver, adaptive } = makeObserver([solidFrame()], clock);
@@ -296,7 +296,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   bus.emit({ name: 'MOUSE_CLICK_COMPLETED', payload: {}, timestamp: Date.now() });
   const r = await adaptive.observe({ trigger: 'explicit_request', priority: 'NORMAL', taskId: 'task-4' });
   assertEqual(r.decision.action, 'OBSERVE_NOW', 'pending post-action trigger forces observation');
-  assertEqual(r.decision.region, 'target_control', 'mouse action → target_control region');
+  assertEqual(r.decision.region, 'target_control', 'mouse action â†’ target_control region');
   assert(captureSource.captures >= 1, 'trigger-driven capture happened');
 
   // Task completion stops observation and purges visual data (privacy).
@@ -314,7 +314,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 }
 
 {
-  console.log('AdaptiveObserver — budgets');
+  console.log('AdaptiveObserver â€” budgets');
   const clock = makeClock();
   const { captureSource, screenObserver, adaptive } = makeObserver([solidFrame()], clock);
   const bounded = new AdaptiveObserver({
@@ -326,12 +326,12 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   await bounded.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'b-task', requireFresh: true });
   await bounded.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'b-task', requireFresh: true });
   const exhausted = await bounded.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'b-task', requireFresh: true });
-  assertEqual(exhausted.status, 'stopped', 'task budget exhausted → structured stop');
+  assertEqual(exhausted.status, 'stopped', 'task budget exhausted â†’ structured stop');
   assert(exhausted.decision.reason.includes('budget'), 'budget reason surfaced for telemetry');
   assertEqual(captureSource.captures, 2, 'budget prevented further captures');
   assertEqual(bounded.budgetStatus().allowed, false, 'budget status reports not-allowed');
 
-  // Window rate limiting → short DELAY with retryAfterMs
+  // Window rate limiting â†’ short DELAY with retryAfterMs
   const rate = new AdaptiveObserver({
     screenObserver: new ScreenObserver({ captureSource: new FakeCaptureSource([solidFrame()]) }),
     now: clock.now,
@@ -342,7 +342,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   await rate.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'r-task', requireFresh: true });
   clock.advance(300);
   const delayed = await rate.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'r-task', requireFresh: true });
-  assertEqual(delayed.status, 'delayed', 'window limit → bounded delay (reduce frequency, no loop)');
+  assertEqual(delayed.status, 'delayed', 'window limit â†’ bounded delay (reduce frequency, no loop)');
   assert((delayed.decision.delayMs ?? 0) > 0, 'delay carries retryAfterMs');
 
   // Tracker unit behavior
@@ -356,7 +356,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 }
 
 {
-  console.log('AdaptiveObserver — recovery + verification integration');
+  console.log('AdaptiveObserver â€” recovery + verification integration');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   adaptive.beginTask('task-6');
@@ -372,11 +372,11 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 
   adaptive.notifyVerification('failed');
   const r3 = await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL', taskId: 'task-6' });
-  assertEqual(r3.status, 'observed', 'failed verification → re-observe');
+  assertEqual(r3.status, 'observed', 'failed verification â†’ re-observe');
 }
 
 {
-  console.log('AdaptiveObserver — cancellation, timeout, permission failure');
+  console.log('AdaptiveObserver â€” cancellation, timeout, permission failure');
   const clock = makeClock();
 
   // Cancellation
@@ -388,7 +388,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
     { trigger: 'explicit_request', priority: 'HIGH', taskId: 'task-7', requireFresh: true },
     controller.signal
   );
-  assertEqual(cancelled.status, 'cancelled', 'pre-aborted signal → structured cancellation');
+  assertEqual(cancelled.status, 'cancelled', 'pre-aborted signal â†’ structured cancellation');
 
   // Timeout with bounded retries (no infinite loop)
   const hanging = new HangingCaptureSource();
@@ -396,7 +396,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   const hangingAdaptive = new AdaptiveObserver({ screenObserver: hangingScreen, now: clock.now });
   hangingAdaptive.beginTask('task-8');
   const failed = await hangingAdaptive.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'task-8', requireFresh: true, timeoutMs: 40 });
-  assertEqual(failed.status, 'failed', 'hanging capture → structured failure');
+  assertEqual(failed.status, 'failed', 'hanging capture â†’ structured failure');
   assertEqual(failed.error?.kind, 'timeout', 'timeout failure kind surfaced');
   assertEqual(hangingAdaptive.budgetStatus().allowed, true, 'retry budget still allows later observations');
 
@@ -405,26 +405,26 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   const deniedEnv = makeObserver([solidFrame()], clock, permissions);
   deniedEnv.adaptive.beginTask('task-9');
   const denied = await deniedEnv.adaptive.observe({ trigger: 'explicit_request', priority: 'HIGH', taskId: 'task-9', requireFresh: true });
-  assertEqual(denied.status, 'failed', 'permission denied → structured failure');
+  assertEqual(denied.status, 'failed', 'permission denied â†’ structured failure');
   assertEqual(denied.error?.kind, 'permission_denied', 'permission failure kind surfaced');
 }
 
 {
-  console.log('AdaptiveObserver — learned workflow integration');
+  console.log('AdaptiveObserver â€” learned workflow integration');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   adaptive.beginTask('task-10');
   await adaptive.observe({ trigger: 'task_step', priority: 'NORMAL', taskId: 'task-10' });
   const captures = captureSource.captures;
 
-  // Reused workflow requires fresh state → capture even though cache is fresh.
+  // Reused workflow requires fresh state â†’ capture even though cache is fresh.
   const r = await adaptive.observe({ trigger: 'learned_workflow_requirement', priority: 'HIGH', taskId: 'task-10', requireFresh: true });
   assertEqual(r.status, 'observed', 'workflow freshness requirement honored');
   assert(captureSource.captures > captures, 'fresh capture performed for workflow step');
 }
 
 {
-  console.log('Agent Core integration — workflow requireFresh step');
+  console.log('Agent Core integration â€” workflow requireFresh step');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   const bus = new AgentEventBus();
@@ -480,7 +480,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 }
 
 {
-  console.log('Computer-Use integration — adaptive OBSERVE step');
+  console.log('Computer-Use integration â€” adaptive OBSERVE step');
   const clock = makeClock();
   const frames = [solidFrame(), solidFrame(), solidFrame(), solidFrame(), solidFrame(), solidFrame()];
   const captureSource = new FakeCaptureSource(frames);
@@ -504,7 +504,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
 }
 
 {
-  console.log('Browser integration — observation only when useful');
+  console.log('Browser integration â€” observation only when useful');
   const clock = makeClock();
   const { captureSource, adaptive } = makeObserver([solidFrame()], clock);
   adaptive.beginTask('browser-task');
@@ -545,7 +545,7 @@ function makeObserver(frames = [solidFrame()], clock = makeClock(), permissions?
   assertEqual(observationRequests, 1, 'exactly one observation request after navigation');
   assert(captureSource.captures >= 1, 'navigation triggered a screen observation');
 
-  // Browser-native state sufficient → NO additional observation requested by state reads.
+  // Browser-native state sufficient â†’ NO additional observation requested by state reads.
   const before = observationRequests;
   await browserAgent.getState();
   await browserAgent.getState();

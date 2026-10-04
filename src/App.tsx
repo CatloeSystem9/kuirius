@@ -45,6 +45,7 @@ import {
   buildMapsActionFromLocation,
 } from './utils/locationService';
 import { wakeWordManager, WakeWordResult, WakeWordStatus } from './utils/wakeWordListener';
+import { OPEN_METEO_WIND_QUERY } from './components/globe/environment/envService';
 import {
   parseFileCommand,
   searchLocalFiles,
@@ -54,7 +55,7 @@ import {
   LocalIndexedFile,
 } from './utils/fileSystemAccess';
 import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
-import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, type AgentSystem } from './agent/bridge';
+import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, type AgentSystem } from './agent/bridge';
 import { getMemoryService } from './agent/memory/memoryService';
 import { attachMemoryToSystem } from './agent/memory/memoryBridge';
 import { SidebarNav } from './components/SidebarNav';
@@ -631,11 +632,11 @@ export default function App() {
   const handleSendMessage = async (text: string, forceMapsGrounding?: boolean) => {
     if (!text.trim() || isLoading) return;
 
-    // ---- Agent Core delegation (Phase 1 / 4 / 5 / 6) ----
-    // Multi-step, screen-observation, mouse-control, and keyboard-control
-    // requests run through the agent loop. Other messages keep the original
-    // inline chat flow below.
-    if (agentSystemRef.current && (isMultiStepRequest(text) || isScreenIntent(text) || isMouseIntent(text) || isKeyboardIntent(text) || isSystemIntent(text))) {
+    // ---- Agent Core delegation (Phase 1 / 4 / 5 / 6 / 9 + Deep Research capability) ----
+    // Multi-step, screen-observation, mouse-control, keyboard-control,
+    // filesystem/application, and deep-research requests run through the agent
+    // loop. Other messages keep the original inline chat flow below.
+    if (agentSystemRef.current && (isMultiStepRequest(text) || isScreenIntent(text) || isMouseIntent(text) || isKeyboardIntent(text) || isSystemIntent(text) || isResearchIntent(text))) {
       await runAgentDelegated(text);
       return;
     }
@@ -878,13 +879,39 @@ export default function App() {
 
     // Check for 3D Earth / Globe interaction commands
     let detectedGlobeAction: GlobeAction | null = null;
+    const isWindIntent = /\b(wind|wind\s+currents?|currents?)\b/i.test(text);
     const isGlobeIntent =
+      isWindIntent ||
       /\b(globe|3d\s+earth|earth\s+view|satellite\s+view|explore\s+earth|google\s+earth|googleearth|earth\.google|open\s+earth)\b/i.test(text) ||
       /\b(?:take\s+me\s+to|fly\s+to|show)\s+[a-zA-Z\s]+?\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth|google\s+earth)\b/i.test(text) ||
       (detectedWebAction?.siteName === 'Google Earth');
 
     if (isGlobeIntent) {
-      if (/\b(return|reset|back\s+to\s+earth|full\s+earth)\b/i.test(text)) {
+      if (isWindIntent && /\b(turn\s+off|stop|hide|remove|disable|close)\b[^.]*\b(wind|currents)\b|\b(wind|currents)\b[^.]*\b(off|away)\b/i.test(text)) {
+        // e.g. "turn off the wind", "hide wind currents", "turn the wind off"
+        detectedGlobeAction = { type: 'wind_off' };
+      } else if (isWindIntent) {
+        // e.g. "show the wind", "show wind currents", "show wind around Mumbai", "show wind around India"
+        const windPlaceMatch = text.match(
+          /\b(?:around|near|at|over|in)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe)|$)/i
+        );
+        const windPlace = windPlaceMatch ? windPlaceMatch[1].trim() : undefined;
+        if (windPlace && !['here', 'me', 'us', 'it', 'the globe', 'globe', 'earth', 'the earth'].includes(windPlace.toLowerCase())) {
+          try {
+            const geocoded = await geocodeAddress(windPlace);
+            detectedGlobeAction = {
+              type: 'wind_on',
+              locationName: windPlace,
+              lat: geocoded?.lat,
+              lng: geocoded?.lng,
+            };
+          } catch {
+            detectedGlobeAction = { type: 'wind_on', locationName: windPlace };
+          }
+        } else {
+          detectedGlobeAction = { type: 'wind_on' };
+        }
+      } else if (/\b(return|reset|back\s+to\s+earth|full\s+earth)\b/i.test(text)) {
         detectedGlobeAction = { type: 'reset_view' };
       } else if (/\b(satellite)\b/i.test(text)) {
         detectedGlobeAction = { type: 'set_layer', layer: 'satellite' };
@@ -981,6 +1008,101 @@ export default function App() {
     setConversations(updatedConversations);
     saveStoredConversations(updatedConversations);
     setIsLoading(true);
+
+    // -------------------------------------------------------------------
+    // Wind information queries (Phase 2): answer "wind speed ..." style
+    // questions with real Open-Meteo data. Never estimates; honestly
+    // reports unavailability. Action commands ("show the wind") continue
+    // to the globe flow below and are excluded from this gate.
+    // -------------------------------------------------------------------
+    const isWindInfoQuery =
+      /\bwind\b/i.test(text) &&
+      /\b(?:what(?:'s| is)|how\s+(?:strong|fast)|wind\s+(?:speed|direction)|current\s+wind|check\s+wind)\b/i.test(text) &&
+      !/\b(show|turn\s+on|open|display|start|hide|turn\s+off|stop|remove|enable|disable)\b/i.test(text);
+
+    if (isWindInfoQuery) {
+      const windPlaceMatch = text.match(/\b(?:in|at|near|over|around)\s+([a-zA-Z\s]+?)(?:\?|$)/i);
+      const windPlace = windPlaceMatch ? windPlaceMatch[1].trim() : undefined;
+      let targetLat: number | undefined;
+      let targetLng: number | undefined;
+      let targetName = windPlace;
+      let locationResolved = true;
+
+      if (targetName) {
+        try {
+          const geocoded = await geocodeAddress(targetName);
+          if (geocoded) {
+            targetLat = geocoded.lat;
+            targetLng = geocoded.lng;
+          } else {
+            locationResolved = false;
+          }
+        } catch {
+          locationResolved = false;
+        }
+      } else if (currentActiveLocation) {
+        targetLat = currentActiveLocation.lat;
+        targetLng = currentActiveLocation.lng;
+        targetName = currentActiveLocation.city || 'your location';
+      } else {
+        locationResolved = false;
+      }
+
+      let windReply: string;
+      if (!locationResolved) {
+        windReply =
+          "I couldn't resolve that location for a wind reading. You can also click a spot on the Krisha Earth globe to inspect real wind there.";
+      } else {
+        try {
+          const reading = await OPEN_METEO_WIND_QUERY.fetchPoint(targetLat!, targetLng!);
+          windReply = `The current wind at ${targetName} is ${reading.speedKmh} km/h, coming from the ${reading.cardinal} (${reading.directionDeg}°). Source: Open-Meteo.`;
+        } catch (err: any) {
+          console.warn('Krisha wind info lookup failed:', err?.message || err);
+          windReply =
+            "I couldn't fetch live wind data right now — the weather feed may be unreachable. The Krisha Earth globe itself keeps working.";
+        }
+      }
+
+      const windEmotion = analyzeSentimentAndKeywords(windReply);
+      const windBotMsg: Message = {
+        id: 'msg_' + (Date.now() + 1),
+        role: 'model',
+        content: windReply,
+        timestamp: Date.now(),
+        expression: windEmotion.expression,
+        emotionData: windEmotion,
+      };
+
+      const windFinalMessages = [...targetConvo.messages, windBotMsg];
+      const windFinalConvo = { ...targetConvo, updatedAt: Date.now(), messages: windFinalMessages };
+      const windFinalConversations = updatedConversations.map((c) =>
+        c.id === windFinalConvo.id ? windFinalConvo : c
+      );
+      setConversations(windFinalConversations);
+      saveStoredConversations(windFinalConversations);
+      setExpression(windEmotion.expression);
+      setEmotionData(windEmotion);
+      setLastSpokenText(windReply);
+      setIsLoading(false);
+
+      if (settings.voiceEnabled) {
+        speakKrishaText(
+          windReply,
+          settings.voiceName || 'Aoede',
+          settings.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false),
+          undefined,
+          settings.languagePreference || 'auto',
+          settings.voicePitch ?? 1.25
+        );
+      } else {
+        setIsSpeaking(true);
+        const talkDuration = Math.min(6500, Math.max(2200, windReply.length * 45));
+        setTimeout(() => setIsSpeaking(false), talkDuration);
+      }
+      return;
+    }
 
     // Krisha transitions into attentive listening mode with user context
     setExpression(userEmotion.sentiment === 'teasing' ? 'playful_smirk' : 'listening_attentive');

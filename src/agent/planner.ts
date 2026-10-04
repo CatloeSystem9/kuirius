@@ -438,6 +438,51 @@ export function isKeyboardIntent(text: string): boolean {
   return classifyKeyboardIntent(text) !== null;
 }
 
+/**
+ * Research intent classification (Deep Research capability — outside the
+ * numbered roadmap). Conservative:
+ * explicit research verbs only, so ordinary chat is never hijacked. "Compare"
+ * additionally requires an explicit comparative structure (X and/vs Y).
+ * File-like targets stay on the filesystem detectors.
+ */
+const FILE_TARGET_RE = /\.(?:pdf|docx?|xlsx?|pptx?|txt|csv|jpe?g|png|gif|zip|rar|mp3|mp4|exe|md)\b/i;
+
+export function classifyResearchIntent(clause: string): StepClassification | null {
+  const text = clause.trim();
+  if (!text || text.length < 10) return null;
+  if (FILE_TARGET_RE.test(text)) return null;
+
+  const researchVerb =
+    /^(?:research|investigate|dig\s+into|look\s+into|find\s+out|do\s+(?:some\s+)?research|gather\s+(?:some\s+)?(?:info|information)|study\s+up\s+on|compare)\b/i;
+  if (!researchVerb.test(text)) return null;
+
+  if (/^(?:compare)\b/i.test(text) && !/\b(?:vs\.?|versus|and|with)\b/i.test(text)) return null;
+
+  return {
+    toolName: 'research.run',
+    capability: 'research.run',
+    description: `Research: ${text.length > 80 ? `${text.slice(0, 77)}...` : text}`,
+    input: { goal: text },
+  };
+}
+
+export function isResearchIntent(text: string): boolean {
+  return classifyResearchIntent(text) !== null;
+}
+
+/**
+ * True when a request should run as ONE deep-research task: the first clause
+ * carries an explicit research phrase and the remaining clauses are only
+ * reporting ("...and tell me what you find"). Mixed requests fall through to
+ * per-clause planning, where the research clause still becomes research.run.
+ */
+export function isResearchRequest(text: string): boolean {
+  const clauses = splitIntoClauses(text);
+  if (clauses.length === 0) return false;
+  if (!classifyResearchIntent(clauses[0])) return false;
+  return clauses.slice(1).every((clause) => REPORT_CLAUSE_RE.test(clause));
+}
+
 /** Classify one clause into an intent (capability) + fallback tool name using the existing detectors. */
 export function classifyStep(clause: string): StepClassification | null {
   const text = clause.trim();
@@ -485,6 +530,11 @@ export function classifyStep(clause: string): StepClassification | null {
   // 3.6 Keyboard-control intents.
   const keyboardIntent = classifyKeyboardIntent(text);
   if (keyboardIntent) return keyboardIntent;
+
+  // 3.7 Deep-research intents (additional Deep Research capability) — explicit
+  // verbs, file targets stay on the filesystem detectors below.
+  const researchIntent = classifyResearchIntent(text);
+  if (researchIntent) return researchIntent;
 
   // 4. Files (before web: "find resume.pdf" must not become a Google search).
   const fileCmd = parseFileCommand(text);
@@ -648,6 +698,34 @@ export class HeuristicPlanner implements Planner {
       pushReportStep('2');
       pushOverflowNote('3');
       return { goal, steps, createdAt: now, revision: 1 };
+    }
+
+    // Deep-research requests (additional Deep Research capability) run as ONE
+    // bounded research loop that
+    // plans sub-questions, searches across rounds, cross-checks sources and
+    // synthesizes a cited report through the registered research tools. The
+    // research GOAL is the first (research-phrased) clause — trailing report
+    // clauses are not part of what should be researched.
+    if (isResearchRequest(goal.rawInput)) {
+      const researchClause = splitIntoClauses(goal.rawInput)[0] ?? goal.rawInput;
+      steps.push({
+        id: `step_${now}_1`,
+        description: `Research: ${goal.description.slice(0, 80)}`,
+        toolName: 'research.run',
+        capability: 'research.run',
+        input: { goal: researchClause },
+        status: 'pending',
+        attempts: 0,
+      });
+      pushReportStep('2');
+      pushOverflowNote('3');
+      return {
+        goal,
+        steps,
+        createdAt: now,
+        revision: 1,
+        objective: goal.description,
+      };
     }
 
     if (overflow) {

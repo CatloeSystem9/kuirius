@@ -829,4 +829,810 @@ skipped when aborted, and time out to the local result.
   than open-world consistency; evidence older than its registry TTL is
   ignored, which can leave questions unanswered by design.
 
+## 21. Proactive intelligence (Phase 15)
 
+New module `src/agent/proactive/` — an event-driven layer that notices
+useful opportunities or important changes and decides whether proactive
+assistance is appropriate. The pipeline is strictly
+EVENT → SIGNAL → CONTEXT → DECIDE → SAFETY CHECK → OPTIONAL ACTION →
+VERIFY → MEMORY. Krix never continuously watches the user: everything is
+triggered by Event Bus events, with bounded one-shot delayed checks only
+for the unfinished-task follow-up.
+
+**Module layout**:
+- `proactiveTypes.ts` — `ProactiveSignal` (type, dedupKey, timestamp,
+  expiry, confidence/importance/urgency, ≤4 bounded redacted evidence
+  items, taskId), `ProactiveOpportunity` (id, type, trigger, context,
+  scores, `expectedBenefit`, `intrusiveness`, `risk`, `expiresAt`,
+  `requiredPermissions`, optional `ProactiveSuggestedAction`, evidence,
+  status), opportunity statuses (DETECTED/CONSIDERING/SUPPRESSED/
+  PRESENTED/ACCEPTED/REJECTED/EXPIRED/EXECUTED/VERIFIED/FAILED),
+  `ProactiveActionLevel` (0 silent … 4 never-automatic), `ActivityState`
+  (IDLE/FOCUSED/ACTIVE/BUSY/UNCERTAIN), `InterruptionBudgetConfig` +
+  `DEFAULT_BUDGET`, `ProactiveSuggestion`.
+- `proactiveSignals.ts` — `ProactiveSignalDetector.ingest(event)`: turns
+  bus events (TASK_COMPLETED/FAILED/CANCELLED, USER_CORRECTION,
+  WORKFLOW_LEARNED, BROWSER_NAVIGATED, SCREEN_CHANGED, APP_*,
+  TOOL_VERIFIED, USER_MESSAGE inactivity) into structured signals.
+  Deduplication by `dedupKey` with refresh-within-window semantics (the
+  same entity never accumulates duplicate signals), a bounded
+  `occurrences` counter so repeated same-entity patterns (e.g. the same
+  correction twice) stay detectable, and TTL expiry. `ingestSignal()`
+  accepts external structured signals (deadlines, other phases) after
+  sanitization (clamped scores, capped TTL, bounded quotes).
+- `proactivePolicy.ts` — deterministic pre-decision gates: expiry,
+  duplicate suppression (same `dedupKey` never re-presented),
+  rejection-suppression window, per-category cooldown, daily
+  interruption budget, minimum presentation confidence. Every gate
+  returns a structured reason that is recorded on the opportunity.
+- `proactiveContext.ts` — bounded shared state: event ring buffer,
+  signals, opportunities (capped at 100, oldest terminal entries
+  pruned by `sweep()`), presented suggestions, rejection history,
+  cooldowns, and the deterministic `activityState(now)` classifier —
+  only user-driven events define presence, so system-generated events
+  (e.g. WORKFLOW_LEARNED) can never make the user look active and
+  suppress their own suggestions. `ProactiveContext` also exposes the
+  follow-up scheduler hooks.
+- `proactiveDecider.ts` — the deterministic two-stage decision engine
+  (spec §4): policy gates → LEVEL-4 hard block → usefulness/evidence
+  strength → relevance window → user-busy/non-interruption →
+  informational suggestion (no action attached; accept() honestly
+  reports "no executable action") → permission + reversibility check
+  (missing permissions become a REQUEST_CONFIRMATION, never a bypass) →
+  action level. Low confidence always degrades to WAIT/RECORD_ONLY —
+  Krix never fabricates a reason to interrupt. `minimumLevelFor(risk)`
+  maps risk categories to minimum action levels; `isNeverAutomatic`
+  categories are hard-blocked at LEVEL 4 even with everything granted.
+- `proactiveScheduler.ts` — lightweight event-triggered scheduling:
+  only bounded one-shot delayed checks (default: single inactivity
+  follow-up for unfinished tasks), each with trigger, creation time,
+  expiration, reason and a cancellation path; firing respects budget
+  and expiry; `dispose()` clears everything (no background polling).
+- `proactiveActions.ts` — `executeConfirmed()` runs a confirmed LEVEL-3
+  action through the existing ToolRegistry with the caller's
+  PermissionManager (Phase 3 permissions remain authoritative at the
+  tool boundary — the registry re-checks). `verifySuggestionPresented()`
+  verifies a suggestion was actually presented;
+  `verifyAction()` prefers independent evidence (Phase 14 hook) and
+  reports `uncertain` rather than claiming success without it.
+- `proactiveService.ts` — the facade: `attach(bus)` wires the event
+  flow; opportunity formation per signal type (task completion offers a
+  screen-observation follow-up requiring `screen.observation`; workflow
+  recognition and repeated corrections produce informational-only
+  suggestions; unfinished tasks schedule the one-shot follow-up);
+  `present()` emits a structured NOTICE; `accept()` re-checks LEVEL-4
+  categories, executes only through the registry, then verifies and
+  emits TOOL_FAILED for Phase 11 recovery on failure (no retry loops);
+  `reject()` escalates suppression and, after repeated rejections,
+  persists one bounded preference memory. `ingestSignal()` sanitizes
+  external signals; `diagnostics()` exposes bounded counters.
+- `index.ts` — public surface.
+
+**Interruption budget (spec §5)**: `DEFAULT_BUDGET` bounds presented
+suggestions per window, per-category cooldowns, rejection-suppression
+windows (`rejectionSuppressMaxMs`), rejections-before-memory, and
+minimum confidence thresholds for presenting vs executing. The same
+condition never generates repeated suggestions (dedup), and repeated
+user rejections suppress similar suggestions for a bounded period.
+
+**Safety boundaries (spec §7/§13)**: LEVEL 0–4 as specified. Destructive,
+credential, financial, security and similar categories are
+`isNeverAutomatic` — hard-blocked at LEVEL 4 regardless of granted
+permissions or confidence. Irreversible non-general actions are never
+proactively suggestable. Missing permissions produce a confirmation
+request, never a bypass. Phase 3 permissions, Phase 11 recovery, Phase
+12 learning safety, Phase 13 observation policy and Phase 14 privacy
+rules all remain authoritative — ProactiveService executes exclusively
+through the existing ToolRegistry.
+
+**Memory + learning integration (spec §8/§9)**: relevant memories are
+recalled (bounded, ≤3 × 160 chars) for each decision; learned-workflow
+signals feed workflow-recognition opportunities, but recognition never
+auto-authorizes execution. Memory writes happen only after repeated
+rejections (validated preference, one bounded record) — proactive
+events are not hoarded.
+
+**Multimodal integration (spec §10)**: verification prefers independent
+evidence via a Phase 14 gather hook; conclusions follow Phase 14
+source-priority and uncertainty rules — weak sources are never combined
+into manufactured confidence.
+
+- **Bridge wiring**: `ProactiveService` is constructed in
+  `src/agent/bridge.ts` with the registry, PermissionManager, Event Bus,
+  memory and multimodal context; exposed as
+  `window.__KRISHA_AGENT__.proactive` (DevTools diagnostics only, no UI
+  changes).
+- **Test suite**: `scripts/test-proactive-phase15.ts`
+  (`npx tsx scripts/test-proactive-phase15.ts`) — 107 assertions
+  covering signal creation/dedup/expiry, activity classification, all
+  policy gates, decision levels + safety blocks, scheduler bounds/
+  cancellation, registry-gated execution + verification, service event
+  flow, workflow/correction/unfinished-task scenarios, rejection
+  suppression + memory, multimodal/provider-free verification, privacy,
+  bounded resources and the no-polling guarantee.
+- **Real-machine check**: `scripts/real-machine-check-proactive.ts`
+  (needs the local server) — aborts if Character Map is already running,
+  launches it through the Phase 9 allowlist surface, verifies a real
+  task-completion suggestion is presented and gated by the real
+  PermissionManager (`screen.observation` missing → confirmation
+  required; accept() refused — no unauthorized action), runs a LEVEL-3
+  read-only `application.status` against the running app after explicit
+  confirmation and verifies the result against the real process table,
+  asserts a destructive `filesystem.delete` opportunity is hard-blocked
+  at LEVEL 4, closes the app and confirms cleanup, and asserts no
+  scheduled checks remain.
+- **Privacy (spec §14)**: no screenshots or raw screen content are
+  stored; evidence quotes are bounded (≤160 chars, ≤4 items); external
+  signals are sanitized (clamped scores, capped TTL); secrets are never
+  persisted; memory writes are single bounded preference records.
+- **Performance (spec §15)**: strictly event-driven — no screen polling,
+  no multimodal processing loop, no background model, no workers;
+  bounded queues/maps with sweep-based pruning; dedup + cooldowns + TTL;
+  AbortSignal support, timeouts and cancellation on every execution and
+  scheduled check; deterministic local reasoning always runs first.
+- **Limitations**: activity classification is approximate (event-history
+  based, not attention-aware); the interruption budget is heuristic and
+  global (not per-user-profile); informational suggestions are
+  non-executable by design (acceptance offers nothing to run); the
+  follow-up scheduler only supports one-shot delayed checks, not
+  calendars/reminders (deadline signals arrive via `ingestSignal`);
+  verification without an independent-evidence hook reports `uncertain`
+  honestly rather than confirming.
+
+
+
+## 22. Deep research capability (additional — outside the numbered roadmap)
+
+> **Roadmap position.** Deep Research is NOT roadmap Phase 16. The official
+> Phase 16 is **Advanced Planning** (the hierarchical PlanEngine in
+> `src/agent/planning/` with `scripts/test-planning-phase16.ts`). Official
+> roadmap: 16 Advanced Planning → 17 Model Routing + Performance → 18 Safety +
+> Permission Hardening → 19 Long-Run Autonomy → 20 Final Agent Integration.
+> Deep Research is an additional capability built ON TOP of the Agent Core /
+> Planning architecture, kept modular and isolated in `src/agent/research/` so
+> it can integrate cleanly wherever the roadmap later places it.
+
+The Deep Research capability gives Krisha genuine multi-step, citation-tracked
+research: INPUT →
+understand the goal → decompose into sub-questions → search → inspect sources →
+extract evidence → cross-check → detect gaps/conflicts → follow-up rounds →
+synthesize a cited report. Domain-agnostic by construction (no Megha-specific
+agriculture/geospatial logic); the same pipeline serves technology, science,
+history, current events, documentation, products and general questions.
+
+### 22.1 Architecture
+
+```
+ HeuristicPlanner (research trigger: research/investigate/look into/
+ find out/compare X and Y)                     Agent Core (single executor)
+        │                          ▲
+        ▼                          │
+   PlanStep: research.run ──────▶ ToolRegistry.execute (Phase 3 contract:
+        capability 'research.run'         validation → permissions → events → timing)
+        │
+        ▼
+ ResearchService.runResearch (bounded loop, no polling, AbortSignal-aware)
+   plan → (search → select → read_source → extract_evidence → analyze →
+           gaps? → next round)* → synthesize
+        │                                   │
+        ▼                                   ▼
+ researchPlanner (deterministic     searchBackends (injectable)
+   decomposition)                     │
+ sourceInspector (tier/quality/       ▼
+   sentences)                       HttpResearchBackend → local server
+ evidenceExtractor (verbatim        /api/research/search (DDG html → lite → Bing RSS)
+   quotes)                          /api/research/fetch (server-side fetch +
+ claimVerifier (support/conflicts)    HTML→text, bounded, SSRF-guarded)
+ gapDetector (coverage → follow-ups)
+ sourceComparator (agreement/ranking)      FakeResearchBackend (tests)
+ synthesizer (report + [n] citations)      Phase 14 hook: round summaries become
+                                           bounded text evidence
+```
+
+Modules live in `src/agent/research/`: researchTypes (bounded dossier model +
+ResearchLimits), researchPlanner, researchBackends, sourceInspector,
+evidenceExtractor, claimVerifier, gapDetector, sourceComparator, synthesizer,
+researchService, researchTools (Phase 3 tools), index. The official Phase 16
+planning foundation (Advanced Planning: hierarchical PlanEngine, `planning/`)
+is reused unchanged: every research task runs as a validated node in the same
+plan tree the Agent Core executes.
+
+### 22.2 Tools (registered like every other capability)
+
+- `research.plan` — decomposition (deterministic, no network, riskLevel safe)
+- `research.search` / `research.read_source` — network tools, gated by the
+  existing `browser.interaction` permission (revocable, default-granted)
+- `research.extract_evidence` / `research.analyze` / `research.synthesize` —
+  local dossier analysis (no permission, no network)
+- `research.run` — the closed-loop orchestrator the planner schedules (like
+  Phase 7 `computer.use` / Phase 8 `browser.use`); it executes the tools above
+  THROUGH the registry so recovery, learning, multimodal and events all see it.
+
+### 22.3 Honesty rules (spec-mandated)
+
+- Factual statements are verbatim quotes with [n] citations — never paraphrased
+  into anonymity; every citation resolves to an inspected URL.
+- Verdicts: `supported` (≥2 independent registrable domains agree),
+  `single_source` (labeled uncertain, never settled fact), `conflicting`
+  (numeric or negation disagreement reported side by side, never averaged),
+  `unverified` (becomes an open question).
+- Confidence formula: `high` ONLY when every sub-question has independent
+  multi-source support; otherwise `medium`/`low`. Insufficient evidence →
+  `RESEARCH_INSUFFICIENT_EVIDENCE` event + honest low-confidence report.
+- Synthesis beyond quotes and limitation notes are labeled `inference`.
+
+### 22.4 Bounds & performance
+
+- Hard caps: ≤5 sub-questions, ≤3 rounds, ≤8 searches, ≤10 sources, ≤4 hits kept
+  per search, ≤4 evidence quotes per source, ≤8 per sub-question, ≤320-char
+  quotes, ≤4KB source excerpts, ≤6KB report, ≤8 dossiers (LRU by task end),
+  120s wall-clock budget; every number in `DEFAULT_RESEARCH_LIMITS`.
+- Strictly on-demand: no polling, no timers, no background model, no workers;
+  the loop advances only on awaited backend responses and checks the
+  AbortSignal between steps. Server endpoints cap responses (1.5MB raw /
+  40KB text) and time out at 15s; private network targets are refused (SSRF).
+- Query dedupe by normalized tokens (a query is never re-searched); source
+  dedupe by URL and domain diversification (≤2 sources per registrable domain).
+
+### 22.5 Tests & verification
+
+- `scripts/test-research.ts` (npx tsx): **179 assertions, 0 failed** —
+  planner decomposition, source quality, evidence extraction/relevance/dedupe,
+  conflict detection (numeric + negation) and support counting, gap kinds +
+  follow-up generation, comparison/ranking, synthesis/citations/confidence,
+  every tool (schema, permission gating, events, dossier isolation), the
+  bounded loop (multi-round coverage, budget stops, all-searches-fail,
+  fetch-failure disclosure, conflicts end-to-end, cancellation, LRU pruning),
+  planner non-hijack guarantees, Agent Core end-to-end through the official
+  Phase 16 (Advanced Planning) planning layer, Phase 14 multimodal hook, HTTP
+  backend error mapping, and bounded-resource/no-polling guarantees.
+  Deterministic: scripted backends.
+- `scripts/real-machine-check-research.ts` (needs local server): real search
+  endpoint → real source fetch → real bounded research run through the registry
+  → full Agent Core delegation. Verified PASS on the real machine with
+  independent evidence (real hits, real page text, real cited report).
+
+### 22.6 Limitations
+
+- Web search uses public engines server-side (DuckDuckGo html/lite → Bing RSS
+  waterfall) which rate-limit aggressively by IP; a blocked engine degrades to
+  the fallback, and a fully blocked network yields honest low-confidence
+  reports rather than errors. No JS-rendered page content (server-side fetch
+  reads server-rendered HTML only).
+- Conflict detection is lexical (numbers/negation/overlap) — it cannot catch
+  semantic disagreements phrased without shared vocabulary; source quality
+  tiers are domain-heuristic, not authority-aware.
+- The research loop is deterministic/heuristic — no LLM step; sub-questions,
+  relevance and synthesis are computed locally, which keeps the laptop
+  footprint minimal at the cost of prose polish.
+- Delegation triggers on explicit research verbs only; single-page lookups
+  ("search X on Y") remain Phase 1 web actions, and mixed browser+research
+  compound requests split per clause.
+
+## 23. Advanced planning — official Phase 16
+
+**Phase 16 — Advanced Planning** (official roadmap; distinct from §22, which is
+an additional capability outside the numbered roadmap). The planning model:
+
+```
+GOAL → SUBGOALS → ACTIONS → VERIFICATION → (on mismatch) REPLANNING
+```
+
+Planning and execution stay separated: the PlanEngine decides WHAT/WHY/ORDER/
+WHAT-SUCCESS-LOOKS-LIKE and never executes; the Agent Core remains the single
+executor and the ToolRegistry the only execution surface (no second loop).
+
+### 23.1 Architecture
+
+```
+ HeuristicPlanner (flat steps)          Agent Core (single executor)
+        │                                     │
+        ▼                                     │
+ PlanEngine.attachPlan                        │
+   ├─ clarification gate (spec §13)           │
+   │    ambiguous goal → PLAN_CLARIFICATION_REQUESTED + honest stop
+   ├─ buildHierarchy: GOAL → SUBGOAL (domain-grouped) → ACTION
+   │    expectedOutcome per action, conditions mirrored, deps: sequential
+   │    + explicit (step-id → node-id)
+   └─ validatePlan: bounds, missing tools, cycles, impossible deps,
+        missing verification, invalid nodes; permission gaps → BLOCKED
+        (not invalid) — permissions stay authoritative at execution
+                                     ▼
+ Agent Core executes each step → ToolRegistry.execute
+        │
+        ▼
+ PlanEngine node lifecycle: pending → ready → running → verifying →
+   completed (ONLY when verified) / failed / skipped / blocked / cancelled
+        │
+        ▼ on unrecovered failure
+ proposeReplan (bounded, deterministic):
+   budgets (task/node replans, node retries, repeated failures, timeout) →
+   duplicate-plan detection → permission boundaries NEVER bypassed →
+   corrective subtree: domain diagnosis (real read-only check) + ONE retry,
+   rotating to the best-ranked ALTERNATIVE tool for the same capability when
+   its declared input schema is compatible (spec §8; failed strategies do not
+   repeat themselves)
+        │
+        ▼
+ commitReplan splices the subtree after the failed step — completed work is
+ preserved; the loop resumes from the current state (partial completion)
+```
+
+Modules in `src/agent/planning/`: planningTypes (bounded node model, limits,
+snapshot types), planBuilder, planValidator, strategySelector (cheapest-
+reliable ranking, modality preferences), clarification (deterministic
+ambiguity detection), planEngine, index.
+
+### 23.2 Capability map (spec §1–16)
+
+| Spec area | Implementation |
+|---|---|
+| Hierarchical decomposition | buildHierarchy — simple goals stay single-subgoal |
+| Dependency-aware planning | sequential + explicit deps; blocked/completed/skipped/failed states; cycles and impossible (forward) deps rejected pre-execution |
+| Dynamic state tracking | PlanEngine.snapshot(): current action + subgoal, per-node status/verification/attempts/expected/condition/error, counts, permission blockers |
+| Action verification | expectedOutcome per action; completed ONLY when tool success AND verification pass; unverified completion degrades the task to uncertain |
+| Adaptive replanning | bounded corrective subtrees (diagnose → retry), environment-derived reasons, replan/refusal accounting |
+| Partial completion | corrective splice after the failed step; completed nodes keep status; remaining steps skipped, never re-run |
+| Conditional planning | Phase 10 StepCondition (context exists/missing/equals/contains) mirrored onto plan nodes |
+| Alternative strategies | strategySelector ranking + alternative-tool rotation in corrective retries (schema-compatible, permission-checked) |
+| Planning vs execution | engine never executes; registry contract enforced on every action |
+| Replanning limits | maxDepth 3, maxNodes 24, maxReplansPerTask 3, maxReplansPerNode 1, maxRetriesPerNode 3, maxRepeatedFailures 2, taskTimeoutMs 10min |
+| Plan validation | planValidator (errors + warnings); malformed plans never execute |
+| Plan adaptation | insert (corrective/adopted splices), mark obsolete (skips, evidence key), replace strategy (tool rotation), preserve completed work |
+| User clarification | detectAmbiguity — "open X or Y"-style materially different plans stop with PLAN_CLARIFICATION_REQUESTED instead of guessing; single-interpretation goals never ask |
+| Safety integration | permissions → blocked nodes; replanning refuses to bypass; registry enforces at execution; confirmation thresholds untouched |
+| Agent Core integration | attachPlan gate, node lifecycle events, replan splice, finishTask with verified-completion semantics |
+| Deep Research compatibility | Deep Research (§22, additional capability) uses attachPlan via the Agent Core — unchanged |
+
+### 23.3 Tests & real-machine verification
+
+- `scripts/test-planning-phase16.ts` (npx tsx): **102 assertions, 0 failed** —
+  hierarchy + grouping, validation (tools/deps/cycles/size/depth/permissions),
+  engine lifecycle, verified completion + honest uncertainty, cancellation,
+  permission blocks, bounded replanning (task/node budgets, repeated-failure
+  and duplicate-plan guards), partial completion (no restart), conditional
+  branches (true/false/skip), impossible dependencies, alternative-strategy
+  rotation (+ incompatible-schema refusal), node retry budget, planning
+  timeout, excessive depth, plan snapshot, user clarification (ask vs don't
+  ask, task-level honest stop), Agent Core E2E (plan → fail → replan →
+  verified completion), Phase 15 regression. Deterministic: injected clock,
+  fake tools, no timers.
+- `scripts/real-machine-check-planning.ts` (needs the local server; READ-ONLY):
+  real hierarchical plan over real filesystem tools (dependency-ordered list →
+  inspect) completes verified; a real unfulfillable read triggers one real
+  diagnosis (directory listing) + retry, then the repeated-failure guard stops
+  honestly with completed work preserved. Verified PASS on the real machine.
+
+### 23.4 Correctness fix shipped with this phase
+
+`PlanEngine.attachPlan` held an ALIAS of the Agent Core's live `plan.steps`
+array; `commitReplan`/`adoptSplicedSteps` bookkeeping pushes therefore
+duplicated corrective steps into the executing plan — invisible while
+corrective steps failed (duplicates were skipped after the honest stop) but
+causing DOUBLE EXECUTION once a corrective retry succeeded (exposed by the
+alternative-strategy tests). The engine now keeps its own copy (same step
+objects), so core-side splices are the single source of execution order.
+
+### 23.5 Limitations
+
+Decomposition is deterministic (domain-grouped subgoals from the existing
+heuristic planner — no LLM step; planning quality inherits the Phase 1
+planner's clause classification). Ambiguity detection is deliberately
+conservative (explicit "X or Y" target alternatives only). Corrective
+strategies cover computer/filesystem/application domains with deterministic
+diagnoses; other domains rotate tools when possible and otherwise stop
+honestly (browser/desktop recovery remains with Phase 11).
+
+## 24. Model routing + performance (Phase 17)
+
+**Phase 17 — Model Routing + Performance** (official roadmap). Goal: use the
+smallest/cheapest/lightest capable path that reliably completes the task, and
+escalate only when necessary — without reducing correctness, safety or
+reliability, and without any new dependency.
+
+### 24.1 What already existed (preserved, not rewritten)
+
+- server.ts `generateContentWithFallback`: 4-model Gemini waterfall
+  (3.8-flash → 3.7-flash → flash-latest → 3.1-flash-lite), 2 attempts/model,
+  500 ms backoff on transient errors (429/RESOURCE_EXHAUSTED/503/UNAVAILABLE),
+  local in-character fallback on exhaustion.
+- Specialized waterfalls: maps grounding (3.5-flash + 3.8-flash + googleMaps
+  tool), TTS (lite-tts → tts), transcription (3.5-transcribe → flash).
+- Local-first heuristics everywhere: sentiment engine, heuristic planner,
+  heuristic memory extraction (+2-min quota cooldown), companion fallback,
+  toolSelector/strategySelector cheapest-reliable ranking, PlanEngine bounds,
+  bounded contexts (chat history ≤16, task context ≤4 KB, memory recall
+  bounded, research excerpts capped, vision rate-limit + cooldowns).
+- No OpenRouter and no routing/telemetry layer existed — that was the gap.
+
+### 24.2 New routing architecture (`src/agent/routing/`)
+
+```
+ text ─▶ CachedClassifier (deterministic 5-tier classification, TTL/LRU-memoized)
+          TRIVIAL │ SIMPLE │ MODERATE │ COMPLEX │ HIGH_COMPLEXITY
+              ▼
+        resolveRequirements (factors + declarative capability map:
+          screen.* → vision+deep reasoning, browser.* → tool use + web
+          reasoning, research.* → deep + web, …)
+              ▼
+        ModelRouter.route — smallest capable AVAILABLE model ≥ tier floor
+          (complexity floor ∧ requirements floor), registry-sorted cheapest-first
+              ▼  decision only — nothing is executed
+        escalate(decision, reason): light → balanced → strong → null (bounded)
+        fallbackFrom(model, reason): compatible alternative, never the failed
+          model first; context_overflow prefers larger context; optional
+          unavailability TTL; exhaustion → honest null
+              ▼
+        RouteDecision { model, orderedModels (FULL waterfall preserved behind
+        the choice), escalationPath, recommendedTimeoutMs, attempts, history }
+```
+
+Modules: complexity.ts, modelProfiles.ts (ModelRegistry — profiles are
+configuration data describing the repo's actual models), requirements.ts,
+router.ts, cache.ts (BoundedCache + FNV-1a hashKey), coalesce.ts,
+telemetry.ts, classifier.ts, routingTools.ts.
+
+**Server integration (additive; the waterfall algorithm is untouched):**
+`generateContentWithFallback` accepts an optional ordered `models` list.
+/api/chat classifies the message (cached), routes, calls the waterfall in the
+routed order, returns additive `route` metadata (complexity, tier, preferred,
+used, orderedModels, timeout guidance) — also on the local-fallback path —
+and records per-call latency/model telemetry. /api/vision/analyze coalesces
+identical in-flight analyses (read-only → safe to share) and records latency.
+/api/health exposes the passive `perf` snapshot. /api/memory/extract,
+grounding, TTS and transcription keep their existing (already specialized)
+paths.
+
+**Agent integration (bridge):** `model.route`, `perf.classify` and
+`perf.metrics` are registered as SAFE/FREE/LOCAL tools — decisions and
+metrics only, no execution surface, so routing cannot bypass permissions,
+verification, plan validation or recovery (spec §20). Passive bus listeners
+record TOOL_COMPLETED durations and TASK_COMPLETED times (bounded maps, no
+new instrumentation points). `modelRouter`/`performance` exposed on the
+AgentSystem and the DevTools hook.
+
+### 24.3 Context/token efficiency (spec §9/§18)
+
+Existing bounds were verified rather than re-invented: chat history ≤16
+messages; task context values bounded (4 KB with preview); memory recall
+relevance-bounded (Phase 2); multimodal/research/proactive evidence caps from
+Phases 13–16. New: classification memoization avoids re-running heuristics
+for repeated identical messages; vision coalescing removes duplicate
+in-flight analyses; routed ordering avoids spending strong-model quota on
+trivial traffic (quota saved IS fallback capacity gained).
+
+### 24.4 Performance measurements (real machine)
+
+- Routing overhead: 100 classify+route cycles ≈ tens of ms total
+  (sub-millisecond per decision; asserted < 250 ms for the 100 in tests).
+- Duplicate-call prevention: identical concurrent vision analyses collapse to
+  one model call (coalescer stats).
+- Classification cache: repeated identical messages are pure cache hits
+  (hit/miss counters in telemetry).
+- Routed ordering: trivial traffic consumes light-model quota first,
+  preserving strong-model quota for escalations (no behavioral claim beyond
+  the measured route decisions in the real-machine check).
+- Memory: all telemetry rings/stats bounded (≤100 records, ≤64 tool stats,
+  ≤128 classifier entries); zero timers/intervals added (verified: health
+  counters do not move without traffic).
+
+### 24.5 Safety constraints
+
+Routing is decision-only end to end: RouteDecision carries model ids and
+ordering, never an executor. Permissions, confirmation thresholds, plan
+validation, recovery and verification are enforced exactly as before (tested:
+a permission-gated tool stays permission_denied with routing tools present).
+Escalation and fallback are bounded (tier ladder length 2; fallback ladder ≤
+registry size − 1; availability TTLs expire). The full 4-model waterfall
+always remains behind any routed choice — resilience is never reduced.
+
+### 24.6 Tests & real-machine verification
+
+- `scripts/test-routing-phase17.ts` (npx tsx): **123 assertions, 0 failed** —
+  classification (5 tiers, determinism, timeout guidance), registry/profiles
+  (availability TTLs), requirements (capability map, satisfaction), routing
+  (lightweight selection, floors, vision/tool routing, unavailability),
+  escalation (bounded ladder, history), fallback (8 reason kinds, overflow
+  preference, rate-limit TTL, exhaustion), caching (hit/miss/expiry/eviction),
+  coalescing (sharing, independence, error propagation), telemetry (bounded
+  rings, snapshot), classifier cache + overhead measurement, safety
+  (decision-only, permissions untouched), integration (Agent Core, Phase 16
+  validation, Deep Research compatibility). Deterministic: fake clocks.
+- `scripts/real-machine-check-routing.ts` (needs the local server; ≤2 real
+  chat calls, no provider spam): registry loads; router decisions; escalation
+  + fallback; real simple chat → lightweight route; real complex chat →
+  strong route with full waterfall preserved; health perf snapshot with
+  counters that do not grow without traffic; real planned task completes;
+  Deep Research planning intact. Verified PASS on the real machine.
+
+### 24.7 Known limitations
+
+Classification is lexical/deterministic (no embedding/LLM classification by
+design — a hard task phrased in few words routes light, and quality-based
+escalation triggers only via explicit callers of `escalate()`; the server
+escalates implicitly through the preserved failure waterfall). Tier/cost/
+reliability profile values are curated configuration for the configured
+models, not measured benchmarks. Deep Research remains fully deterministic
+and local — it never routes to a model (nothing to route; by design, and
+unchanged). Streaming behavior is unchanged (no streaming existed in the
+server chat path).
+
+## 25. Safety + permission hardening (Phase 18)
+
+**Phase 18 — Safety + Permission Hardening** (official roadmap). Central
+principle: Krisha knows what she is allowed to do, what requires
+confirmation, what is forbidden, what scope a permission covers, and when a
+permission must be re-requested — enforced centrally, not by tools
+remembering to check.
+
+### 25.1 What already existed (preserved, not rewritten)
+
+Phase 3 PermissionManager (12 typed domains, session grants, RISK_ORDER +
+confirmationThreshold hook) enforced by the ToolRegistry on every execution;
+Phase 16 plan validation (permission gaps → BLOCKED nodes; replanning refuses
+to route around permissions); Phase 11 recovery (PERMISSION_DENIED →
+SAFE_STOP; permission_denied is non-retryable); Phase 15 proactive LEVEL 1–4
+gates (LEVEL 4 never auto-executes); Phase 9 server path safety (allowed
+roots, traversal rejection, system-dir write denylist, app allowlist);
+scheme/SSRF guards in browser/research; AbortSignal cancellation everywhere.
+
+### 25.2 New architecture (`src/agent/safety/`)
+
+```
+ any caller (core, planning, recovery, proactive, research, tools)
+        │  registry.execute — THE single chokepoint
+        ▼
+ SafetyGate.evaluate (deterministic, fail-closed):
+   1. risk classification (classifyRisk): declared risk → base class, then
+      input escalations (force/overwrite flags, bulk targets >5, destructive
+      tools, external side effects, sensitive path patterns) — classes:
+      SAFE / CONFIRM / HIGH_RISK / DENY; unknown declaration → fail closed
+   2. unknown permission id → DENY (spec §19: never implicit allow)
+   3. scoped revocation → REVOKED (kill-switch over session grants until an
+      explicit new grant is made)
+   4. emergency stop active → side-effecting classes DENIED (read-only
+      control plane stays operable)
+   5. base PermissionManager coverage; scoped grants (once / task / session /
+      duration) satisfy gaps — consumed on use, removed on expiry
+   6. optional strict mode: HIGH_RISK → REQUIRE_CONFIRMATION unless a
+      high-risk acknowledgment grant exists (default off — preserves existing
+      legitimate flows; switch exists for the Phase 20 confirmation UI)
+        │
+        ▼ structured SafetyEvaluation on EVERY result (allow AND deny)
+ ToolResult.metadata.safety { decision, klass, permission, reason, factors,
+        auditId } — denials are permission_denied + non-retryable, so Phase
+        11/16 semantics (no retry, no replan around safety) apply unchanged
+        │
+        ▼
+ SafetyAuditLog — bounded ring (200), redacted (reasons through redactText;
+        input KEYS only, never values), passive (no polling/timers)
+```
+
+Scoped grants (`ScopedPermissionManager`): explicit scope kinds — one-shot
+(consumed on use), task-bound (one taskId), session, duration (expiry) —
+never broader than requested; revocation is immediate and removes all stale
+grant objects; emergency revoke clears every temporary grant. Grants are made
+by the embedding application/user ONLY — there is deliberately NO self-grant
+tool.
+
+Emergency stop (`EmergencyStop`): `activate(reason)` fires registered hooks —
+the bridge wires `core.cancelAll()` (existing cancellation architecture) +
+`scoped.revokeAllTemporary()` — then the gate blocks new side-effecting
+actions while read-only visibility continues; `deactivate()` fully restores
+permission-checked operation. Audited with the operator reason.
+
+Safety tools: `safety.status`, `safety.emergency_stop`, `safety.audit` — the
+control plane (status/stop/resume/audit read) classifies SAFE so it remains
+operable during a stop. AgentSystem/DevTools expose `safety` (gate, scoped
+grants, audit, emergencyStop, emergencyStopNow/resume).
+
+### 25.3 Integration guarantees (spec §11–§14)
+
+- **Planning**: plan validation unchanged (missing permissions → BLOCKED
+  nodes); execution-time gate denials are structured and non-retryable, so a
+  plan still cannot execute a side-effecting step merely because the planner
+  produced it.
+- **Retries/replanning**: permission_denied remains non-retryable; Phase 11
+  classifies PERMISSION_DENIED → SAFE_STOP; Phase 16
+  `proposeReplan(refusedBecause: 'not_replannable')` — a retry can never
+  bypass a denial, and corrective strategies stay inside the permission
+  boundary (Phase 16 rotation permission-checks alternative tools).
+- **Model routing (Phase 17)**: routing remains decision-only; fallback and
+  escalation operate under the exact same gate — a stronger model receives no
+  additional permissions (verified by test).
+- **Browser/filesystem/application**: every registered tool passes the gate;
+  the server's path-safety guards remain intact behind it (verified on the
+  real machine).
+
+### 25.4 Tests & real-machine verification
+
+- `scripts/test-safety-phase18.ts` (npx tsx): **62 assertions, 0 failed** —
+  risk classification table (destructive/irreversible/local-external/bulk/
+  force/fail-closed/determinism), permission decisions (allow/deny/
+  require_confirmation/revoked/expired through the registry), scoped grants
+  (once consumed, task-bound isolation, duration expiry, immediate
+  revocation), agent core/planner/retry/replan safety, emergency stop
+  (cancellation, signal-honoring side-effect block, read-only visibility,
+  recovery), bounded redacted audit (300 → 200 ring; secrets redacted),
+  safety tools (no self-grant), Phase 16/17 + Deep Research compatibility,
+  and byte-identical no-gate registry behavior.
+- `scripts/real-machine-check-safety.ts` (needs the local server; uses a
+  disposable temp directory, cleaned up afterwards; no destructive probes):
+  **21/21 PASS** — safe read executes with ALLOW recorded; ungranted write
+  denied; one-shot grant allows exactly once; expiry rejected; revocation
+  immediate; emergency stop blocks side effects while read-only continues and
+  recovers on resume; server path-safety guards intact through the gate;
+  Phase 16 planned execution completes under the gate; Phase 17 routing and
+  Deep Research unaffected; unknown-permission bypass attempt fails closed;
+  audit bounded and metadata-only.
+
+### 25.5 Known limitations
+
+Confirmation is structured but has NO interactive UI yet: in the default
+policy, CONFIRM/HIGH_RISK actions execute within their granted permission
+scope (the existing session-grant architecture) and are audited; the strict
+high-risk confirmation mode and the structured `require_confirmation` result
+are ready for the Phase 20 confirmation UI. Sandboxing is NOT claimed: tool
+execution is permission-gated and path-guarded, but not sandboxed (documented
+per spec §16). The audit log is in-memory and bounded (not persisted across
+restarts — a deliberate privacy/performance tradeoff). Scope kinds cover
+once/task/session/duration; recurring calendars are Phase 19 territory.
+
+## 26. Long-Run Autonomy — official Phase 19
+
+**Phase 19 — Long-Run Autonomy** (official roadmap). Goal: give Krisha
+persistent, bounded, safely-resumable task sessions so that a task that takes
+longer than one interaction, suffers a transient interruption, or requires a
+pause can continue safely instead of being lost.
+
+### Architecture overview
+
+```
+AgentCore (existing, single executor — no second core)
+    ↓  emits TASK_STEP_COMPLETED / _FAILED / RECOVERY_* / PLAN_REPLANNED /
+    ↓       TASK_COMPLETED / _FAILED / _CANCELLED / TOOL_COMPLETED / _FAILED
+LongRunManager (event-driven, no polling, no timers of its own)
+    ↓  advances TaskSession lifecycle (deterministic state machine)
+    ↓  writes lightweight CheckpointStore on meaningful step boundaries
+TaskSession (deterministic state machine per task)
+    SessionState: CREATED → RUNNING → PAUSED / WAITING / BLOCKED / RECOVERING
+                                    → CANCELLED / FAILED / COMPLETED / EXPIRED
+    All transitions validated against a static table; invalid transitions logged
+    to SafetyAuditLog and rejected — never silently applied.
+CheckpointStore (bounded, MemoryStorage-backed or real storage)
+    Persists compact SessionCheckpoint: task id, goal, plan revision, step
+    statuses (id/toolName/status/attempts/verified), budget state, last-action
+    outcome class. NEVER persists tool inputs/outputs, screenshots, histories,
+    secrets or credentials. Bounded: MAX_PERSISTED_CHECKPOINTS = 24; oldest
+    terminal entries evicted first.
+waitUntil() — bounded adaptive polling helper
+    Single timer at a time. Interval doubles from pollMs to maxPollMs (default
+    500 ms → 8 s). Hard poll cap (maxPolls = 60). Timeout → BLOCKED.
+    Optional AbortSignal for event-driven early wake.
+```
+
+### Task lifecycle
+
+```
+start(goal) → CREATED → RUNNING
+  │  checkpoint written per step completion (not on a timer)
+  │  budgets: maxDurationMs / maxToolCalls / maxRecoveries / maxStepCompletions
+  │
+  ├─ pause()   → PAUSED   (resumable; in-flight step cancelled, not duplicated)
+  ├─ wait()    → WAITING  → RUNNING (satisfied) | BLOCKED (timeout)
+  ├─ Recovery  → RECOVERING → RUNNING (Phase 11 handles the retry)
+  │
+  ├─ cancel()  → CANCELLED  (terminal — never auto-resumes)
+  ├─ budget exhausted → EXPIRED  (terminal)
+  ├─ failure   → FAILED    (terminal)
+  └─ complete  → COMPLETED (terminal)
+```
+
+### Checkpoint design
+
+Compact `SessionCheckpoint` fields:
+- `schemaVersion` — forward-compatibility guard; incompatible → BLOCKED
+- `taskId`, `goal` (≤ 160 chars), `lifecycle`, `planRevision`
+- `steps[]` — id, description (≤ 80 chars), toolName, status, attempts, verified
+- `counts` — stepsCompleted, stepsFailed, toolCalls, recoveries, replans
+- `budget` + `consumed` — runtime limits and consumption tracking
+- `lastAction` — `{ stepId, toolName, outcome: DEFINITE_SUCCESS | DEFINITE_FAILURE | UNKNOWN }`
+- `pauseReason`, `failureReason`, `blockReason` — human-readable, bounded
+
+Written at: step completion/failure, pause, recovery transitions, replan,
+budget exhaustion. Never on a timer; never in a tight loop.
+
+### Resume flow
+
+```
+resume(taskId)
+  1. session PAUSED or BLOCKED?
+  2. validateCheckpoint(cp)         — structural, schema, bounds
+  3. lastAction.outcome === UNKNOWN? → BLOCKED (duplicate-action prevention)
+  4. emergencyStop.isActive()?      → refuse (spec §15)
+  5. budgetExhaustion()?            → refuse (requires fresh budget)
+  6. transitionTo('RUNNING')?       — rejected if table forbids it
+  7. core.resumeTask(taskId)        — Phase 18 gate re-checks every action
+```
+
+### Crash / restart recovery
+
+`crashScan()` on construction validates every stored checkpoint:
+- Corrupt/incompatible → dropped (fail-closed, not executed)
+- Stale beyond 24 h → BLOCKED (explicit revalidation required)
+- `RUNNING` / `RECOVERING` / `WAITING` → downgraded to PAUSED (core died, external
+  state unverified; NOT auto-resumed)
+- Terminal states preserved as-is
+
+### Interruption taxonomy
+
+| Signal | Session state | Resumable? |
+|---|---|---|
+| `pause()` | PAUSED | Yes — after explicit validated resume |
+| `cancel()` | CANCELLED | No — terminal |
+| Emergency stop | blocks resume | No — until stop lifted |
+| Budget exhausted | EXPIRED | No |
+| Permission expired/revoked | BLOCKED (gate catches at exec time) | Yes — after permission restored |
+| Stale checkpoint | BLOCKED | Yes — after revalidation |
+| UNKNOWN last action | BLOCKED | Yes — after external state verified |
+
+### Duplicate-action prevention (spec §16)
+
+`lastAction.outcome` is classified after every step:
+- `DEFINITE_SUCCESS` — `completed && verified === true`
+- `DEFINITE_FAILURE` — `failed && verified === false`, or `cancelled` (aborted before side effect)
+- `UNKNOWN` — dispatched but unverified (`uncertain`)
+
+`resume()` refuses and transitions to BLOCKED when outcome is `UNKNOWN`.
+
+### Resource behaviour
+
+- **No background polling loops, no manager timers.** All advancement is
+  event-driven on the shared AgentCore event bus.
+- `waitUntil()` owns exactly one doubling-interval timer at a time.
+- Checkpoint writes: ≤ one per step boundary.
+- Concurrency: single active session (default); configurable via `maxActiveSessions`.
+- `cleanup(keepRecent=5)` removes terminal sessions beyond the retention limit.
+
+### Safety integration
+
+Phase 18 SafetyGate is authoritative: every resumed or new side-effecting action
+passes the gate inside `AgentCore.runStepWithRetry`. A checkpoint cannot grant
+permission. Emergency stop wired via `setEmergencyProbe()`. ScopedPermissionManager
+expiry/revocation caught at execution time, not by the session layer.
+
+### Phase integrations
+
+- **Phase 11**: `RECOVERY_STARTED/SUCCEEDED/FAILED` drive `RECOVERING` transitions.
+- **Phase 16**: `PLAN_REPLANNED` increments replan counter; resumed tasks re-enter
+  the core's existing plan continuation path.
+- **Phase 17**: routing unchanged; long-run tasks use the same model router.
+- **Phase 15**: proactive signals share the event bus; no duplicate background system.
+- **Deep Research**: compatible; tool calls tracked in the session budget.
+
+### Modules
+
+```
+src/agent/longrun/
+  sessionTypes.ts   — SessionState machine, budget, checkpoint schema, CheckpointStore
+  taskSession.ts    — per-task deterministic lifecycle state machine
+  waiting.ts        — waitUntil() bounded adaptive timer
+  longRunManager.ts — event-driven session coordinator: crash scan, pause/resume/cancel/wait
+  longRunTools.ts   — Phase 3 tools: longrun.status / .pause / .resume / .wait
+  index.ts          — public exports
+```
+
+### Known limitations
+
+- Single-active-session model by default (correctness over throughput on a laptop).
+- Crash recovery restores to PAUSED — external state must be revalidated by the
+  user or a Phase 11 recovery pass before continuation.
+- `AgentCore.resumeTask` resets plan from the `interrupted` state; `$context` refs
+  must still be valid in the task store.
+- Checkpoint store is in-memory (MemoryStorage) in the browser build; the
+  server-side bridge supplies real persistence.
+- The real-machine verification script requires the local dev server (`npm run dev`).
+
+---
+
+> **Phase 20 — Final Agent Integration — NOT STARTED**

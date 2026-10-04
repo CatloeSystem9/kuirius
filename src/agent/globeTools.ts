@@ -7,6 +7,7 @@ import type { AgentTool, ToolResult } from './types';
 import { ok, fail } from './types';
 import type { GlobeAction } from '../types';
 import { geocodeAddress } from '../utils/locationService';
+import { OPEN_METEO_WIND_QUERY, directionToCardinal } from '../components/globe/environment/envService';
 
 const GLOBE_VERIFICATION = {
   strategy: 'self_reported' as const,
@@ -219,5 +220,125 @@ export function createGlobeTools(): AgentTool[] {
     },
   };
 
-  return [showGlobeTool, flyToTool, setLayerTool, resetViewTool, getCoordinatesTool];
+  const showWindTool: AgentTool = {
+    name: 'globe.show_wind',
+    description:
+      "Show animated live wind currents on the 3D globe. Optionally pass a target city/country/coordinates to fly there and enable the wind layer.",
+    category: 'location',
+    riskLevel: 'safe',
+    cost: 'free',
+    capabilities: ['globe.show_wind', 'wind.layer', 'earth.wind'],
+    inputSchema: {
+      optional: ['locationName', 'lat', 'lng'],
+      types: { locationName: 'string', lat: 'number', lng: 'number' },
+    },
+    verification: GLOBE_VERIFICATION,
+    async execute(input): Promise<ToolResult> {
+      let lat = typeof input.lat === 'number' ? input.lat : undefined;
+      let lng = typeof input.lng === 'number' ? input.lng : undefined;
+      const locationName = typeof input.locationName === 'string' ? input.locationName.trim() : undefined;
+
+      if ((lat === undefined || lng === undefined) && locationName) {
+        try {
+          const geocoded = await geocodeAddress(locationName);
+          if (geocoded) {
+            lat = geocoded.lat;
+            lng = geocoded.lng;
+          }
+        } catch (err) {
+          console.warn('Geocoding error in globe.show_wind:', err);
+        }
+      }
+
+      const globeAction: GlobeAction = {
+        type: 'wind_on',
+        lat,
+        lng,
+        locationName,
+      };
+
+      return ok({
+        output: {
+          opened: true,
+          windLayer: true,
+          locationName,
+          lat,
+          lng,
+        },
+        ui: [
+          { kind: 'open_modal', modal: 'globe' },
+          { kind: 'globe_action', action: globeAction },
+          { kind: 'pose', pose: 'waving_greeting' },
+        ],
+      });
+    },
+  };
+
+  const hideWindTool: AgentTool = {
+    name: 'globe.hide_wind',
+    description: 'Turn off the animated wind currents layer on the 3D globe.',
+    category: 'location',
+    riskLevel: 'safe',
+    cost: 'free',
+    capabilities: ['globe.hide_wind', 'wind.layer'],
+    verification: GLOBE_VERIFICATION,
+    async execute(): Promise<ToolResult> {
+      return ok({
+        output: { windLayer: false },
+        ui: [
+          { kind: 'globe_action', action: { type: 'wind_off' } },
+        ],
+      });
+    },
+  };
+
+  const windInfoTool: AgentTool = {
+    name: 'globe.wind_info',
+    description:
+      'Look up the current real wind speed and direction for a place (city, country, or coordinates). Returns honest data from Open-Meteo; never estimates.',
+    category: 'location',
+    riskLevel: 'safe',
+    cost: 'free',
+    capabilities: ['globe.wind_info', 'wind.speed', 'wind.direction'],
+    inputSchema: {
+      required: ['query'],
+      types: { query: 'string' },
+    },
+    async execute(input): Promise<ToolResult> {
+      const query = String(input.query || '').trim();
+      if (!query) return fail('Query string is required');
+
+      let lat = typeof input.lat === 'number' ? input.lat : undefined;
+      let lng = typeof input.lng === 'number' ? input.lng : undefined;
+
+      try {
+        if (lat === undefined || lng === undefined) {
+          const geocoded = await geocodeAddress(query);
+          if (!geocoded) return fail(`Could not resolve coordinates for "${query}"`);
+          lat = geocoded.lat;
+          lng = geocoded.lng;
+        }
+
+        const reading = await OPEN_METEO_WIND_QUERY.fetchPoint(lat, lng);
+        return ok({
+          output: {
+            query,
+            lat,
+            lng,
+            windSpeedKmh: reading.speedKmh,
+            windSpeedMs: reading.speedMs,
+            windDirectionDeg: reading.directionDeg,
+            windDirectionFrom: `${reading.directionDeg.toFixed(0)}deg ${reading.cardinal}`,
+            cardinal: directionToCardinal(reading.directionDeg),
+            timestamp: reading.timestamp,
+            source: reading.source,
+          },
+        });
+      } catch (err: any) {
+        return fail(`Wind data lookup failed for "${query}": ${err?.message || err}`);
+      }
+    },
+  };
+
+  return [showGlobeTool, flyToTool, setLayerTool, resetViewTool, getCoordinatesTool, showWindTool, hideWindTool, windInfoTool];
 }

@@ -67,6 +67,11 @@ export class PermissionManager {
     return this.grants.get(permission) === true;
   }
 
+  /** True when the id is a known permission domain (Phase 18 fail-closed support). */
+  isKnown(permission: string): boolean {
+    return (ALL_PERMISSIONS as string[]).includes(permission);
+  }
+
   grant(permission: ToolPermission): void {
     this.grants.set(permission, true);
   }

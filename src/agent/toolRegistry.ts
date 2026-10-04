@@ -16,6 +16,12 @@
 import type { AgentTool, ToolContext, ToolErrorKind, ToolInputSchema, ToolPermission, ToolResult } from './types';
 import type { AgentEventBus } from './events';
 import type { PermissionManager } from './permissions';
+import type { SafetyEvaluation } from './safety/safetyTypes';
+
+/** Central safety gate contract (Phase 18) — implemented by SafetyGate. */
+export interface ToolSafetyGate {
+  evaluate(toolName: string, declaredRisk: string | undefined, declaredPermissions: string[] | undefined, input: Record<string, unknown> | undefined, context?: { taskId?: string }): SafetyEvaluation;
+}
 
 export interface ToolCatalogEntry {
   name: string;
@@ -60,9 +66,17 @@ export interface ValidationResult {
 export class ToolRegistry {
   private tools = new Map<string, AgentTool>();
   private bus: AgentEventBus | null;
+  /** Central safety gate (Phase 18) — evaluates EVERY execution, from ANY
+   *  caller. Registries without a gate behave exactly as before. */
+  private safetyGate: ToolSafetyGate | null = null;
 
   constructor(bus?: AgentEventBus) {
     this.bus = bus ?? null;
+  }
+
+  /** Attach the Phase 18 safety gate (single chokepoint, spec §4). */
+  setSafetyGate(gate: ToolSafetyGate | null): void {
+    this.safetyGate = gate;
   }
 
   register(tool: AgentTool): void {
@@ -202,12 +216,30 @@ export class ToolRegistry {
       return this.failure(name, 'not_found', `Unknown tool "${name}"`, false);
     }
 
-    // Permissions
-    const missing = ctx?.permissions?.missing(tool.permissions) ?? [];
-    if (missing.length > 0) {
-      return this.failure(name, 'permission_denied', `Permission denied: missing ${missing.join(', ')}`, false, {
-        missingPermissions: missing,
-      });
+    // Phase 18: central safety gate — when attached, it is the AUTHORITATIVE
+    // permission/risk authority for every execution from every caller (risk
+    // classification, emergency stop, scoped grants, fail-closed unknown
+    // permissions, audit). Denials are structured, non-retryable permission
+    // failures so recovery/planning semantics (SAFE_STOP,
+    // no-replan-around-permissions) apply unchanged. The legacy ctx-based
+    // check below remains ONLY for registries without a gate.
+    let safetyEvaluation: SafetyEvaluation | undefined;
+    if (this.safetyGate) {
+      safetyEvaluation = this.safetyGate.evaluate(name, tool.riskLevel, tool.permissions as string[] | undefined, input ?? {}, { taskId: ctx?.taskId });
+      if (safetyEvaluation.decision !== 'allow') {
+        this.bus?.emit({ name: 'TOOL_FAILED', payload: { tool: name, error: `Safety gate: ${safetyEvaluation.decision} — ${safetyEvaluation.reason}`, safety: safetyEvaluation.decision }, timestamp: Date.now() });
+        return this.failure(name, 'permission_denied', `Safety gate: ${safetyEvaluation.decision} — ${safetyEvaluation.reason}`, false, {
+          safety: safetyEvaluation,
+        });
+      }
+    } else {
+      // Permissions
+      const missing = ctx?.permissions?.missing(tool.permissions) ?? [];
+      if (missing.length > 0) {
+        return this.failure(name, 'permission_denied', `Permission denied: missing ${missing.join(', ')}`, false, {
+          missingPermissions: missing,
+        });
+      }
     }
 
     // Input validation
@@ -225,6 +257,10 @@ export class ToolRegistry {
     try {
       const raw = await tool.execute(input ?? {}, ctx ?? this.nullContext());
       result = { ...raw };
+      // Phase 18: surface the gate decision on the result (successes too).
+      if (safetyEvaluation) {
+        result.metadata = { ...(result.metadata ?? {}), safety: safetyEvaluation };
+      }
     } catch (err: any) {
       const aborted = ctx?.signal?.aborted || err?.name === 'AbortError';
       const kind: ToolErrorKind = aborted ? 'cancelled' : 'execution_error';

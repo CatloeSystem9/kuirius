@@ -16,7 +16,7 @@ import { createBrowserTools } from './browserTools';
 import { createScreenTools } from './vision/screenTools';
 import { ScreenObserver } from './vision/screenObserver';
 import { BrowserCaptureSource } from './vision/browserCapture';
-import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, HeuristicPlanner } from './planner';
+import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, HeuristicPlanner } from './planner';
 import { LearningService } from './learning/learningService';
 import { WorkflowAwarePlanner } from './learning/workflowPlanner';
 import { getMemoryService } from './memory/memoryService';
@@ -31,6 +31,20 @@ import { createComputerUseTools } from './computerUse/computerUseTools';
 import { AdaptiveObserver } from './observation/adaptiveObserver';
 import { BrowserAgent } from './browser/browserAgent';
 import { MultimodalService } from './multimodal/multimodalService';
+import { ProactiveService } from './proactive/proactiveService';
+import { PlanEngine } from './planning';
+import { ResearchService } from './research';
+import { HttpResearchBackend } from './research/researchBackends';
+import { createResearchTools } from './research/researchTools';
+import {
+  CachedClassifier,
+  createDefaultModelRegistry,
+  createRoutingTools,
+  getPerformanceTelemetry,
+  ModelRouter,
+} from './routing';
+import { EmergencyStop, SafetyAuditLog, SafetyGate, ScopedPermissionManager, createSafetyTools, type SafetyToolsDeps } from './safety';
+import { LongRunManager, createLongRunTools } from './longrun';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -65,6 +79,28 @@ export interface AgentSystem {
   learning?: LearningService;
   /** Multimodal intelligence service (Phase 14). */
   multimodal?: MultimodalService;
+  /** Proactive intelligence service (Phase 15). */
+  proactive?: ProactiveService;
+  /** Hierarchical planning engine (Phase 16). */
+  planning?: PlanEngine;
+  /** Deep research intelligence service (additional capability, outside the numbered roadmap). */
+  research?: ResearchService;
+  /** Model routing (Phase 17) — decision-only router over the model registry. */
+  modelRouter?: ModelRouter;
+  /** Passive performance telemetry (Phase 17). */
+  performance?: ReturnType<typeof getPerformanceTelemetry>;
+  /** Safety + permission hardening (Phase 18). */
+  safety?: {
+    gate: SafetyGate;
+    scoped: ScopedPermissionManager;
+    audit: SafetyAuditLog;
+    emergencyStop: EmergencyStop;
+    /** Emergency stop: cancel tasks, revoke temporary grants, block side effects. */
+    emergencyStopNow: (reason: string) => void;
+    resume: () => void;
+  };
+  /** Long-run autonomy (Phase 19) — persistent bounded task sessions. */
+  longRun?: LongRunManager;
   detach: () => void;
 }
 
@@ -84,16 +120,29 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     memory: getMemoryService(),
     taskResolver: (taskId) => store.get(taskId),
   });
+  // Advanced planning (Phase 16): hierarchical plan derivation + validation,
+  // node lifecycle tracking and BOUNDED replanning. Event-driven and idle
+  // between tasks — no polling, no second agent loop; the Agent Core remains
+  // the single executor. Memory recall feeds replanning context only.
+  const planning = new PlanEngine({
+    registry,
+    events: bus,
+    permissions,
+    memory: getMemoryService(),
+  });
   const core = new AgentCore({
     registry,
     events: bus,
     store,
     permissions,
     planner: new WorkflowAwarePlanner(new HeuristicPlanner(), learning),
+    planning,
   });
 
   registry.registerAll(createBrowserTools());
   registry.registerAll(createGlobeTools());
+  // Planner fallback (Phase 1) made real: unclassifiable clauses become
+  // system.note steps; system.note is already registered via createBrowserTools() above.
 
   // Screen vision (Phase 4): native Screen Capture API, gated by the
   // 'screen.observation' permission (default-deny).
@@ -180,9 +229,113 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // Phase 14: CU observations also become multimodal evidence (read-only).
   computerUseAgent.setMultimodal({ recordObservation: (state) => multimodal.context.addInput({ type: 'ui_state', state, source: 'phase7.computerUse' }) });
 
+  // Proactive intelligence (Phase 15): event-driven opportunity detection on
+  // the shared bus — SIGNAL → CONTEXT → DECIDE → SAFETY CHECK → OPTIONAL
+  // ACTION → VERIFY → MEMORY. No polling; presentation via NOTICE events and
+  // the service API; execution only through the existing registry with the
+  // authoritative PermissionManager; LEVEL 4 categories never auto-execute.
+  const proactive = new ProactiveService({
+    registry,
+    permissions,
+    events: bus,
+    memory: getMemoryService(),
+    learning,
+    multimodalContext: multimodal.context,
+  });
+
+  // Deep Research (additional capability, outside the numbered roadmap):
+  // bounded multi-step research loops
+  // (plan → search → inspect → extract → cross-check → gaps → synthesize)
+  // executed THROUGH the ToolRegistry like every other capability. Network
+  // access goes through the local server's /api/research/* endpoints; every
+  // finding cites inspected sources and low evidence yields an honest
+  // low-confidence report instead of manufactured certainty.
+  const research = new ResearchService({
+    backend: new HttpResearchBackend(),
+    registry,
+    events: bus,
+    permissions,
+    multimodal: {
+      addText: (text, source) => {
+        try {
+          multimodal.context.addInput({ type: 'text', text, source });
+        } catch {
+          // multimodal evidence is best-effort — never blocks research
+        }
+      },
+    },
+  });
+  registry.registerAll(createResearchTools(research));
+
+  // Safety + permission hardening (Phase 18): the gate is attached to the
+  // ToolRegistry — the single chokepoint every execution passes through, from
+  // any caller (Agent Core, planning, recovery, proactive, research, tools).
+  // Deterministic risk classification; fail-closed on unknown permissions;
+  // scoped/expiring/revocable grants layered on the session PermissionManager;
+  // bounded redacted audit; emergency stop cancels tasks, revokes temporary
+  // grants and blocks new side effects while read-only work continues.
+  const safetyAudit = new SafetyAuditLog();
+  const scopedPermissions = new ScopedPermissionManager();
+  const emergencyStop = new EmergencyStop(safetyAudit);
+  const safetyGate = new SafetyGate({
+    permissions,
+    scoped: scopedPermissions,
+    emergencyStop,
+    audit: safetyAudit,
+  });
+  registry.setSafetyGate(safetyGate);
+  // Emergency stop reactions (spec §9): cancel active tasks + revoke
+  // temporary grants. The gate blocks new side effects while active;
+  // read-only work continues; deactivate() fully restores operation.
+  emergencyStop.onActivate((reason) => {
+    try {
+      core.cancelAll();
+    } catch {
+      // cancellation is best-effort; the gate still blocks side effects
+    }
+    scopedPermissions.revokeAllTemporary();
+    void reason;
+  });
+  const safetyDeps: SafetyToolsDeps = { gate: safetyGate, scoped: scopedPermissions, audit: safetyAudit, emergencyStop };
+  registry.registerAll(createSafetyTools(safetyDeps));
+  const safety = {
+    gate: safetyGate,
+    scoped: scopedPermissions,
+    audit: safetyAudit,
+    emergencyStop,
+    emergencyStopNow: (reason: string) => {
+      const result = emergencyStop.activate(reason);
+      return result;
+    },
+    resume: () => emergencyStop.deactivate(),
+  };
+
+  // Long-run autonomy (Phase 19): persistent bounded task sessions over the
+  // existing core. Fully event-driven (checkpoints at step boundaries — never
+  // a persistence loop); single-active-session concurrency; resume is NEVER
+  // blind (checkpoint + lifecycle + duplicate-action + budget + emergency
+  // stop revalidated first; Phase 18 re-checks every action at execution).
+  const longRun = new LongRunManager(core, bus, { audit: safetyAudit });
+  longRun.setEmergencyProbe(() => emergencyStop.isActive());
+  registry.registerAll(createLongRunTools({
+    manager: longRun,
+    pollExecutor: async (toolName, input, ctx) =>
+      registry.execute(toolName, input, { taskId: ctx.taskId, stepId: ctx.stepId, signal: ctx.signal, memory: {}, permissions }),
+  }));
+
+  // Model routing (Phase 17): deterministic classification + smallest-capable
+  // model selection over the registry of configured models. Decision-only —
+  // the tools compute routes and read metrics; they execute nothing, so
+  // routing cannot bypass permissions, verification or recovery. Telemetry
+  // is passive: it records events that already happened, nothing else.
+  const performance = getPerformanceTelemetry();
+  const modelRouter = new ModelRouter(createDefaultModelRegistry(), performance);
+  const chatClassifier = new CachedClassifier({ telemetry: performance });
+  registry.registerAll(createRoutingTools(modelRouter, chatClassifier, performance));
+
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, research, modelRouter, performance, safety, longRun };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
@@ -208,6 +361,42 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     }
   });
 
+  // Proactive intelligence (Phase 15): event-driven triggers on the shared bus.
+  const detachProactive = proactive.attach(bus);
+
+  // Deep Research (additional capability): task-lifecycle cleanup of research dossiers.
+  const detachResearch = research.attach(bus);
+
+  // Long-run autonomy (Phase 19): event-driven session advancement on the bus.
+  const detachLongRun = longRun.attach();
+
+  // Performance telemetry (Phase 17): passive recording of tool durations and
+  // task completion times from events that already exist on the bus — no new
+  // instrumentation points, no background work. Bounded bookkeeping.
+  const perfTaskStarts = new Map<string, number>();
+  const detachPerfTool = bus.on('TOOL_COMPLETED', (event) => {
+    const payload = event.payload as { tool?: string; durationMs?: number } | undefined;
+    if (payload?.tool && typeof payload.durationMs === 'number') performance.recordToolDuration(payload.tool, payload.durationMs);
+  });
+  const detachPerfTaskStart = bus.on('TASK_STARTED', (event) => {
+    if (!event.taskId) return;
+    if (perfTaskStarts.size >= 64) perfTaskStarts.delete(perfTaskStarts.keys().next().value as string);
+    perfTaskStarts.set(event.taskId, Date.now());
+  });
+  const detachPerfTaskEnd = bus.on('TASK_COMPLETED', (event) => {
+    const startedAt = event.taskId ? perfTaskStarts.get(event.taskId) : undefined;
+    if (startedAt !== undefined) {
+      performance.recordTaskDuration(Date.now() - startedAt);
+      if (event.taskId) perfTaskStarts.delete(event.taskId);
+    }
+  });
+  const detachPerfTaskFail = bus.on('TASK_FAILED', (event) => {
+    if (event.taskId) perfTaskStarts.delete(event.taskId);
+  });
+  const detachPerfTaskCancel = bus.on('TASK_CANCELLED', (event) => {
+    if (event.taskId) perfTaskStarts.delete(event.taskId);
+  });
+
   return {
     core,
     bus,
@@ -218,11 +407,26 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     keyboardControl,
     learning,
     multimodal,
+    proactive,
+    planning,
+    research,
+    modelRouter,
+    performance,
+    safety,
+    longRun,
     detach: () => {
       detachStepListener();
       detachLearning();
       detachObservation();
       detachMultimodal();
+      detachProactive();
+      detachResearch();
+      detachLongRun();
+      detachPerfTool();
+      detachPerfTaskStart();
+      detachPerfTaskEnd();
+      detachPerfTaskFail();
+      detachPerfTaskCancel();
     },
   };
 }
@@ -267,4 +471,4 @@ export async function runAgentTask(system: AgentSystem, text: string): Promise<A
   return { task, summary: task.summary || '' };
 }
 
-export { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent };
+export { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent };

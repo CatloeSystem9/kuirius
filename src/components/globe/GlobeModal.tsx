@@ -16,6 +16,7 @@ import {
   ExternalLink,
   ChevronRight,
   Info,
+  Loader2,
 } from 'lucide-react';
 import { EarthCanvas } from './EarthCanvas';
 import {
@@ -24,9 +25,11 @@ import {
   MapLayerType,
   GlobeControllerHandle,
   GlobeSearchResult,
+  WindInfoReading,
 } from './types';
 import { AVAILABLE_LAYERS, FUTURE_WEATHER_OVERLAYS } from './layerManager';
 import { GlobeAction, UserLocation } from '../../types';
+import { WEATHER_ATTRIBUTION, WindStatusMeta } from './environment/envService';
 
 interface GlobeModalProps {
   isOpen: boolean;
@@ -51,6 +54,12 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
   const [selectedPin, setSelectedPin] = useState<GlobeMarker | null>(null);
   const [isLayerMenuOpen, setIsLayerMenuOpen] = useState(false);
   const [isWeatherPreviewOpen, setIsWeatherPreviewOpen] = useState(false);
+
+  // Environmental (wind) layer state
+  const [windEnabled, setWindEnabled] = useState(false);
+  const [windStatus, setWindStatus] = useState<WindStatusMeta | null>(null);
+  const [windAtPin, setWindAtPin] = useState<WindInfoReading | null>(null);
+  const [isLoadingPinWind, setIsLoadingPinWind] = useState(false);
 
   // Search State
   const [searchQuery, setSearchQuery] = useState('');
@@ -77,6 +86,22 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
         globeRef.current.addMarker(pin);
       } else if (initialAction.type === 'set_layer' && initialAction.layer) {
         setActiveLayer(initialAction.layer);
+      } else if (initialAction.type === 'wind_on') {
+        setWindEnabled(true);
+        setIsWeatherPreviewOpen(true);
+        if (initialAction.lat !== undefined && initialAction.lng !== undefined) {
+          await globeRef.current.flyTo(initialAction.lat, initialAction.lng, initialAction.zoom || 145);
+          const pin: GlobeMarker = {
+            id: 'agent_pin_' + Date.now(),
+            lat: initialAction.lat,
+            lng: initialAction.lng,
+            label: initialAction.locationName || 'Target Location',
+          };
+          setSelectedPin(pin);
+          globeRef.current.addMarker(pin);
+        }
+      } else if (initialAction.type === 'wind_off') {
+        setWindEnabled(false);
       } else if (initialAction.type === 'reset_view') {
         await globeRef.current.resetToEarthView();
         setSelectedPin(null);
@@ -88,6 +113,32 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
 
     return () => clearTimeout(timer);
   }, [isOpen, initialAction]);
+
+  // Inspect real wind data at the selected pin when the layer is active.
+  useEffect(() => {
+    if (!windEnabled || !selectedPin) {
+      setWindAtPin(null);
+      setIsLoadingPinWind(false);
+      return;
+    }
+    let cancelled = false;
+    setIsLoadingPinWind(true);
+    globeRef.current
+      ?.getWindReadingAt(selectedPin.lat, selectedPin.lng)
+      .then((reading) => {
+        if (cancelled) return;
+        setWindAtPin(reading);
+        setIsLoadingPinWind(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setWindAtPin(null);
+        setIsLoadingPinWind(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedPin, windEnabled]);
 
   if (!isOpen) return null;
 
@@ -323,6 +374,8 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
             onCoordinatesChange={setCursorCoords}
             onLocationSelect={handleGlobeClick}
             selectedMarker={selectedPin}
+            windEnabled={windEnabled}
+            onWindStatusChange={setWindStatus}
           />
         </div>
 
@@ -383,14 +436,37 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
               <span>{AVAILABLE_LAYERS[activeLayer].name}</span>
             </button>
 
-            {/* Environmental Architecture Button (Phase 2 Preview) */}
+            {/* Live Wind Layer Toggle */}
             <button
-              onClick={() => setIsWeatherPreviewOpen(!isWeatherPreviewOpen)}
-              title="Environmental & Live Wind Architecture"
-              className="flex items-center gap-1.5 px-3 py-2.5 bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-cyan-500 hover:bg-blue-950/40 rounded-2xl text-xs text-cyan-300 hover:text-white shadow-lg transition-all cursor-pointer"
+              onClick={() => setWindEnabled(!windEnabled)}
+              title={windEnabled ? 'Turn off wind currents' : 'Show live wind currents'}
+              className={`flex items-center gap-1.5 px-3 py-2.5 rounded-2xl text-xs shadow-lg transition-all cursor-pointer ${
+                windEnabled
+                  ? 'bg-cyan-950/70 border border-cyan-500/60 text-cyan-100'
+                  : 'bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-cyan-500 hover:bg-blue-950/40 text-cyan-300 hover:text-white'
+              }`}
             >
-              <Wind className="w-4 h-4 text-cyan-400 animate-pulse" />
-              <span className="hidden sm:inline">Weather Architecture</span>
+              <Wind
+                className={`w-4 h-4 ${
+                  windStatus?.status === 'live'
+                    ? 'text-cyan-300 shadow-[0_0_8px_#22d3ee]'
+                    : 'text-cyan-400'
+                }`}
+              />
+              <span>Wind</span>
+              {windEnabled && (
+                <span
+                  className={`w-1.5 h-1.5 rounded-full ${
+                    windStatus?.status === 'live'
+                      ? 'bg-cyan-300 shadow-[0_0_6px_#22d3ee]'
+                      : windStatus?.status === 'loading'
+                      ? 'bg-amber-300 animate-pulse'
+                      : windStatus?.status === 'error' || windStatus?.status === 'stale'
+                      ? 'bg-red-400'
+                      : 'bg-amber-300'
+                  }`}
+                />
+              )}
             </button>
           </div>
         </div>
@@ -445,10 +521,19 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
                 — {selectedPin.sublabel}
               </span>
             )}
+            {windEnabled && windAtPin && (
+              <span className="hidden sm:inline text-cyan-300/90 truncate">
+                | WIND: {windAtPin.speedKmh} km/h {windAtPin.cardinal}
+                {windAtPin.stale ? ' (stale)' : ''}
+              </span>
+            )}
+            {windEnabled && !windAtPin && windStatus?.status === 'error' && (
+              <span className="hidden sm:inline text-red-400/80">| WIND: live data unavailable</span>
+            )}
           </div>
         </footer>
 
-        {/* Environmental / Wind Architecture Modal Drawer (Phase 2 Roadmap) */}
+        {/* Atmospheric Engine Panel (live wind layer status & info) */}
         <AnimatePresence>
           {isWeatherPreviewOpen && (
             <motion.div
@@ -472,35 +557,141 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
                 </button>
               </div>
 
-              <div className="text-[11px] text-blue-200/80 leading-relaxed">
-                The Krisha geospatial layer manager has been architected to accept real-time global atmospheric and aerodynamic vector data.
-              </div>
+              {/* Wind Layer Toggle */}
+              <button
+                onClick={() => setWindEnabled(!windEnabled)}
+                className={`w-full flex items-center justify-between p-2.5 rounded-xl text-xs transition-colors cursor-pointer ${
+                  windEnabled
+                    ? 'bg-cyan-600/25 text-cyan-100 border border-cyan-500/50'
+                    : 'bg-blue-950/30 text-slate-300 border border-blue-900/40 hover:border-cyan-500/40 hover:text-white'
+                }`}
+              >
+                <span className="flex items-center gap-2.5">
+                  <Wind className={`w-4 h-4 ${windEnabled ? 'text-cyan-300' : 'text-cyan-400/70'}`} />
+                  <span className="font-medium">Live Wind Currents</span>
+                </span>
+                <span
+                  className={`text-[9px] font-mono px-1.5 py-0.5 rounded uppercase ${
+                    windEnabled ? 'bg-cyan-900/60 text-cyan-300' : 'bg-blue-900/50 text-slate-400'
+                  }`}
+                >
+                  {windEnabled ? 'Active' : 'Off'}
+                </span>
+              </button>
 
-              <div className="space-y-2">
-                <div className="text-[10px] font-mono uppercase text-blue-400 tracking-wider">
-                  Planned Real-Time Overlays
-                </div>
-                {FUTURE_WEATHER_OVERLAYS.map((ov) => (
-                  <div
-                    key={ov.id}
-                    className="p-2.5 rounded-xl bg-blue-950/30 border border-blue-900/40 text-xs"
-                  >
-                    <div className="flex items-center justify-between text-blue-200 font-medium">
-                      <span>{ov.name}</span>
-                      <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-blue-900/50 text-cyan-400">
-                        {ov.provider}
-                      </span>
-                    </div>
-                    <p className="text-[10px] text-blue-400/70 mt-1">{ov.description}</p>
+              {/* Layer status */}
+              {windEnabled && (
+                <div className="space-y-2">
+                  <div className="flex items-center justify-between text-[11px]">
+                    <span className="text-blue-400 font-mono uppercase tracking-wider">Data Feed</span>
+                    <span
+                      className={`flex items-center gap-1.5 font-mono ${
+                        windStatus?.status === 'live'
+                          ? 'text-cyan-300'
+                          : windStatus?.status === 'loading'
+                          ? 'text-amber-300'
+                          : windStatus?.status === 'stale'
+                          ? 'text-orange-300'
+                          : windStatus?.status === 'error'
+                          ? 'text-red-400'
+                          : 'text-slate-400'
+                      }`}
+                    >
+                      {windStatus?.status === 'live' && <span className="w-1.5 h-1.5 rounded-full bg-cyan-300" />}
+                      {windStatus?.status === 'loading' && <Loader2 className="w-3 h-3 animate-spin" />}
+                      {windStatus?.status === 'stale' && <Info className="w-3 h-3" />}
+                      {windStatus?.status === 'error' && <Info className="w-3 h-3" />}
+                      {windStatus?.status ?? 'waiting'}
+                    </span>
                   </div>
-                ))}
-              </div>
+
+                  {windStatus?.status === 'error' && (
+                    <div className="p-2.5 rounded-xl bg-red-950/40 border border-red-800/50 text-[10px] text-red-200">
+                      Live data unavailable{windStatus.message ? `: ${windStatus.message}` : ''}. Check your
+                      connection — the globe itself keeps working.
+                    </div>
+                  )}
+
+                  {windStatus?.status === 'stale' && (
+                    <div className="p-2.5 rounded-xl bg-orange-950/40 border border-orange-800/50 text-[10px] text-orange-200">
+                      Showing the last valid wind field — refresh failed, retrying periodically.
+                    </div>
+                  )}
+
+                  {windStatus && windStatus.vectorCount > 0 && (
+                    <div className="grid grid-cols-2 gap-2 text-[10px]">
+                      <div className="p-2 rounded-lg bg-blue-950/30 border border-blue-900/40">
+                        <div className="text-blue-400/70 font-mono uppercase">Points</div>
+                        <div className="text-blue-200 font-mono">{windStatus.vectorCount}</div>
+                      </div>
+                      <div className="p-2 rounded-lg bg-blue-950/30 border border-blue-900/40">
+                        <div className="text-blue-400/70 font-mono uppercase">Updated</div>
+                        <div className="text-blue-200 font-mono">
+                          {new Date(windStatus.fetchedAt).toLocaleTimeString([], {
+                            hour: '2-digit',
+                            minute: '2-digit',
+                          })}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Selected location wind inspection */}
+              {windEnabled && selectedPin && (
+                <div className="space-y-2">
+                  <div className="text-[10px] font-mono uppercase text-blue-400 tracking-wider flex items-center gap-1.5">
+                    <MapPin className="w-3 h-3" />
+                    Wind at selected location
+                  </div>
+                  {isLoadingPinWind ? (
+                    <div className="flex items-center gap-2 p-2.5 rounded-xl bg-blue-950/30 border border-blue-900/40 text-[10px] text-blue-300">
+                      <Loader2 className="w-3 h-3 animate-spin" /> Reading wind field...
+                    </div>
+                  ) : windAtPin ? (
+                    <div className="p-2.5 rounded-xl bg-cyan-950/30 border border-cyan-800/40 space-y-1.5">
+                      <div className="flex items-baseline justify-between">
+                        <span className="text-lg text-cyan-100 font-mono">{windAtPin.speedKmh} km/h</span>
+                        <span className="text-[10px] font-mono text-cyan-300">
+                          FROM {windAtPin.directionDeg.toFixed(0)}° {windAtPin.cardinal}
+                        </span>
+                      </div>
+                      <div className="text-[10px] font-mono text-cyan-400/80">
+                        {windAtPin.lat.toFixed(3)}°, {windAtPin.lng.toFixed(3)}°
+                        {windAtPin.stale ? ' · stale data' : ' · live'}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="p-2.5 rounded-xl bg-blue-950/30 border border-blue-900/40 text-[10px] text-blue-300/80">
+                      Live data unavailable for this location.
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="p-2.5 rounded-xl bg-cyan-950/30 border border-cyan-800/40 text-[10px] text-cyan-200/90 flex items-start gap-2">
                 <Info className="w-4 h-4 text-cyan-400 shrink-0 mt-0.5" />
                 <span>
-                  <strong>Free-First Real Data</strong>: Uses Open-Meteo & NOAA GFS APIs with 0 paid keys. Streamline flow particle simulation engine ready for Phase 2.
+                  <strong>Free-First Real Data</strong>: {WEATHER_ATTRIBUTION}. No paid keys. Flow follows real
+                  vector data — never random movement.
                 </span>
+              </div>
+
+              {/* Future overlays (architecture roadmap, not yet implemented) */}
+              <div className="space-y-1">
+                <div className="text-[10px] font-mono uppercase text-blue-500/70 tracking-wider">
+                  Planned environmental layers
+                </div>
+                {FUTURE_WEATHER_OVERLAYS.filter((ov) => ov.id !== 'wind_particles').map((ov) => (
+                  <div
+                    key={ov.id}
+                    className="px-2.5 py-1.5 rounded-lg bg-blue-950/20 border border-blue-950/60 text-[10px] text-blue-400/60 flex items-center justify-between"
+                  >
+                    <span>{ov.name}</span>
+                    <span className="font-mono text-[8px] uppercase">soon</span>
+                  </div>
+                ))}
               </div>
             </motion.div>
           )}

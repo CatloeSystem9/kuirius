@@ -1,0 +1,32 @@
+server healthy
+
+[init] full integrated system initialized in 3ms
+  PASS  ToolRegistry initialized (22 tools)
+  PASS  SafetyGate + emergency stop initialized (inactive)
+  PASS  model routing initialized and decision-capable
+  PASS  planning initialized
+  PASS  long-run manager initialized
+  PASS  safety audit initialized
+  PASS  no duplicate tool registration occurs
+
+[capabilities] discovery + lazy loading
+  PASS  capability discovery works (first lazy load + search in 123ms)
+  PASS  discovered capabilities honestly labeled advisory
+  PASS  lazy loading: each source loaded exactly once
+  PASS  catalog metadata-driven (100 cataloged specialist capabilities)
+  PASS  catalog did NOT load one tool per capability (3 control tools only)
+
+[deep research] functional under integration
+  PASS  Deep Research discovers, inspects and cites a source
+
+[capabilities] filesystem/computer/browser remain functional + gated
+  PASS  filesystem capability functional through the integrated registry
+  PASS  planned write executes on the real filesystem
+  PASS  revoked permission → action denied (Phase 18 authoritative)
+  PASS  emergency stop blocks side-effecting actions
+
+[long-run] checkpoint/resume under integration
+  PASS  long-run task completed + checkpointed
+  PASS  cancellation terminal — no resume
+  PASS  no secrets in the audit trail
+  PASS  idle repeated catalog stats stay cheap (cached index)

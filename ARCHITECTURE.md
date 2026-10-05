@@ -1636,3 +1636,213 @@ src/agent/longrun/
 ---
 
 > **Phase 20 — Final Agent Integration — NOT STARTED**
+
+## 26. Long-run autonomy (Phase 19)
+
+**Phase 19 — Long-Run Autonomy** (official roadmap). Principle:
+`PLAN → ACT → VERIFY → CHECKPOINT → CONTINUE`, with
+`INTERRUPT → CHECKPOINT → VALIDATE → RESUME` and
+`RESTART → LOAD → VALIDATE → VERIFY EXTERNAL STATE → RESUME OR BLOCK`.
+Long-running means persistent + recoverable + bounded + safe + resource-aware
+— never infinite, uncontrolled, or constantly running. No second core, no
+second planner, no second recovery framework: everything extends the existing
+Agent Core, Phase 11, Phase 16, Phase 17 and Phase 18 systems.
+
+### 26.1 Task lifecycle (`src/agent/longrun/`)
+
+A TaskSession wraps an EXISTING AgentCore task. Deterministic transition
+table (validated; invalid transitions rejected and audited):
+
+```
+CREATED → RUNNING → { PAUSED | WAITING | BLOCKED | RECOVERING } → RUNNING → COMPLETED
+           ↘ CANCELLED / FAILED / EXPIRED (terminal — never transition out;
+             a cancelled task NEVER resumes)
+PAUSED → RUNNING (only via validated resume) | BLOCKED | CANCELLED | EXPIRED
+```
+
+AgentCore extensions: `startTask()` (detached start — submit without
+awaiting), `resumeTask(taskId)` (revalidates the plan through Phase 16, skips
+completed/skipped/uncertain steps, retries failed/cancelled ones), and
+`cancel(taskId, mode)` — 'pause' mode stores the task as 'interrupted'
+(resumable) with pending steps left 'pending'; 'cancel' remains terminally
+'cancelled'. The long-run manager reads the mode AT cancellation time.
+
+### 26.2 Checkpoints + resume
+
+`SessionCheckpoint` (schema-versioned, ≤24 persisted, `krisha_agent_longrun_v1`
+over the existing StorageAdapter pattern): task id, compact goal, plan
+revision, step records (id/description/toolName/status/attempts/verified —
+NO inputs, NO outputs, NO screenshots, NO secrets), counts, budget +
+consumption, last-action outcome class (DEFINITE_SUCCESS / DEFINITE_FAILURE /
+UNKNOWN), pause/block/failure reasons. Written at meaningful boundaries only:
+one checkpoint per completed step, plus pause/failure/replan/terminal
+transitions — event-driven, never a persistence loop.
+
+Resume (spec §8) validates: checkpoint structure (corrupt → dropped/failed
+safe), lifecycle legality, duplicate-action safety (UNKNOWN last outcome →
+BLOCKED — external verification must establish safety before a side-effecting
+step is retried), budget state, and emergency-stop state. Phase 18 then
+re-checks every action through the gate at execution. Crash scan (manager
+construction): persisted mid-run sessions restore as PAUSED (never
+auto-resumed); stale (>24h) → BLOCKED; corrupt → dropped.
+
+### 26.3 Interruptions, budgets, waiting, concurrency
+
+- Interruptions are differentiated: user pause → PAUSED (resumable, event
+  TASK_PAUSED); user cancel → CANCELLED (terminal); emergency stop → side
+  effects blocked (read-only continues); failure → FAILED with reason;
+  budget exhaustion → EXPIRED with reason + checkpoint.
+- Budgets (spec §11): maxDurationMs (10 min default), maxToolCalls (60),
+  maxRecoveries (6), maxStepCompletions (24) — enforced on events; exhausted →
+  safe stop + checkpoint + EXPIRED; resume requires a fresh budget.
+- Waiting (spec §13): `WAIT → WAKE → VERIFY → CONTINUE` via bounded adaptive
+  polling (interval doubling 500ms → 8s cap, hard timeout, ≤60 polls, optional
+  event wake); timeout → BLOCKED + checkpoint. One timer at a time.
+- Concurrency (spec §23): single-active-session model (start rejected while
+  another session is active).
+
+### 26.4 Integration
+
+Phase 11 recovery (RECOVERY_* events → RECOVERING state; failures flow through
+the existing strategies), Phase 16 planning (resumeTask revalidates through
+attachPlan; checkpointed plan revision; replan events counted), Phase 17
+routing (untouched — decision-only), Phase 18 safety (gate re-evaluates every
+executed or resumed action; checkpoint grants NOTHING; revocation is a
+kill-switch verified on the real machine), Phase 15 proactive (no
+long-run-driven autonomous loops), Deep Research (untouched additional
+capability — its own bounded dossier behavior unchanged, regression suite
+green). Cleanup: terminal checkpoints pruned beyond retention (keepRecent);
+checkpoints cannot inject executable instructions (plan steps only come from
+the core's validated planner; checkpoints store statuses, not code).
+
+### 26.5 Tests & real-machine verification
+
+- `scripts/test-longrun-phase19.ts` (npx tsx): **71 assertions, 0 failed** —
+  transition table (valid/invalid/terminal), checkpoint validation (schema,
+  corruption, staleness, bounds), full lifecycle E2E (start → per-step
+  checkpoints → pause → validated resume → completion with NO re-execution of
+  completed steps and NO duplicate side effect), crash/restart (restore
+  PAUSED, explicit resume, corrupt dropped), duplicate prevention (UNKNOWN
+  blocks, verified success skips), budgets (tool-call exhaustion → EXPIRED,
+  refusal without fresh budget), waiting (adaptive bounded polls, timeout →
+  BLOCKED), safety (emergency stop blocks resume; pause ≠ cancel), single-
+  active concurrency, cleanup, and compatibility (plain submit intact).
+- `scripts/real-machine-check-long-run.ts` (needs the local server; disposable
+  temp directory): **26/26 PASS** — real planned execution with per-step
+  checkpoints; pause mid-task with zero completed duplicate writes; validated
+  resume completing the interrupted write exactly once; bounded adaptive wait
+  (1 poll for an already-true condition); Phase 11 transient-failure retry
+  under the session; honest FAILED with reasons; UNKNOWN outcome blocking
+  resume after a simulated restart; revoked permission → FAILED; emergency
+  stop; terminal cancellation; cleanup; restart scan leaving no session
+  mid-run.
+
+### 26.6 Limitations
+
+Concurrency is deliberately single-active (correctness over throughput).
+Checkpoints are in-memory-per-process in Node tests and localStorage-backed in
+the browser (bounded, not a durable database — multi-device sync is out of
+scope). Waiting predicates are function-based (real event-sourced waits arrive
+with Phase 20's integration surface). Session history is bounded; very long
+tasks exceeding budget require an explicit fresh-budget continuation. No
+automatic crash resume (deliberate safety choice per spec §10).
+
+**Phase 20 — Final Agent Integration — NOT STARTED.**
+
+## 27. Final agent integration (Phase 20)
+
+**Phase 20 — Final Agent Integration — COMPLETE.** Phase 20 integrates the
+existing systems into one coherent agent architecture WITHOUT replacing any
+of them. The pipeline:
+
+```
+INPUT → UNDERSTAND → MEMORY/CONTEXT → GOAL → CAPABILITY DISCOVERY → PLAN
+→ MODEL ROUTING → SAFETY GATE → TOOL/API EXECUTION → RESULT → VERIFY
+→ LEARN/STORE → NEXT STEP → CHECKPOINT → COMPLETION
+```
+
+Authorities unchanged: ToolRegistry = execution authority; Phase 16 =
+planning; Phase 17 = model routing (decision-only); Phase 11 = recovery;
+Phase 18 = safety (every action re-evaluated); Phase 19 = long-run sessions.
+
+### 27.1 New capability layer (`src/agent/capabilities/`)
+
+- `capabilityTypes.ts` — normalized CapabilityRecord + explicit availability
+  states: cataloged / discoverable / advisory / requires_credentials /
+  requires_payment / unavailable. Cataloged ≠ executable, always.
+- `capabilityCatalog.ts` — lazy, metadata-driven index over pluggable
+  CatalogSources: each source loads ONCE on first use (startup stays free of
+  catalog weight); searches are bounded (≤25 results) keyword/tag matches;
+  failing sources degrade to an honest `unavailable` record instead of
+  breaking Krisha; duplicate ids within a source are deduped;
+  `modelHintToTier` maps advisory hints into the Phase 17 tier vocabulary
+  (hints only — the Phase 17 router still decides).
+- `specialistSource.ts` — adapts the PREPARED `krisha-specialists` library
+  (100 metadata-only reasoning definitions across 10 departments, zero
+  runtime dependencies) via async dynamic import — the package loads once,
+  on first catalog use.
+- `capabilityTools.ts` — `capability.search`, `capability.stats`,
+  `capability.by_category`: SAFE/FREE/LOCAL discovery tools. They search
+  metadata and report stats; they execute NOTHING and grant NOTHING — every
+  real action still flows ToolRegistry → Phase 18 gate.
+
+### 27.2 Honest capability accounting (spec §23/§24)
+
+- Cataloged + discoverable + advisory: **100 specialists** (krisha-specialists
+  library). These reason and advise; they do not act on the world.
+- The referenced **1,841-entry Public API catalog file is NOT present in the
+  repository** — stated honestly rather than faked. The catalog layer is
+  source-agnostic: such a catalog plugs in as another lazy CatalogSource and
+  its records would be labeled `cataloged`/`requires_credentials`/
+  `requires_payment`/`unavailable` as appropriate, never silently activated.
+- Verified operational: the integrated tool set (22 tools) + capability
+  discovery — verified on the real machine (below). **0 APIs claimed working
+  without verification.**
+
+### 27.3 Initialization order (spec §17)
+
+Storage → Safety (gate/audit/emergency) → ToolRegistry + tools → Model
+Router → Planner → Recovery (in core) → Long-Run Manager → Capability
+catalog (lazy) → AgentCore → UI bridge → Proactive (event-driven). No
+circular initialization; a failing catalog source degrades to an
+`unavailable` record without preventing startup. Duplicate registration is
+rejected by the registry (verified).
+
+### 27.4 Observability (spec §18)
+
+`capability.stats` exposes sources/availability/category breakdowns +
+per-source lazy-load counts; Phase 17 telemetry records routes/model
+latency/escalations/fallbacks; Phase 18 audit trail records every safety
+decision (redacted, bounded); Phase 19 session diagnostics track lifecycle/
+progress/budgets. All bounded, all passive, no secrets.
+
+### 27.5 Tests & real-machine verification
+
+- `scripts/test-integration-phase20.ts`: **45 assertions, 0 failed** — real
+  catalog load (100/10 departments/advisory labels), search ranking +
+  filters + honest empty results, model-hint→tier mapping, load-once lazy
+  behavior, dedupe, graceful source failure, tools through the gated
+  registry (no execution surface, permissions NOT weakened, invalid input
+  fails closed), full-agent integration (no duplicate registrations, long-run
+  session under the integrated registry, Deep Research coexistence), and
+  performance (first lazy load ~160ms one-time; 50 searches ≈ instant; still
+  exactly one source load).
+- `scripts/real-machine-check-integration.ts` (needs the local server;
+  disposable temp directory): **22/22 PASS** — full integrated system
+  initializes in ~4ms; no duplicate registration; capability discovery with
+  lazy load verified (3 control tools only, NOT one tool per capability);
+  Deep Research discovers/inspects/cites a real source; filesystem
+  capability functional; revoked permission + emergency stop enforced;
+  long-run checkpoint/resume + terminal cancellation; no secrets in the
+  audit trail; idle repeated catalog stats stay cheap (no background work).
+
+### 27.6 Known limitations
+
+The 1,841-entry Public API catalog is not present in the repository; when
+provided, it plugs in as an additional lazy CatalogSource (the layer is
+built for it) — until then only the 100 specialists are cataloged. Specialist
+capabilities are advisory reasoning definitions: they inform planning and
+model hints but do not execute (by design of the prepared library). Voice/
+wake-word and globe remain UI-layer capabilities exposed through the existing
+app surface (their agent-side hooks — globe tools — were already registered
+in Phase 1; no new integration was required).

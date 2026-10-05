@@ -45,6 +45,7 @@ import {
 } from './routing';
 import { EmergencyStop, SafetyAuditLog, SafetyGate, ScopedPermissionManager, createSafetyTools, type SafetyToolsDeps } from './safety';
 import { LongRunManager, createLongRunTools } from './longrun';
+import { CapabilityCatalog, createCapabilityTools, SpecialistCatalogSource } from './capabilities';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -101,6 +102,8 @@ export interface AgentSystem {
   };
   /** Long-run autonomy (Phase 19) — persistent bounded task sessions. */
   longRun?: LongRunManager;
+  /** Capability catalog (Phase 20) — lazy metadata-driven discovery. */
+  capabilities?: CapabilityCatalog;
   detach: () => void;
 }
 
@@ -323,6 +326,15 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       registry.execute(toolName, input, { taskId: ctx.taskId, stepId: ctx.stepId, signal: ctx.signal, memory: {}, permissions }),
   }));
 
+  // Final capability layer (Phase 20): lazy, metadata-driven DISCOVERY over
+  // prepared catalogs (first source: the 100-specialist krisha-specialists
+  // library). Advisory only — search/stats never execute anything and never
+  // bypass planning, routing, or the Phase 18 gate; executable tools remain
+  // exactly the safety-gated ToolRegistry set. The catalog loads lazily on
+  // first search — startup stays free of catalog weight.
+  const capabilities = new CapabilityCatalog([new SpecialistCatalogSource()]);
+  registry.registerAll(createCapabilityTools(capabilities));
+
   // Model routing (Phase 17): deterministic classification + smallest-capable
   // model selection over the registry of configured models. Decision-only —
   // the tools compute routes and read metrics; they execute nothing, so
@@ -335,7 +347,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, research, modelRouter, performance, safety, longRun };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, research, modelRouter, performance, safety, longRun, capabilities };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
@@ -414,6 +426,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     performance,
     safety,
     longRun,
+    capabilities,
     detach: () => {
       detachStepListener();
       detachLearning();

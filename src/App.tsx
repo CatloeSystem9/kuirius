@@ -883,7 +883,8 @@ export default function App() {
     const isGlobeIntent =
       isWindIntent ||
       /\b(globe|3d\s+earth|earth\s+view|satellite\s+view|explore\s+earth|google\s+earth|googleearth|earth\.google|open\s+earth)\b/i.test(text) ||
-      /\b(?:take\s+me\s+to|fly\s+to|show)\s+[a-zA-Z\s]+?\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth|google\s+earth)\b/i.test(text) ||
+      /\b(?:take\s+me\s+to|fly\s+to|show|zoom\s+into|zoom\s+in)\s+[a-zA-Z\s]+?(?:\s+(?:on|in)\s+(?:the\s+)?(?:globe|earth|google\s+earth)|$)\b/i.test(text) ||
+      /\b(maximum\s+(?:available\s+)?detail|highest\s+detail|max\s+detail|globe\s+view|back\s+to\s+globe)\b/i.test(text) ||
       (detectedWebAction?.siteName === 'Google Earth');
 
     if (isGlobeIntent) {
@@ -911,8 +912,51 @@ export default function App() {
         } else {
           detectedGlobeAction = { type: 'wind_on' };
         }
-      } else if (/\b(return|reset|back\s+to\s+earth|full\s+earth)\b/i.test(text)) {
+      } else if (/\b(return|reset|back\s+to\s+(?:earth|globe)|globe\s+view|full\s+earth)\b/i.test(text)) {
+        // e.g. "Go back to globe view"
         detectedGlobeAction = { type: 'reset_view' };
+      } else if (/\b(maximum\s+(?:available\s+)?detail|highest\s+detail|max\s+detail|photorealistic)\b/i.test(text)) {
+        // e.g. "Show this place in maximum available detail"
+        const placeMatch = text.match(/\b(?:for|in|at|show)\s+([a-zA-Z\s]+?)(?:\s+(?:in|with)\s+max|$)/i);
+        const place = placeMatch ? placeMatch[1].trim() : undefined;
+        const targetPlace = place && !['this place', 'this', 'here', 'current'].includes(place.toLowerCase()) ? place : undefined;
+        let coords: { lat?: number; lng?: number } | undefined;
+        if (targetPlace) {
+          try {
+            coords = await geocodeAddress(targetPlace) || undefined;
+          } catch {
+            // fallback
+          }
+        }
+        detectedGlobeAction = {
+          type: 'zoom_detail',
+          locationName: targetPlace,
+          lat: coords?.lat,
+          lng: coords?.lng,
+          zoom: 115,
+          detailLevel: 'photorealistic_3d',
+        };
+      } else if (/\b(?:zoom\s+into|zoom\s+in\s+to|zoom\s+in)\b/i.test(text)) {
+        // e.g. "Zoom into Mumbai"
+        const zoomPlaceMatch = text.match(/\b(?:zoom\s+into|zoom\s+in\s+to|zoom\s+in)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+|$)/i);
+        const place = zoomPlaceMatch ? zoomPlaceMatch[1].trim() : undefined;
+        if (place && !['here', 'it', 'this', 'globe', 'earth'].includes(place.toLowerCase())) {
+          try {
+            const geocoded = await geocodeAddress(place);
+            detectedGlobeAction = {
+              type: 'zoom_detail',
+              locationName: place,
+              lat: geocoded?.lat,
+              lng: geocoded?.lng,
+              zoom: 120,
+              detailLevel: 'city',
+            };
+          } catch {
+            detectedGlobeAction = { type: 'zoom_detail', locationName: place, zoom: 120, detailLevel: 'city' };
+          }
+        } else {
+          detectedGlobeAction = { type: 'zoom_detail', zoom: 120, detailLevel: 'city' };
+        }
       } else if (/\b(satellite)\b/i.test(text)) {
         detectedGlobeAction = { type: 'set_layer', layer: 'satellite' };
       } else if (/\b(dark|night)\b/i.test(text)) {
@@ -923,7 +967,7 @@ export default function App() {
         detectedGlobeAction = { type: 'set_layer', layer: 'standard' };
       } else {
         const placeMatch = text.match(
-          /\b(?:show|take\s+me\s+to|fly\s+to|zoom\s+into|locate|explore)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe|google\s+earth)|$)/i
+          /\b(?:show|take\s+me\s+to|fly\s+to|locate|explore)\s+([a-zA-Z\s]+?)(?:\s+(?:on|in)\s+(?:the\s+)?(?:3d\s+)?(?:earth|globe|google\s+earth)|$)/i
         );
         const place = placeMatch
           ? placeMatch[1].trim()
@@ -936,9 +980,10 @@ export default function App() {
               locationName: place,
               lat: geocoded?.lat,
               lng: geocoded?.lng,
+              zoom: 145,
             };
           } catch {
-            detectedGlobeAction = { type: 'fly_to', locationName: place };
+            detectedGlobeAction = { type: 'fly_to', locationName: place, zoom: 145 };
           }
         } else {
           detectedGlobeAction = { type: 'open_globe' };

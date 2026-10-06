@@ -17,8 +17,10 @@ import {
   ChevronRight,
   Info,
   Loader2,
+  Box,
 } from 'lucide-react';
 import { EarthCanvas } from './EarthCanvas';
+import { EarthViewAdapter } from './providers';
 import {
   GlobeCoordinates,
   GlobeMarker,
@@ -102,6 +104,28 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
         }
       } else if (initialAction.type === 'wind_off') {
         setWindEnabled(false);
+      } else if (initialAction.type === 'zoom_detail') {
+        if (initialAction.lat !== undefined && initialAction.lng !== undefined) {
+          await globeRef.current.flyTo(initialAction.lat, initialAction.lng, initialAction.zoom || 120);
+          globeRef.current.setDetailLevel?.(initialAction.detailLevel || 'city');
+          const pin: GlobeMarker = {
+            id: 'agent_pin_' + Date.now(),
+            lat: initialAction.lat,
+            lng: initialAction.lng,
+            label: initialAction.locationName || 'High Detail View',
+          };
+          setSelectedPin(pin);
+          globeRef.current.addMarker(pin);
+        } else {
+          globeRef.current.setDetailLevel?.(initialAction.detailLevel || 'photorealistic_3d');
+        }
+      } else if (initialAction.type === 'set_detail_mode') {
+        if (initialAction.engineMode) {
+          globeRef.current.setEngineMode?.(initialAction.engineMode);
+        }
+        if (initialAction.detailLevel) {
+          globeRef.current.setDetailLevel?.(initialAction.detailLevel);
+        }
       } else if (initialAction.type === 'reset_view') {
         await globeRef.current.resetToEarthView();
         setSelectedPin(null);
@@ -225,7 +249,7 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
 
     if (globeRef.current) {
       globeRef.current.addMarker(pin);
-      await globeRef.current.flyTo(result.lat, result.lng, 140, 1600);
+      await globeRef.current.flyTo(result.lat, result.lng, 128, 1600);
     }
   };
 
@@ -276,33 +300,31 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
         className="relative w-full h-full sm:max-w-6xl sm:h-[90vh] bg-[#030610] sm:rounded-3xl border border-blue-900/40 shadow-[0_0_60px_rgba(30,58,138,0.35)] flex flex-col overflow-hidden"
       >
         {/* Top Floating Header & Search Bar */}
-        <header className="absolute top-0 inset-x-0 z-30 p-4 sm:p-5 flex flex-col sm:flex-row items-center justify-between gap-3 pointer-events-none">
+        <header className="absolute top-0 inset-x-0 z-30 p-3 sm:p-4 flex items-center justify-between gap-2.5 sm:gap-4 pointer-events-none">
           {/* Brand Badge */}
-          <div className="flex items-center gap-3 bg-[#070c1a]/85 backdrop-blur-xl px-4 py-2.5 rounded-2xl border border-blue-800/40 shadow-lg pointer-events-auto self-start sm:self-auto">
-            <span className="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_10px_#3b82f6] animate-pulse" />
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-xs font-semibold tracking-wider uppercase text-blue-100">
-                  Krisha Earth
-                </span>
-                <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-950/80 text-blue-400 border border-blue-800/50">
-                  3D Geospatial
-                </span>
-              </div>
+          <div className="flex items-center gap-2.5 bg-[#070c1a]/90 backdrop-blur-xl px-3 sm:px-4 py-2 rounded-2xl border border-blue-800/40 shadow-lg pointer-events-auto shrink-0">
+            <span className="w-2.5 h-2.5 rounded-full bg-blue-500 shadow-[0_0_10px_#3b82f6] animate-pulse shrink-0" />
+            <div className="flex items-center gap-2">
+              <span className="text-xs font-semibold tracking-wider uppercase text-blue-100 whitespace-nowrap">
+                Krisha Earth
+              </span>
+              <span className="text-[10px] uppercase font-mono px-1.5 py-0.5 rounded bg-blue-950/80 text-blue-400 border border-blue-800/50 whitespace-nowrap hidden sm:inline">
+                3D Geospatial
+              </span>
             </div>
           </div>
 
-          {/* Search Box */}
-          <div className="relative w-full sm:w-80 pointer-events-auto">
+          {/* Search Box (positioned on right side before action buttons, leaving center completely open) */}
+          <div className="relative w-36 sm:w-52 md:w-64 pointer-events-auto ml-auto">
             <form onSubmit={handleSearch} className="relative flex items-center">
               <input
                 type="text"
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                placeholder="Search city, country, or coordinate..."
-                className="w-full bg-[#070c1a]/90 backdrop-blur-xl border border-blue-800/50 focus:border-blue-400 rounded-2xl pl-10 pr-10 py-2.5 text-xs text-blue-100 placeholder:text-blue-400/50 outline-none transition-all shadow-lg"
+                placeholder="Search city or coord..."
+                className="w-full bg-[#070c1a]/90 backdrop-blur-xl border border-blue-800/50 focus:border-cyan-400 rounded-2xl pl-8 pr-7 py-2 text-xs text-blue-100 placeholder:text-blue-400/50 outline-none transition-all shadow-lg"
               />
-              <Search className="w-4 h-4 text-blue-400 absolute left-3.5 pointer-events-none" />
+              <Search className="w-3.5 h-3.5 text-blue-400 absolute left-2.5 pointer-events-none" />
               {searchQuery && (
                 <button
                   type="button"
@@ -311,9 +333,9 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
                     setSearchResults([]);
                     setSearchError(null);
                   }}
-                  className="absolute right-3 p-1 text-slate-400 hover:text-white"
+                  className="absolute right-2 p-1 text-slate-400 hover:text-white"
                 >
-                  <X className="w-3.5 h-3.5" />
+                  <X className="w-3 h-3" />
                 </button>
               )}
             </form>
@@ -345,30 +367,30 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
           </div>
 
           {/* Top Right Quick Controls */}
-          <div className="flex items-center gap-2 pointer-events-auto self-end sm:self-auto">
+          <div className="flex items-center gap-1.5 sm:gap-2 pointer-events-auto shrink-0">
             {/* Return to Earth View */}
             <button
               onClick={handleResetEarthView}
               title="Return to Full Earth View"
-              className="p-2.5 bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-blue-500 hover:bg-blue-950/50 rounded-2xl text-blue-300 hover:text-white transition-all shadow-lg cursor-pointer"
+              className="p-2 sm:p-2.5 bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-blue-500 hover:bg-blue-950/50 rounded-2xl text-blue-300 hover:text-white transition-all shadow-lg cursor-pointer shrink-0"
             >
-              <RotateCcw className="w-4 h-4" />
+              <RotateCcw className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             </button>
 
             {/* Close Button */}
             <button
               onClick={onClose}
               title="Return to Krisha"
-              className="p-2.5 bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-red-500 hover:bg-red-950/40 rounded-2xl text-slate-300 hover:text-white transition-all shadow-lg cursor-pointer"
+              className="p-2 sm:p-2.5 bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 hover:border-red-500 hover:bg-red-950/40 rounded-2xl text-slate-300 hover:text-white transition-all shadow-lg cursor-pointer shrink-0"
             >
-              <X className="w-4 h-4" />
+              <X className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
             </button>
           </div>
         </header>
 
-        {/* 3D WebGL Earth Canvas Viewport */}
+        {/* 3D WebGL Earth & Google Earth Viewport */}
         <div className="relative flex-1 w-full h-full bg-[#02040a]">
-          <EarthCanvas
+          <EarthViewAdapter
             ref={globeRef}
             activeLayer={activeLayer}
             onCoordinatesChange={setCursorCoords}
@@ -482,6 +504,15 @@ export const GlobeModal: React.FC<GlobeModalProps> = ({
               <Navigation className="w-4 h-4" />
             </button>
           )}
+
+          {/* 3D Tilt / Perspective Toggle */}
+          <button
+            onClick={() => globeRef.current?.toggleTilt?.()}
+            title="Toggle 3D Perspective Tilt (0° top-down / 60° 3D buildings)"
+            className="p-3 bg-[#070c1a]/85 backdrop-blur-xl border border-cyan-800/40 hover:border-cyan-400 hover:bg-cyan-950/40 rounded-2xl text-cyan-300 hover:text-white shadow-lg transition-all cursor-pointer flex items-center justify-center group"
+          >
+            <Box className="w-4 h-4 group-hover:scale-110 transition-transform" />
+          </button>
 
           <div className="flex flex-col bg-[#070c1a]/85 backdrop-blur-xl border border-blue-800/40 rounded-2xl overflow-hidden shadow-lg">
             <button

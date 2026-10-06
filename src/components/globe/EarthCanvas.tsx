@@ -14,12 +14,13 @@ interface EarthCanvasProps {
   selectedMarker?: GlobeMarker | null;
   windEnabled?: boolean;
   onWindStatusChange?: (meta: WindStatusMeta) => void;
+  onDistanceChange?: (distance: number, centerCoords: GlobeCoordinates) => void;
 }
 
 const GLOBE_RADIUS = 100;
 const MIN_DISTANCE = 115;
-const MAX_DISTANCE = 320;
-const DEFAULT_DISTANCE = 240;
+export const MAX_DISTANCE = 1400; // Expansive deep space orbital distance allowing zooming far out beyond default
+export const DEFAULT_DISTANCE = 240;
 
 // Coordinate transformations between Geographic (Lat, Lng) and Cartesian 3D (X, Y, Z)
 export function latLngToVector3(lat: number, lng: number, radius: number = GLOBE_RADIUS): THREE.Vector3 {
@@ -53,7 +54,20 @@ export function vector3ToLatLng(point: THREE.Vector3, radius: number = GLOBE_RAD
 }
 
 export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
-  ({ activeLayer, onCoordinatesChange, onLocationSelect, initialLat = 20, initialLng = 0, selectedMarker, windEnabled = false, onWindStatusChange }, ref) => {
+  (
+    {
+      activeLayer,
+      onCoordinatesChange,
+      onLocationSelect,
+      initialLat = 20,
+      initialLng = 0,
+      selectedMarker,
+      windEnabled = false,
+      onWindStatusChange,
+      onDistanceChange,
+    },
+    ref
+  ) => {
     const containerRef = useRef<HTMLDivElement>(null);
     const sceneRef = useRef<THREE.Scene | null>(null);
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -195,21 +209,40 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
       },
 
       zoomIn: () => {
-        targetSphericalRef.current.radius = THREE.MathUtils.clamp(
-          targetSphericalRef.current.radius - 25,
+        const currentR = targetSphericalRef.current.radius;
+        const step = Math.max(25, currentR * 0.18);
+        const newRadius = THREE.MathUtils.clamp(
+          currentR - step,
           MIN_DISTANCE,
           MAX_DISTANCE
         );
+        targetSphericalRef.current.radius = newRadius;
         isDirtyRef.current = true;
+
+        const phi = sphericalRef.current.phi;
+        const theta = sphericalRef.current.theta;
+        const lat = 90 - (phi * 180) / Math.PI;
+        const lng = (theta * 180) / Math.PI - 180;
+        onDistanceChange?.(newRadius, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)) });
       },
 
       zoomOut: () => {
-        targetSphericalRef.current.radius = THREE.MathUtils.clamp(
-          targetSphericalRef.current.radius + 25,
+        const currentR = targetSphericalRef.current.radius;
+        // Adaptive zoom step: expands smoothly as camera retreats into deep space
+        const step = Math.max(45, currentR * 0.26);
+        const newRadius = THREE.MathUtils.clamp(
+          currentR + step,
           MIN_DISTANCE,
           MAX_DISTANCE
         );
+        targetSphericalRef.current.radius = newRadius;
         isDirtyRef.current = true;
+
+        const phi = sphericalRef.current.phi;
+        const theta = sphericalRef.current.theta;
+        const lat = 90 - (phi * 180) / Math.PI;
+        const lng = (theta * 180) / Math.PI - 180;
+        onDistanceChange?.(newRadius, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)) });
       },
 
       setLayer: (layer: MapLayerType) => {
@@ -362,7 +395,7 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
       sceneRef.current = scene;
 
       // 2. Camera
-      const camera = new THREE.PerspectiveCamera(45, width / height, 1, 2000);
+      const camera = new THREE.PerspectiveCamera(45, width / height, 1, 4000);
       cameraRef.current = camera;
 
       // 3. Renderer with high performance & smooth pixel ratio
@@ -379,11 +412,11 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
       rendererRef.current = renderer;
 
       // 4. Subtle Starfield / Cosmic dust matching Krisha dark anime aesthetic
-      const starCount = 600;
+      const starCount = 800;
       const starGeo = new THREE.BufferGeometry();
       const starPositions = new Float32Array(starCount * 3);
       for (let i = 0; i < starCount * 3; i += 3) {
-        const r = 500 + Math.random() * 400;
+        const r = 850 + Math.random() * 1800;
         const theta = Math.random() * Math.PI * 2;
         const phi = Math.acos(2 * Math.random() - 1);
         starPositions[i] = r * Math.sin(phi) * Math.cos(theta);
@@ -731,14 +764,24 @@ export const EarthCanvas = forwardRef<GlobeControllerHandle, EarthCanvasProps>(
 
     const handleWheel = (e: React.WheelEvent<HTMLDivElement>) => {
       e.preventDefault();
-      // Zoom in / out smoothly
-      const zoomDelta = e.deltaY * 0.15;
-      targetSphericalRef.current.radius = THREE.MathUtils.clamp(
-        targetSphericalRef.current.radius + zoomDelta,
+      // Zoom in / out smoothly with scale-aware delta
+      const currentR = targetSphericalRef.current.radius;
+      const zoomFactor = Math.max(0.6, currentR / DEFAULT_DISTANCE);
+      const zoomDelta = e.deltaY * 0.32 * zoomFactor;
+      const newRadius = THREE.MathUtils.clamp(
+        currentR + zoomDelta,
         MIN_DISTANCE,
         MAX_DISTANCE
       );
+      targetSphericalRef.current.radius = newRadius;
       isDirtyRef.current = true;
+
+      // Report distance and center coordinates for progressive LOD / Google Earth switch
+      const phi = sphericalRef.current.phi;
+      const theta = sphericalRef.current.theta;
+      const lat = 90 - (phi * 180) / Math.PI;
+      const lng = (theta * 180) / Math.PI - 180;
+      onDistanceChange?.(newRadius, { lat: Number(lat.toFixed(4)), lng: Number(lng.toFixed(4)) });
     };
 
     return (

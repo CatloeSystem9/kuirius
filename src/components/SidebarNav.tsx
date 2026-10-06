@@ -115,9 +115,14 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
     }
   };
 
-  // Ultra-fluid Drag-to-Scroll handlers with GPU-friendly RAF batching & momentum physics
+  // Drag-to-scroll handlers (only applied when dragging on container background, never interfering with buttons)
   const handlePointerDown = (e: React.PointerEvent<HTMLElement>) => {
     if (e.button !== 0) return;
+    // Never hijack clicks or pointer events intended for buttons
+    if ((e.target as HTMLElement).closest('button')) {
+      return;
+    }
+
     if (momentumRafRef.current) {
       cancelAnimationFrame(momentumRafRef.current);
       momentumRafRef.current = null;
@@ -149,14 +154,13 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
     if (!isDraggingRef.current || !navRef.current) return;
     const currentY = e.clientY;
     const deltaY = currentY - startYRef.current;
-    if (Math.abs(deltaY) > 3) {
+    if (Math.abs(deltaY) > 4) {
       hasDraggedRef.current = true;
     }
     const now = performance.now();
     const dt = now - lastTimeRef.current;
     if (dt > 4) {
       const v = (currentY - lastYRef.current) / dt;
-      // Exponential smoothing on velocity for clean release momentum
       velocityRef.current = velocityRef.current * 0.35 + v * 0.65;
       lastYRef.current = currentY;
       lastTimeRef.current = now;
@@ -164,7 +168,6 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
 
     targetScrollTopRef.current = startScrollTopRef.current - deltaY;
 
-    // Single RAF throttle: synchronize direct scroll assignment to display refresh rate
     if (!dragRafRef.current) {
       dragRafRef.current = requestAnimationFrame(() => {
         dragRafRef.current = null;
@@ -191,7 +194,6 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
       dragRafRef.current = null;
     }
 
-    // Apply high-FPS fluid momentum inertial decay animation if released with velocity
     if (hasDraggedRef.current && Math.abs(velocityRef.current) > 0.05 && navRef.current) {
       let currentVelocity = velocityRef.current * 16;
       const friction = 0.94;
@@ -208,13 +210,10 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
       momentumRafRef.current = requestAnimationFrame(stepMomentum);
     }
 
-    setTimeout(() => {
-      hasDraggedRef.current = false;
-    }, 60);
+    hasDraggedRef.current = false;
   };
 
   const handleNavClick = (modal: ActiveModal) => {
-    if (hasDraggedRef.current) return;
     onSelectModal(activeModal === modal ? null : modal);
   };
 
@@ -228,10 +227,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
         {/* Top Brand Orb */}
         <div className="shrink-0 mb-2 flex flex-col items-center">
           <button
+            type="button"
             onClick={() => onSelectModal(null)}
             title="Krisha Presence"
             id="krisha-brand-orb"
-            className="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center border border-blue-500/20 hover:border-blue-500/50 hover:bg-blue-500/20 hover:shadow-[0_0_15px_rgba(59,130,246,0.3)] transition-all cursor-pointer group"
+            className="w-10 h-10 rounded-full bg-blue-500/10 flex items-center justify-center border border-blue-500/20 hover:border-blue-500/50 hover:bg-blue-500/20 hover:shadow-[0_0_15px_rgba(59,130,246,0.3)] transition-all cursor-pointer group pointer-events-auto"
           >
             <span className="w-2.5 h-2.5 rounded-full bg-blue-400 shadow-[0_0_8px_#3b82f6] group-hover:scale-110 transition-transform" />
           </button>
@@ -244,15 +244,16 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
           }`}
         >
           <button
+            type="button"
             onClick={() => scrollSmooth(-140)}
             title="Scroll up"
-            className="p-1 rounded-full text-blue-400/80 hover:text-blue-200 hover:bg-blue-500/15 transition-all cursor-pointer"
+            className="p-1 rounded-full text-blue-400/80 hover:text-blue-200 hover:bg-blue-500/15 transition-all cursor-pointer pointer-events-auto"
           >
             <ChevronUp className="w-4 h-4 animate-bounce" />
           </button>
         </div>
 
-        {/* Navigation Options with 60-120 FPS high-performance fluid drag-to-scroll */}
+        {/* Navigation Options */}
         <nav
           ref={navRef}
           onPointerDown={handlePointerDown}
@@ -260,93 +261,116 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
           onPointerUp={endDrag}
           onPointerLeave={endDrag}
           onPointerCancel={endDrag}
-          className={`flex flex-col items-center space-y-5 sm:space-y-6 flex-1 w-full overflow-y-auto overflow-x-hidden smooth-scroll nav-scrollbar py-2 px-1 overscroll-contain transition-colors select-none transform-gpu will-change-scroll ${
-            isDragging ? 'cursor-grabbing' : 'cursor-grab'
-          }`}
+          className="flex flex-col items-center space-y-5 sm:space-y-6 flex-1 w-full overflow-y-auto overflow-x-hidden smooth-scroll nav-scrollbar py-2 px-1 overscroll-contain transition-colors select-none transform-gpu will-change-scroll"
           style={{ touchAction: 'pan-y' }}
         >
           {/* 1. Previous Conversations */}
           <button
+            type="button"
             id="nav-previous-conversations"
             title="Previous Conversations"
-            onClick={() => handleNavClick('conversations')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('conversations');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'conversations'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <History className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'conversations' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 2. Memory */}
           <button
+            type="button"
             id="nav-memory"
             title="Memory"
-            onClick={() => handleNavClick('memory')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('memory');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'memory'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <BrainCircuit className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'memory' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 3. Computer Files & Storage */}
           <button
+            type="button"
             id="nav-files"
             title="Computer Storage & Files"
-            onClick={() => handleNavClick('files')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('files');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'files'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <HardDrive className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'files' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 4. Downloaded Laptop Apps */}
           <button
+            type="button"
             id="nav-apps"
             title="Downloaded Laptop Apps"
-            onClick={() => handleNavClick('apps')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('apps');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'apps'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <Laptop className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'apps' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 5. Google Maps Location */}
           <button
+            type="button"
             id="nav-location"
             title={location?.city ? `Google Maps: ${location.city} (Connected)` : "Google Maps Location"}
-            onClick={() => handleNavClick('location')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('location');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'location'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <MapPin className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'location' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
             {location && (
               <span className="absolute top-2 right-2 w-1.5 h-1.5 rounded-full bg-emerald-400 shadow-[0_0_4px_#34d399]" />
@@ -355,69 +379,89 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
 
           {/* 6. Web & Media Launcher (YouTube, Search, Web) */}
           <button
+            type="button"
             id="nav-web-browser"
             title="Web & Media Launcher (YouTube, Search, Streaming)"
-            onClick={() => handleNavClick('web_browser')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('web_browser');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'web_browser'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <Globe className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'web_browser' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 7. Interactive 3D Earth */}
           <button
+            type="button"
             id="nav-globe"
             title="Interactive 3D Earth / Globe"
-            onClick={() => handleNavClick('globe')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('globe');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'globe'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <Orbit className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'globe' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 8. Audio Transcription (Microphone & Audio Files) */}
           <button
+            type="button"
             id="nav-transcribe"
             title="Transcribe Audio (Microphone & Audio Files with Gemini)"
-            onClick={() => handleNavClick('transcribe')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('transcribe');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'transcribe'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <AudioLines className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'transcribe' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
 
           {/* 9. Settings */}
           <button
+            type="button"
             id="nav-settings"
             title="Settings"
-            onClick={() => handleNavClick('settings')}
-            className={`relative p-3 rounded-2xl transition-all duration-150 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu ${
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('settings');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'settings'
-                ? 'text-blue-300 bg-blue-950/40 border border-blue-800/50 shadow-[0_0_15px_rgba(59,130,246,0.2)]'
-                : 'text-slate-500 hover:text-blue-400 hover:bg-blue-950/20'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
             <Settings className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'settings' && (
-              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3 rounded-full bg-blue-500 shadow-[0_0_6px_#3b82f6]" />
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>
         </nav>

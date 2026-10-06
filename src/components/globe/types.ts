@@ -56,6 +56,12 @@ export interface GlobeControllerHandle {
   clearMarkers: () => void;
   getWindReadingAt: (lat: number, lng: number) => Promise<WindInfoReading | null>;
   isWindDataReady: () => boolean;
+  // Level of detail & swappable geospatial engine extensions
+  setDetailLevel?: (level: 'globe' | 'regional' | 'city' | 'photorealistic_3d') => void;
+  setEngineMode?: (mode: 'threejs' | 'google_earth') => void;
+  getEngineMode?: () => 'threejs' | 'google_earth';
+  getDetailLevel?: () => 'globe' | 'regional' | 'city' | 'photorealistic_3d';
+  toggleTilt?: () => void;
 }
 
 // ---------------------------------------------------------------------------

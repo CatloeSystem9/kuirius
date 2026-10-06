@@ -172,17 +172,149 @@ export function createGlobeTools(): AgentTool[] {
 
   const resetViewTool: AgentTool = {
     name: 'globe.reset_view',
-    description: 'Return the 3D Earth camera to the full planet orbital overview.',
+    description: 'Return the 3D Earth camera to the full planet orbital overview (Three.js globe view).',
     category: 'location',
     riskLevel: 'safe',
     cost: 'free',
-    capabilities: ['globe.reset_view', 'earth.overview'],
+    capabilities: ['globe.reset_view', 'earth.overview', 'globe.back_to_globe'],
     verification: GLOBE_VERIFICATION,
     async execute(): Promise<ToolResult> {
       return ok({
-        output: { reset: true },
+        output: { reset: true, mode: 'globe' },
         ui: [
           { kind: 'globe_action', action: { type: 'reset_view' } },
+        ],
+      });
+    },
+  };
+
+  const zoomDetailTool: AgentTool = {
+    name: 'globe.zoom_detail',
+    description:
+      'Zoom closely into a city, landmark, or current view to progressively stream and display high-detail Google Earth geographic imagery and 3D terrain/buildings.',
+    category: 'location',
+    riskLevel: 'safe',
+    cost: 'free',
+    capabilities: ['globe.zoom_detail', 'globe.zoom_in', 'earth.detail', 'google_earth.zoom'],
+    inputSchema: {
+      optional: ['locationName', 'lat', 'lng', 'detailLevel'],
+      types: {
+        locationName: 'string',
+        lat: 'number',
+        lng: 'number',
+        detailLevel: 'string',
+      },
+    },
+    verification: GLOBE_VERIFICATION,
+    async execute(input): Promise<ToolResult> {
+      let lat = typeof input.lat === 'number' ? input.lat : undefined;
+      let lng = typeof input.lng === 'number' ? input.lng : undefined;
+      const locationName = typeof input.locationName === 'string' ? input.locationName.trim() : undefined;
+      const rawDetail = String(input.detailLevel || 'city').toLowerCase();
+      let detailLevel: 'globe' | 'regional' | 'city' | 'photorealistic_3d' = 'city';
+      if (rawDetail.includes('photo') || rawDetail.includes('max') || rawDetail.includes('building') || rawDetail.includes('street')) {
+        detailLevel = 'photorealistic_3d';
+      } else if (rawDetail.includes('region')) {
+        detailLevel = 'regional';
+      } else if (rawDetail.includes('globe')) {
+        detailLevel = 'globe';
+      }
+
+      if ((lat === undefined || lng === undefined) && locationName) {
+        try {
+          const geocoded = await geocodeAddress(locationName);
+          if (geocoded) {
+            lat = geocoded.lat;
+            lng = geocoded.lng;
+          }
+        } catch (err) {
+          console.warn('Geocoding error in globe.zoom_detail:', err);
+        }
+      }
+
+      const globeAction: GlobeAction = {
+        type: 'zoom_detail',
+        lat,
+        lng,
+        zoom: detailLevel === 'photorealistic_3d' ? 115 : 125,
+        locationName,
+        detailLevel,
+      };
+
+      return ok({
+        output: {
+          zoomed: true,
+          detailLevel,
+          locationName,
+          lat,
+          lng,
+          provider: 'google_earth',
+        },
+        ui: [
+          { kind: 'open_modal', modal: 'globe' },
+          { kind: 'globe_action', action: globeAction },
+          { kind: 'pose', pose: 'waving_greeting' },
+        ],
+      });
+    },
+  };
+
+  const maxDetailTool: AgentTool = {
+    name: 'globe.max_detail',
+    description:
+      'Request the highest supported photorealistic 3D detail and buildings for the current area or specified city/landmark using Google Earth 3D.',
+    category: 'location',
+    riskLevel: 'safe',
+    cost: 'free',
+    capabilities: ['globe.max_detail', 'earth.max_detail', 'google_earth.max'],
+    inputSchema: {
+      optional: ['locationName', 'lat', 'lng'],
+      types: {
+        locationName: 'string',
+        lat: 'number',
+        lng: 'number',
+      },
+    },
+    verification: GLOBE_VERIFICATION,
+    async execute(input): Promise<ToolResult> {
+      let lat = typeof input.lat === 'number' ? input.lat : undefined;
+      let lng = typeof input.lng === 'number' ? input.lng : undefined;
+      const locationName = typeof input.locationName === 'string' ? input.locationName.trim() : undefined;
+
+      if ((lat === undefined || lng === undefined) && locationName) {
+        try {
+          const geocoded = await geocodeAddress(locationName);
+          if (geocoded) {
+            lat = geocoded.lat;
+            lng = geocoded.lng;
+          }
+        } catch (err) {
+          console.warn('Geocoding error in globe.max_detail:', err);
+        }
+      }
+
+      const globeAction: GlobeAction = {
+        type: 'zoom_detail',
+        lat,
+        lng,
+        zoom: 115,
+        locationName,
+        detailLevel: 'photorealistic_3d',
+      };
+
+      return ok({
+        output: {
+          maxDetail: true,
+          detailLevel: 'photorealistic_3d',
+          locationName,
+          lat,
+          lng,
+          provider: 'google_earth',
+        },
+        ui: [
+          { kind: 'open_modal', modal: 'globe' },
+          { kind: 'globe_action', action: globeAction },
+          { kind: 'pose', pose: 'waving_greeting' },
         ],
       });
     },
@@ -340,5 +472,16 @@ export function createGlobeTools(): AgentTool[] {
     },
   };
 
-  return [showGlobeTool, flyToTool, setLayerTool, resetViewTool, getCoordinatesTool, showWindTool, hideWindTool, windInfoTool];
+  return [
+    showGlobeTool,
+    flyToTool,
+    zoomDetailTool,
+    maxDetailTool,
+    setLayerTool,
+    resetViewTool,
+    getCoordinatesTool,
+    showWindTool,
+    hideWindTool,
+    windInfoTool,
+  ];
 }

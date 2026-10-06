@@ -45,7 +45,7 @@ import {
 } from './routing';
 import { EmergencyStop, SafetyAuditLog, SafetyGate, ScopedPermissionManager, createSafetyTools, type SafetyToolsDeps } from './safety';
 import { LongRunManager, createLongRunTools } from './longrun';
-import { CapabilityCatalog, createCapabilityTools, SpecialistCatalogSource } from './capabilities';
+import { CapabilityCatalog, createCapabilityTools, SpecialistCatalogSource, PublicApisCatalogSource } from './capabilities';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -327,12 +327,12 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   }));
 
   // Final capability layer (Phase 20): lazy, metadata-driven DISCOVERY over
-  // prepared catalogs (first source: the 100-specialist krisha-specialists
-  // library). Advisory only — search/stats never execute anything and never
+  // prepared catalogs (krisha-specialists + the supplied public-apis catalog).
+  // Advisory only — search/stats never execute anything and never
   // bypass planning, routing, or the Phase 18 gate; executable tools remain
-  // exactly the safety-gated ToolRegistry set. The catalog loads lazily on
+  // exactly the safety-gated ToolRegistry set. Sources load lazily on
   // first search — startup stays free of catalog weight.
-  const capabilities = new CapabilityCatalog([new SpecialistCatalogSource()]);
+  const capabilities = new CapabilityCatalog([new SpecialistCatalogSource(), new PublicApisCatalogSource()]);
   registry.registerAll(createCapabilityTools(capabilities));
 
   // Model routing (Phase 17): deterministic classification + smallest-capable

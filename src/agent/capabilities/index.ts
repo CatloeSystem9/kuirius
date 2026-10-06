@@ -13,4 +13,5 @@ export * from './capabilityTypes';
 export { CapabilityCatalog, modelHintToTier } from './capabilityCatalog';
 export type { CatalogSource } from './capabilityCatalog';
 export { SpecialistCatalogSource, SPECIALIST_SOURCE_ID, SPECIALIST_FAMILY } from './specialistSource';
+export { PublicApisCatalogSource, PUBLIC_APIS_SOURCE_ID, PUBLIC_APIS_FAMILY } from './publicApisSource';
 export { createCapabilityTools } from './capabilityTools';

@@ -119,6 +119,7 @@ export const ConversationsModal: React.FC<ConversationsModalProps> = ({
                 const isActive = convo.id === activeConversationId;
                 const lastMsg = convo.messages[convo.messages.length - 1]?.content || 'Empty conversation';
                 const hasWebAction = convo.messages.some((m) => Boolean(m.webAction));
+                const hasHabitAction = convo.messages.some((m) => Boolean(m.habitAction));
 
                 return (
                   <div
@@ -139,6 +140,11 @@ export const ConversationsModal: React.FC<ConversationsModalProps> = ({
                         <h3 className="text-xs font-medium text-slate-200 truncate">
                           {convo.title || 'Conversation'}
                         </h3>
+                        {hasHabitAction && (
+                          <span className="text-[9px] px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono">
+                            Habits / Goals
+                          </span>
+                        )}
                         {hasWebAction && (
                           <span className="text-[9px] px-1.5 py-0.5 rounded bg-blue-500/15 border border-blue-500/30 text-blue-300 font-mono">
                             Web / Media

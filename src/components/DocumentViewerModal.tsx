@@ -59,14 +59,8 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
     }
   }, [file]);
 
-  if (!isOpen || !file) return null;
-
-  const isPdf =
-    file.extension.toLowerCase() === 'pdf' ||
-    file.type === 'application/pdf' ||
-    file.name.toLowerCase().endsWith('.pdf');
-
   const activeBlobUrl = React.useMemo(() => {
+    if (!file) return null;
     if (file.blobUrl) return file.blobUrl;
     if (file.fileRef instanceof Blob) {
       try {
@@ -77,6 +71,13 @@ export const DocumentViewerModal: React.FC<DocumentViewerModalProps> = ({
     }
     return null;
   }, [file]);
+
+  if (!isOpen || !file) return null;
+
+  const isPdf =
+    file.extension.toLowerCase() === 'pdf' ||
+    file.type === 'application/pdf' ||
+    file.name.toLowerCase().endsWith('.pdf');
 
   const isImage =
     ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp'].includes(file.extension.toLowerCase()) ||

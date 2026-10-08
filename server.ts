@@ -926,6 +926,7 @@ app.post("/api/chat", async (req, res) => {
     wantsToOpenMaps,
     useMapsGrounding,
     languagePreference = "auto",
+    habitsContext = "",
   } = req.body;
 
   try {
@@ -948,6 +949,15 @@ app.post("/api/chat", async (req, res) => {
 
     const userPreferenceContext = companionNotes.trim()
       ? `\n\n[USER CUSTOM PREFERENCES/NOTES]:\n${companionNotes}`
+      : "";
+
+    const habitsInstruction = habitsContext && habitsContext.trim()
+      ? `\n\n[USER'S DAILY HABITS, GOALS & CALENDAR CONTEXT (TODAY'S SCHEDULE)]:\n${habitsContext.trim()}
+- HABIT COACHING & AFFECTIONATE MOTIVATION:
+  * You actively follow and track ${userName}'s daily goals, habits, and schedule throughout the day.
+  * When ${userName} asks about their goals, asks for a check-in, or reports completing a habit (e.g. drinking water, working out, deep work, reading, reflection), celebrate enthusiastically, cheer them on warmly, and encourage their streak!
+  * If they have pending goals, gently and lovingly prompt them without being overbearing (e.g. "You've already finished hydration, but don't forget your afternoon walk soon! You can do it, I'm cheering for you!").
+  * Acknowledge streaks and celebrate their consistency!`
       : "";
 
     const locationContext = userLocation?.lat !== undefined && userLocation?.lng !== undefined
@@ -991,7 +1001,7 @@ PERSONALITY & FEMININE TONE:
 - Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now!").
 - Your dialogue feels genuine, soft, candid, and alive—NOT robotic, formal, or like a customer service agent.
 - VOICE FIDELITY & NO MID-SENTENCE LAUGHTER: Speak smoothly, cleanly, and naturally. Do NOT type laughter tokens or giggles (such as 'haha', 'hehe', 'ehehe', 'hihi', '*laughs*', '*giggles*'). Let your words flow clearly so the selected voice model pronounces everything faithfully without odd human laughing interruptions.
-- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${locationContext}${languageInstruction}
+- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${habitsInstruction}${locationContext}${languageInstruction}
 - MULTILINGUAL & DYNAMIC LANGUAGE ADAPTATION (CRITICAL DIRECTIVE):
   * You MUST ALWAYS speak and reply in the same language or dialect that the user uses, or in whatever language they explicitly ask for!
   * ENGLISH & HINDI EXCELLENCE:

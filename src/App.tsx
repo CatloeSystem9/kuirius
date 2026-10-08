@@ -14,6 +14,9 @@ import {
   MapsLocationAction,
   UserLocation,
   GlobeAction,
+  DailyHabit,
+  CalendarEvent,
+  HabitAction,
 } from './types';
 import {
   getStoredSettings,
@@ -74,6 +77,25 @@ import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { WebBrowserModal } from './components/WebBrowserModal';
 import { GlobeModal } from './components/globe/GlobeModal';
 import { AudioTranscriptionModal } from './components/AudioTranscriptionModal';
+import { HabitActionCard } from './components/HabitActionCard';
+import { HabitsModal } from './components/HabitsModal';
+import {
+  loadHabits,
+  loadCalendarEvents,
+  toggleHabitCompletion,
+  addHabit,
+  deleteHabit,
+  addCalendarEvent,
+  deleteCalendarEvent,
+  toggleCalendarEvent,
+  formatHabitContextForPrompt,
+  matchHabitInText,
+  isHabitIntent,
+  isCalendarIntent,
+  isHabitCompletionReport,
+  buildHabitAction,
+  getTodayDateString,
+} from './utils/habitStorage';
 
 export default function App() {
   // State
@@ -117,6 +139,62 @@ export default function App() {
   const [activeAppAction, setActiveAppAction] = useState<LaptopAppAction | null>(null);
   const [activeGlobeAction, setActiveGlobeAction] = useState<GlobeAction | null>(null);
   const [initialAppSearch, setInitialAppSearch] = useState<string>('');
+
+  // Daily Habits & Calendar State
+  const [habits, setHabits] = useState<DailyHabit[]>(loadHabits);
+  const [calendarEvents, setCalendarEvents] = useState<CalendarEvent[]>(loadCalendarEvents);
+  const [activeHabitAction, setActiveHabitAction] = useState<HabitAction | null>(null);
+
+  // Daily Habits action handlers
+  const handleToggleHabit = (habitId: string, dateStr?: string) => {
+    const targetDate = dateStr || getTodayDateString();
+    const { habits: updatedHabits, updatedHabit, wasCompleted } = toggleHabitCompletion(
+      habitId,
+      targetDate,
+      habits
+    );
+    setHabits(updatedHabits);
+    if (updatedHabit && wasCompleted) {
+      setForcedPose('waving_greeting');
+      setExpression('happy_sparkle');
+    }
+    if (activeHabitAction) {
+      setActiveHabitAction(buildHabitAction(updatedHabits, 'complete_habit', updatedHabit || undefined));
+    }
+  };
+
+  const handleAddHabit = (
+    habitData: Omit<DailyHabit, 'id' | 'completedDates' | 'streak' | 'bestStreak' | 'createdAt'>
+  ) => {
+    const { habits: updatedHabits } = addHabit(habitData, habits);
+    setHabits(updatedHabits);
+    if (activeHabitAction) {
+      setActiveHabitAction(buildHabitAction(updatedHabits, 'check_in'));
+    }
+  };
+
+  const handleDeleteHabit = (habitId: string) => {
+    const updatedHabits = deleteHabit(habitId, habits);
+    setHabits(updatedHabits);
+    if (activeHabitAction) {
+      setActiveHabitAction(buildHabitAction(updatedHabits, 'check_in'));
+    }
+  };
+
+  const handleAddCalendarEvent = (eventData: Omit<CalendarEvent, 'id'>) => {
+    const updatedEvents = addCalendarEvent(eventData, calendarEvents);
+    setCalendarEvents(updatedEvents);
+  };
+
+  const handleDeleteCalendarEvent = (eventId: string) => {
+    const updatedEvents = deleteCalendarEvent(eventId, calendarEvents);
+    setCalendarEvents(updatedEvents);
+  };
+
+  const handleToggleCalendarEvent = (eventId: string) => {
+    const updatedEvents = toggleCalendarEvent(eventId, calendarEvents);
+    setCalendarEvents(updatedEvents);
+  };
 
   const isWhiteBackground = isDancing || Boolean(lookDirection);
 
@@ -997,6 +1075,47 @@ export default function App() {
       }
     }
 
+    // Check for daily habit & calendar commands or progress tracking
+    let detectedHabitAction: HabitAction | null = null;
+    const isHabitQuery = isHabitIntent(text);
+    const isCalQuery = isCalendarIntent(text);
+    const isCompletionReport = isHabitCompletionReport(text);
+
+    if (isCompletionReport) {
+      const matched = matchHabitInText(text, habits);
+      if (matched) {
+        const targetDate = getTodayDateString();
+        const { habits: nextHabits, updatedHabit, wasCompleted } = toggleHabitCompletion(
+          matched.id,
+          targetDate,
+          habits
+        );
+        setHabits(nextHabits);
+        detectedHabitAction = buildHabitAction(
+          nextHabits,
+          'complete_habit',
+          updatedHabit || undefined,
+          `Marked "${matched.title}" as completed! 🔥 ${updatedHabit?.streak || 1} day streak`
+        );
+        setActiveHabitAction(detectedHabitAction);
+        setForcedPose('waving_greeting');
+        setExpression('happy_sparkle');
+      } else {
+        detectedHabitAction = buildHabitAction(habits, 'check_in');
+        setActiveHabitAction(detectedHabitAction);
+      }
+    } else if (isHabitQuery || isCalQuery) {
+      detectedHabitAction = buildHabitAction(habits, isCalQuery ? 'view_habits' : 'check_in');
+      setActiveHabitAction(detectedHabitAction);
+      if (
+        /\b(open\s+calendar|show\s+calendar|view\s+calendar|calendar\s+view|open\s+habits|show\s+habits|view\s+habits|daily\s+habits)\b/i.test(
+          text
+        )
+      ) {
+        setActiveModal('habits');
+      }
+    }
+
     // Analyze user message sentiment immediately
     const userEmotion = analyzeSentimentAndKeywords(text);
 
@@ -1006,7 +1125,7 @@ export default function App() {
       content: text.trim(),
       timestamp: Date.now(),
       expression:
-        detectedWebAction || detectedFileAction || detectedAppAction || detectedMapsAction || detectedGlobeAction
+        detectedWebAction || detectedFileAction || detectedAppAction || detectedMapsAction || detectedGlobeAction || detectedHabitAction
           ? 'happy_sparkle'
           : userEmotion.expression,
       emotionData: userEmotion,
@@ -1015,6 +1134,7 @@ export default function App() {
       appAction: detectedAppAction || undefined,
       mapsAction: detectedMapsAction || undefined,
       globeAction: detectedGlobeAction || undefined,
+      habitAction: detectedHabitAction || undefined,
     };
 
     let targetConvo = currentConversation;
@@ -1175,6 +1295,7 @@ export default function App() {
           wantsToOpenMaps,
           useMapsGrounding: Boolean(forceMapsGrounding),
           languagePreference: settings.languagePreference || 'auto',
+          habitsContext: formatHabitContextForPrompt(habits, calendarEvents),
         }),
       });
 
@@ -1229,6 +1350,7 @@ export default function App() {
         fileAction: detectedFileAction || undefined,
         appAction: detectedAppAction || undefined,
         mapsAction: resolvedMapsAction || undefined,
+        habitAction: detectedHabitAction || undefined,
         mapsGrounding: mapsGroundingData,
       };
 
@@ -1678,6 +1800,16 @@ export default function App() {
             onChangeLocation={() => setActiveModal('location')}
             isLightMode={isWhiteBackground}
           />
+          <HabitActionCard
+            action={activeHabitAction}
+            onDismiss={() => setActiveHabitAction(null)}
+            onToggleHabit={(habitId) => handleToggleHabit(habitId)}
+            onOpenHabitsModal={() => setActiveModal('habits')}
+            onAskKrishaCheckIn={() =>
+              handleSendMessage("Krisha, let's do our daily habits check-in! How am I doing on my goals today?")
+            }
+            isLightMode={isWhiteBackground}
+          />
           <DirectChatInput
             onSendMessage={handleSendMessage}
             onTypingChange={handleTypingReaction}
@@ -1849,6 +1981,23 @@ export default function App() {
         onClose={() => setActiveModal(null)}
         onSendToChat={(txt) => handleSendMessage(txt)}
         isLightMode={isWhiteBackground}
+      />
+
+      <HabitsModal
+        isOpen={activeModal === 'habits'}
+        onClose={() => setActiveModal(null)}
+        habits={habits}
+        calendarEvents={calendarEvents}
+        onToggleHabit={handleToggleHabit}
+        onAddHabit={handleAddHabit}
+        onDeleteHabit={handleDeleteHabit}
+        onAddCalendarEvent={handleAddCalendarEvent}
+        onDeleteCalendarEvent={handleDeleteCalendarEvent}
+        onToggleCalendarEvent={handleToggleCalendarEvent}
+        onCheckInWithKrisha={() => {
+          setActiveModal(null);
+          handleSendMessage("Krisha, let's do our daily habits check-in! How am I doing on my goals today?");
+        }}
       />
     </div>
   );

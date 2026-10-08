@@ -128,6 +128,59 @@ export interface GlobeAction {
   engineMode?: 'threejs' | 'google_earth';
 }
 
+export type HabitCategory = 'health' | 'productivity' | 'mindfulness' | 'fitness' | 'learning' | 'routine';
+export type HabitTimeOfDay = 'morning' | 'afternoon' | 'evening' | 'anytime';
+export type HabitFrequency = 'daily' | 'weekdays' | 'weekends';
+
+export interface DailyHabit {
+  id: string;
+  title: string;
+  description?: string;
+  category: HabitCategory;
+  timeOfDay: HabitTimeOfDay;
+  targetTime?: string; // HH:mm
+  frequency: HabitFrequency;
+  completedDates: string[]; // YYYY-MM-DD
+  streak: number;
+  bestStreak: number;
+  createdAt: number;
+  reminderEnabled?: boolean;
+  icon?: string;
+  color?: string;
+}
+
+export interface CalendarEvent {
+  id: string;
+  title: string;
+  date: string; // YYYY-MM-DD
+  time?: string; // HH:mm
+  category?: HabitCategory | 'general';
+  completed?: boolean;
+  notes?: string;
+  habitId?: string;
+}
+
+export interface HabitAction {
+  type: 'check_in' | 'complete_habit' | 'add_habit' | 'view_habits' | 'reminder';
+  habitId?: string;
+  habitTitle?: string;
+  summary?: string;
+  todayProgress: {
+    completed: number;
+    total: number;
+    percentage: number;
+  };
+  habits: {
+    id: string;
+    title: string;
+    category: HabitCategory;
+    timeOfDay: HabitTimeOfDay;
+    targetTime?: string;
+    completed: boolean;
+    streak: number;
+  }[];
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -140,6 +193,7 @@ export interface Message {
   appAction?: LaptopAppAction;
   mapsAction?: MapsLocationAction;
   globeAction?: GlobeAction;
+  habitAction?: HabitAction;
   mapsGrounding?: MapsGroundingPlace[];
 }
 
@@ -176,4 +230,5 @@ export type ActiveModal =
   | 'location'
   | 'web_browser'
   | 'globe'
-  | 'transcribe';
+  | 'transcribe'
+  | 'habits';

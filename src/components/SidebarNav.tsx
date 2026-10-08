@@ -9,6 +9,7 @@ import {
   Globe,
   Orbit,
   AudioLines,
+  CalendarCheck,
   ChevronUp,
   ChevronDown,
 } from 'lucide-react';
@@ -443,7 +444,29 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             )}
           </button>
 
-          {/* 9. Settings */}
+          {/* 9. Daily Habits & Calendar */}
+          <button
+            type="button"
+            id="nav-habits"
+            title="Daily Habits & Calendar"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('habits');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
+              activeModal === 'habits'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
+            }`}
+          >
+            <CalendarCheck className="w-5 h-5 transition-transform group-hover:scale-110" />
+            {activeModal === 'habits' && (
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
+            )}
+          </button>
+
+          {/* 10. Settings */}
           <button
             type="button"
             id="nav-settings"
@@ -601,6 +624,19 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             }`}
           >
             <AudioLines className="w-4 h-4" />
+          </button>
+
+          <button
+            id="mobile-nav-habits"
+            title="Daily Habits & Calendar"
+            onClick={() => onSelectModal(activeModal === 'habits' ? null : 'habits')}
+            className={`p-2 rounded-lg text-xs transition-all ${
+              activeModal === 'habits'
+                ? 'text-blue-300 bg-blue-950/50'
+                : 'text-slate-400 hover:text-blue-300'
+            }`}
+          >
+            <CalendarCheck className="w-4 h-4" />
           </button>
 
           <button

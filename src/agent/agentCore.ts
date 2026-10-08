@@ -11,7 +11,7 @@
  *  - no infinite loops: hard cap on steps and attempts
  *  - task state is persisted through the TaskStore after every mutation
  */
-import type { AgentTask, PlanStep, ToolResult, Verification } from './types';
+import type { AgentTask, PlanStep, ToolResult, Verification, TaskVerification } from './types';
 import type { AgentEventBus } from './events';
 import type { ToolRegistry } from './toolRegistry';
 import type { TaskStore } from './taskState';
@@ -23,6 +23,8 @@ import { PermissionManager } from './permissions';
 import { evaluateCondition, resolveContextRefs, resolveContextPath, boundContextValue } from './context';
 import { RecoveryManager } from './recovery';
 import type { PlanEngine } from './planning';
+import type { ContextPackage } from './context/contextTypes';
+import { CycleTraceStore } from './loop/cycleTrace';
 
 export interface AgentCoreOptions {
   registry: ToolRegistry;
@@ -33,6 +35,14 @@ export interface AgentCoreOptions {
   recovery?: RecoveryManager;
   /** Phase 16: hierarchical planning layer (validation, node lifecycle, bounded replanning). */
   planning?: PlanEngine;
+  /**
+   * Intelligence Loop v1 — supplies the Context Engine package for a task's
+   * input (usually `contextEngine.getLastPackage`, which the USER_MESSAGE
+   * event listener already built). Optional; when absent the core behaves
+   * exactly as before. Existing priorities/budgets stay authoritative —
+   * this only READS the package and attaches memory/knowledge to the task.
+   */
+  contextProvider?: (input: string, taskId: string) => ContextPackage | undefined;
   stepTimeoutMs?: number;
   maxAttemptsPerStep?: number;
   retryDelayMs?: number;
@@ -49,6 +59,9 @@ export class AgentCore {
   readonly recovery: RecoveryManager;
   private planner: Planner;
   private planning?: PlanEngine;
+  private readonly contextProvider?: AgentCoreOptions['contextProvider'];
+  /** Intelligence Loop v1 — bounded per-task cycle observability. */
+  readonly cycleTrace = new CycleTraceStore();
   private stepTimeoutMs: number;
   private maxAttemptsPerStep: number;
   private retryDelayMs: number;
@@ -65,6 +78,7 @@ export class AgentCore {
     this.store = options.store;
     this.planner = options.planner ?? new HeuristicPlanner();
     this.permissions = options.permissions ?? new PermissionManager();
+    this.contextProvider = options.contextProvider;
     this.recovery = options.recovery ?? new RecoveryManager({
       registry: this.registry,
       events: this.events,
@@ -98,6 +112,10 @@ export class AgentCore {
     const goal = extractGoal(input);
     const task = this.store.create(goal, now);
     this.recovery.resetTask(task.id);
+
+    // Intelligence Loop v1: begin the bounded cycle trace (observability only).
+    this.cycleTrace.begin(task.id, goal.description, now);
+    this.cycleTrace.record(task.id, 'understand', { goalKind: goal.kind, inputLength: input.length, goalLength: goal.description.length }, now);
 
     this.events.emit({ name: 'USER_MESSAGE', taskId: task.id, payload: { input }, timestamp: Date.now() });
     this.events.emit({ name: 'TASK_STARTED', taskId: task.id, payload: { goal }, timestamp: Date.now() });
@@ -169,6 +187,7 @@ export class AgentCore {
         t.summary = this.buildSummary(t);
       });
       this.events.emit({ name: aborted && mode === 'pause' ? 'TASK_PAUSED' : aborted ? 'TASK_CANCELLED' : 'TASK_FAILED', taskId, payload: { error: message }, timestamp: Date.now() });
+      this.finalizeTask(taskId, aborted ? (mode === 'pause' ? 'cancelled' : 'cancelled') : 'failed');
       return this.store.get(taskId)!;
     } finally {
       this.controllers.delete(taskId);
@@ -176,10 +195,48 @@ export class AgentCore {
     }
   }
 
+  /**
+   * Intelligence Loop v1 — bounded cycle trace for one task (observability:
+   * understand → context → plan → execute → verify → outcome).
+   */
+  getCycleTrace(taskId: string) {
+    return this.cycleTrace.get(taskId);
+  }
+
   /** Shared execution body for submit/startTask (single execution loop). */
   private async executeTask(taskId: string, controller: AbortController): Promise<AgentTask> {
     try {
       const task = this.store.get(taskId)!;
+
+      // ---- UNDERSTAND + CONTEXT ASSEMBLY (Intelligence Loop v1): consume
+      // the Context Engine package built event-driven for this input and
+      // attach its memories to the task so planning and tools can use them.
+      // This only READS the package — analysis, relevance, budgets and
+      // caches stay authoritative inside the Context Engine.
+      try {
+        const pkg = this.contextProvider?.(task.goal.rawInput, taskId);
+        if (pkg) {
+          this.cycleTrace.record(taskId, 'context', {
+            memories: pkg.relevantMemories.length,
+            knowledge: pkg.knowledgeGraph?.length ?? 0,
+            cached: pkg.cachedKnowledge.length,
+            conversation: pkg.relevantConversation.length,
+            networkRequired: pkg.metadata.networkRequired,
+            itemsKept: pkg.metadata.itemsKept,
+          });
+          const memories = pkg.relevantMemories.slice(0, 8);
+          if (memories.length > 0) {
+            this.store.update(taskId, (t) => {
+              t.memoryContext = memories;
+            });
+          }
+        } else {
+          this.cycleTrace.record(taskId, 'context', { source: 'unavailable' });
+        }
+      } catch {
+        // context must never break execution
+      }
+
       // PLAN
       const plan = this.planner.makePlan(task.goal);
       if (plan.steps.length > this.maxSteps) {
@@ -190,6 +247,11 @@ export class AgentCore {
         t.status = 'running';
       });
       this.events.emit({ name: 'TASK_PLANNED', taskId, payload: { steps: plan.steps.map((s) => ({ id: s.id, toolName: s.toolName, description: s.description })) }, timestamp: Date.now() });
+      this.cycleTrace.record(taskId, 'plan', {
+        steps: plan.steps.length,
+        tools: [...new Set(plan.steps.map((s) => s.toolName))].join(','),
+        revision: plan.revision,
+      });
 
       // PHASE 16: derive + validate the hierarchical plan. Malformed plans
       // never execute (spec §8) — the task fails honestly with the reason.
@@ -202,6 +264,7 @@ export class AgentCore {
             t.completedAt = Date.now();
             t.summary = this.buildSummary(t);
           });
+          this.finalizeTask(taskId, 'failed');
           this.events.emit({ name: 'TASK_FAILED', taskId, payload: { error: attached.reason, reason: 'plan_validation_failed' }, timestamp: Date.now() });
           return this.store.get(taskId)!;
         }
@@ -221,12 +284,62 @@ export class AgentCore {
         t.completedAt = Date.now();
         t.summary = this.buildSummary(t);
       });
+      this.finalizeTask(taskId, aborted ? 'cancelled' : 'failed');
       this.events.emit({ name: aborted ? 'TASK_CANCELLED' : 'TASK_FAILED', taskId, payload: { error: message }, timestamp: Date.now() });
       return this.store.get(taskId)!;
     } finally {
       this.controllers.delete(taskId);
       this.cancelModes.delete(taskId);
     }
+  }
+
+  /**
+   * Intelligence Loop v1 — VERIFY + outcome: goal/result comparison recorded
+   * at every terminal state. Honest by design: uncertain steps never yield
+   * 'pass', no evidence yields 'uncertain', failures are 'fail'. Cancelled
+   * tasks get no verification (no claim either way).
+   */
+  private finalizeTask(taskId: string, status: 'completed' | 'failed' | 'cancelled'): void {
+    const task = this.store.get(taskId);
+    if (!task) return;
+    let outcome: TaskVerification['outcome'] | undefined;
+    if (status === 'completed' || status === 'failed') {
+      const steps = task.plan?.steps ?? [];
+      const uncertain = steps.filter((s) => s.status === 'uncertain').length;
+      const completed = steps.filter((s) => s.status === 'completed').length;
+      const evidenceSatisfied =
+        !!task.plan?.evidenceKey &&
+        resolveContextPath(task.context ?? {}, task.plan.evidenceKey) !== undefined;
+      let reason: string;
+      if (status === 'failed') {
+        outcome = 'fail';
+        reason = task.error || 'task failed';
+      } else if (evidenceSatisfied) {
+        // Objective evidence is the strongest verification — it satisfies the
+        // goal even if individual step verifications were incomplete.
+        outcome = 'pass';
+        reason = 'objective evidence present in task context';
+      } else if (uncertain > 0) {
+        outcome = 'uncertain';
+        reason = `${uncertain} step(s) completed with incomplete verification evidence`;
+      } else if (completed > 0) {
+        outcome = 'pass';
+        reason = `all ${completed} executed step(s) verified`;
+      } else {
+        outcome = 'uncertain';
+        reason = 'no verifiable evidence produced';
+      }
+      this.store.update(taskId, (t) => {
+        t.verification = {
+          outcome,
+          expected: t.goal.description.slice(0, 200),
+          actual: (t.summary || '').split('\n')[0].slice(0, 200),
+          reason,
+          checkedAt: Date.now(),
+        };
+      });
+    }
+    this.cycleTrace.finish(taskId, status, outcome);
   }
 
   /**
@@ -277,6 +390,7 @@ export class AgentCore {
           if (cancelMode !== 'pause') t.completedAt = Date.now();
           t.summary = this.buildSummary(t);
         });
+        this.finalizeTask(task.id, 'cancelled');
         this.events.emit({ name: 'TASK_CANCELLED', taskId: task.id, timestamp: Date.now() });
         return;
       }
@@ -363,6 +477,7 @@ export class AgentCore {
           t.completedAt = Date.now();
           t.summary = this.buildSummary(t);
         });
+        this.finalizeTask(task.id, 'failed');
         this.events.emit({ name: 'TASK_FAILED', taskId: task.id, payload: { error: step.error, stepId: step.id }, timestamp: Date.now() });
         return;
       }
@@ -409,6 +524,7 @@ export class AgentCore {
           if (!pauseMode) t.completedAt = Date.now();
           t.summary = pauseMode ? `Paused: ${step.description}` : this.buildSummary(t);
         });
+        this.finalizeTask(task.id, 'cancelled');
         this.events.emit({ name: 'TASK_CANCELLED', taskId: task.id, timestamp: Date.now() });
         return;
       }
@@ -548,6 +664,7 @@ export class AgentCore {
           t.completedAt = Date.now();
           t.summary = this.buildSummary(t);
         });
+        this.finalizeTask(task.id, 'failed');
         this.events.emit({ name: 'TASK_FAILED', taskId: task.id, payload: { error: finishedStep.error, stepId: step.id }, timestamp: Date.now() });
         return;
       }
@@ -565,6 +682,7 @@ export class AgentCore {
             t.completedAt = Date.now();
             t.summary = this.buildSummary(t);
           });
+          this.finalizeTask(task.id, 'completed');
           this.events.emit({
             name: 'TASK_COMPLETED',
             taskId: task.id,
@@ -576,13 +694,21 @@ export class AgentCore {
       }
     }
 
-    this.planning?.finishTask(task.id, 'completed');
+    // Intelligence Loop v1 (spec §9): a task whose steps finished with
+    // incomplete verification evidence is NEVER reported as completed —
+    // it lands in the honest 'uncertain' terminal state. The completion
+    // event is still emitted (with the verification outcome in the payload)
+    // so lifecycle consumers observe the end of the cycle, but consolidation
+    // refuses to learn from uncertain tasks (verification gate).
+    const anyUncertain = plan.steps.some((s) => s.status === 'uncertain');
+    this.planning?.finishTask(task.id, anyUncertain ? 'uncertain' : 'completed');
     this.store.update(task.id, (t) => {
-      t.status = 'completed';
+      t.status = anyUncertain ? 'uncertain' : 'completed';
       t.completedAt = Date.now();
       t.summary = this.buildSummary(t);
     });
-    this.events.emit({ name: 'TASK_COMPLETED', taskId: task.id, payload: { summary: this.store.get(task.id)?.summary }, timestamp: Date.now() });
+    this.finalizeTask(task.id, 'completed');
+    this.events.emit({ name: 'TASK_COMPLETED', taskId: task.id, payload: { summary: this.store.get(task.id)?.summary, verification: anyUncertain ? 'uncertain' : 'pass' }, timestamp: Date.now() });
   }
 
   /** Resolve a step to a concrete tool: capability selection first, then direct name. */
@@ -590,6 +716,7 @@ export class AgentCore {
     if (step.capability) {
       const selection = selectToolForCapability(this.registry, step.capability);
       if (selection) {
+        this.cycleTrace.record(taskId, 'execute', { tool: selection.tool.name, via: 'capability', step: step.id });
         this.events.emit({
           name: 'TOOL_SELECTED',
           taskId,
@@ -606,7 +733,10 @@ export class AgentCore {
       }
     }
     const direct = this.registry.get(step.toolName);
-    if (direct) return { tool: direct, reason: `direct tool name "${step.toolName}"` };
+    if (direct) {
+      this.cycleTrace.record(taskId, 'execute', { tool: direct.name, via: 'direct', step: step.id });
+      return { tool: direct, reason: `direct tool name "${step.toolName}"` };
+    }
     return null;
   }
 

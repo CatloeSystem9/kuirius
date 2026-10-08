@@ -9,7 +9,7 @@ import type { AgentTask, UiEffect } from './types';
 import type { AgentEvent } from './events';
 import { AgentEventBus } from './events';
 import { ToolRegistry } from './toolRegistry';
-import { TaskStore } from './taskState';
+import { TaskStore, localStorageAdapter } from './taskState';
 import { AgentCore } from './agentCore';
 import { PermissionManager } from './permissions';
 import { createBrowserTools } from './browserTools';
@@ -20,6 +20,7 @@ import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, is
 import { LearningService } from './learning/learningService';
 import { WorkflowAwarePlanner } from './learning/workflowPlanner';
 import { getMemoryService } from './memory/memoryService';
+import { ConsolidationEngine } from './memory/consolidation';
 import { ComputerControlService } from './computer/computerControl';
 import { PowerShellMouseBackend } from './computer/powerShellMouse';
 import { createMouseTools } from './computer/mouseTools';
@@ -33,6 +34,9 @@ import { BrowserAgent } from './browser/browserAgent';
 import { MultimodalService } from './multimodal/multimodalService';
 import { ProactiveService } from './proactive/proactiveService';
 import { PlanEngine } from './planning';
+import { ContextEngine } from './context/index';
+import { KnowledgeGraphFacade } from './knowledge/index';
+import { SemanticIntelligence, semanticGraphSource } from './semantic/index';
 import { ResearchService } from './research';
 import { HttpResearchBackend } from './research/researchBackends';
 import { createResearchTools } from './research/researchTools';
@@ -84,6 +88,14 @@ export interface AgentSystem {
   proactive?: ProactiveService;
   /** Hierarchical planning engine (Phase 16). */
   planning?: PlanEngine;
+  /** Context Engine v1 — local-first, cache-first, network-last context selection. */
+  contextEngine?: ContextEngine;
+  /** Knowledge Graph v1 — bounded relationship store complementing memory. */
+  knowledgeGraph?: KnowledgeGraphFacade;
+  /** Semantic Intelligence v1 — bounded local semantic expansion layer. */
+  semantic?: SemanticIntelligence;
+  /** Memory Consolidation v1 — bounded event-driven durable-knowledge engine. */
+  consolidation?: ConsolidationEngine;
   /** Deep research intelligence service (additional capability, outside the numbered roadmap). */
   research?: ResearchService;
   /** Model routing (Phase 17) — decision-only router over the model registry. */
@@ -133,6 +145,45 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     permissions,
     memory: getMemoryService(),
   });
+  // Knowledge Graph v1: bounded relationship store that COMPLEMENTS memory —
+  // memory keeps information, the graph keeps how it is connected. Lazy-loaded
+  // (no I/O at construction), persisted via the same StorageAdapter
+  // convention, deterministic extraction on bus events only.
+  const knowledgeGraph = new KnowledgeGraphFacade({ storage: localStorageAdapter });
+  // Semantic Intelligence v1: lightweight LOCAL semantic expansion layered
+  // UNDER the deterministic relevance stack — exact match first, then
+  // bounded alias/graph/learned expansion through the existing Context
+  // Engine pipeline. Fully offline by default; the Knowledge Graph acts as
+  // one bounded, confidence-filtered expansion source.
+  const semantic = new SemanticIntelligence({
+    graphSource: semanticGraphSource(knowledgeGraph),
+  });
+  // Context Engine v1: local-first, cache-first, network-last context
+  // selection over the existing memory + task state. Event-driven only
+  // (USER_MESSAGE → context package, TASK_COMPLETED → post-result caching),
+  // bounded caches, zero new dependencies — it never polls and never
+  // replaces the Agent Core or the Phase 2 memory service. The knowledge
+  // graph is wired as ONE more targeted source; its statements flow through
+  // the existing relevance + budget pipeline like every other source.
+  const contextEngine = new ContextEngine({
+    memory: getMemoryService(),
+    taskStore: store,
+    cacheStorage: localStorageAdapter,
+    knowledge: { query: (input, limit) => knowledgeGraph.queryStatements(input, limit) },
+    semantic,
+  });
+  // Memory Consolidation v1: bounded, event-driven durable-knowledge engine
+  // layered UNDER the existing memory + graph write paths. MemoryService
+  // stays the only memory writer (its safety rules remain authoritative);
+  // the engine only DECIDES what deserves to persist and observes the same
+  // pre-existing bus events as the Knowledge Indexer — no polling.
+  const consolidation = new ConsolidationEngine({
+    memory: getMemoryService(),
+    knowledge: knowledgeGraph.graph,
+    semantic,
+    storage: localStorageAdapter,
+    getTask: (id) => store.get(id),
+  });
   const core = new AgentCore({
     registry,
     events: bus,
@@ -140,6 +191,11 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     permissions,
     planner: new WorkflowAwarePlanner(new HeuristicPlanner(), learning),
     planning,
+    // Intelligence Loop v1: the task consumes the Context Engine package that
+    // the USER_MESSAGE listener already built (zero extra computation) — its
+    // memories/knowledge are attached to the task before planning, so tools
+    // receive relevantMemories and the cycle is traceable end to end.
+    contextProvider: (input, taskId) => contextEngine.getTaskContext(taskId) ?? contextEngine.buildContext({ input, taskId, now: Date.now() }),
   });
 
   registry.registerAll(createBrowserTools());
@@ -347,7 +403,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, research, modelRouter, performance, safety, longRun, capabilities };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
@@ -375,6 +431,17 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // Proactive intelligence (Phase 15): event-driven triggers on the shared bus.
   const detachProactive = proactive.attach(bus);
+
+  // Context Engine v1: event-driven context building + post-result caching.
+  const detachContext = contextEngine.attach(bus);
+
+  // Knowledge Graph v1: event-driven relationship extraction (decisions,
+  // preferences, task results/tools). Bounded per event; never polls.
+  const detachKnowledge = knowledgeGraph.attach(bus, { getTask: (id) => store.get(id) });
+
+  // Memory Consolidation v1: event-driven durable-knowledge consolidation
+  // (USER_MESSAGE / TASK_COMPLETED). Bounded per event; never polls.
+  const detachConsolidation = consolidation.attach(bus);
 
   // Deep Research (additional capability): task-lifecycle cleanup of research dossiers.
   const detachResearch = research.attach(bus);
@@ -421,6 +488,10 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     multimodal,
     proactive,
     planning,
+    contextEngine,
+    knowledgeGraph,
+    semantic,
+    consolidation,
     research,
     modelRouter,
     performance,
@@ -433,6 +504,9 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       detachObservation();
       detachMultimodal();
       detachProactive();
+      detachContext();
+      detachKnowledge();
+      detachConsolidation();
       detachResearch();
       detachLongRun();
       detachPerfTool();

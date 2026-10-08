@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
@@ -11,6 +12,11 @@ import {
   ModelRouter,
   RequestCoalescer,
 } from "./src/agent/routing";
+// Context Engine v1: local-first, cache-first, network-last context selection.
+// (Imported with an explicit /index specifier: './src/agent/context' already
+// refers to the Phase 10 task-context helper module context.ts.)
+import { ContextEngine, analyzeContext, rankItems, packWithinBudget } from "./src/agent/context/index";
+import type { ContextBudgetConfig, ContextItem, StorageAdapter } from "./src/agent/context/index";
 
 dotenv.config();
 
@@ -808,6 +814,105 @@ async function executeMapsGroundingQuery(
   };
 }
 
+// ---- Context Engine v1 (server side) ----
+// LOCAL-FIRST → CACHE-FIRST → NETWORK-LAST for the server pipeline:
+//  1. chat memories are RANKED + BUDGETED against the current request instead
+//     of being dumped into the prompt unconditionally;
+//  2. research queries consult the persistent cache BEFORE hitting the public
+//     search engines (network-last), and successful searches are cached for
+//     reuse across restarts.
+// The persistent cache uses the same StorageAdapter convention as taskState,
+// backed by a small bounded JSON file. No timers, no polling, no new deps.
+
+/** Tiny JSON-file StorageAdapter (corruption-safe, single-process server). */
+class JsonFileStorage implements StorageAdapter {
+  private map = new Map<string, string>();
+  private loaded = false;
+  constructor(private readonly filePath: string) {}
+  private ensureLoaded(): void {
+    if (this.loaded) return;
+    this.loaded = true;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(this.filePath, "utf8"));
+      if (parsed && typeof parsed === "object") {
+        for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+          this.map.set(k, String(v));
+        }
+      }
+    } catch {
+      // missing/corrupt file → clean start
+    }
+  }
+  private flush(): void {
+    try {
+      fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+      fs.writeFileSync(this.filePath, JSON.stringify(Object.fromEntries(this.map)));
+    } catch {
+      // storage failure is non-fatal for agent operation
+    }
+  }
+  getItem(key: string): string | null {
+    this.ensureLoaded();
+    return this.map.get(key) ?? null;
+  }
+  setItem(key: string, value: string): void {
+    this.ensureLoaded();
+    this.map.set(key, value);
+    this.flush();
+  }
+  removeItem(key: string): void {
+    this.ensureLoaded();
+    this.map.delete(key);
+    this.flush();
+  }
+}
+
+let serverContextEngine: ContextEngine | null = null;
+function getContextEngine(): ContextEngine {
+  if (!serverContextEngine) {
+    serverContextEngine = new ContextEngine({
+      cacheStorage: new JsonFileStorage(path.join(process.cwd(), ".krisha", "context-cache-v1.json")),
+    });
+  }
+  return serverContextEngine;
+}
+
+/** Per-request character budget for chat memory injection. */
+const CHAT_MEMORY_BUDGET: Partial<ContextBudgetConfig> = {
+  maxChars: 2400,
+  priorityCaps: { P0: 1500, P1: 1800, P2: 1000, P3: 500, P4: 0 },
+  truncatable: ["P2", "P3"],
+};
+
+/**
+ * Rank + budget the recalled memories against the current request. Only the
+ * highest-value memories enter the prompt (P1 tier, capped, never blindly
+ * truncated); failures degrade to the previous bounded join.
+ */
+function buildMemoryContext(input: string, memories: string[]): string {
+  if (!Array.isArray(memories) || memories.length === 0) return "";
+  try {
+    const now = Date.now();
+    const requirements = analyzeContext({ input: String(input ?? "") });
+    const items: ContextItem[] = memories
+      .filter((m) => typeof m === "string" && m.trim().length > 0)
+      .map((m, i) => ({
+        id: `server_memory_${i}`,
+        source: "memory" as const,
+        content: m.trim().slice(0, 800),
+        priority: "P1" as const,
+        timestamp: now,
+        chars: m.trim().length,
+      }));
+    const ranked = rankItems(items, requirements, now);
+    const outcome = packWithinBudget(ranked, CHAT_MEMORY_BUDGET);
+    if (outcome.kept.length === 0) return "";
+    return `\n\n[KRISHA'S PERSISTENT MEMORIES ABOUT THE USER]:\n${outcome.kept.map((i) => `- ${i.content}`).join("\n")}`;
+  } catch {
+    return `\n\n[KRISHA'S PERSISTENT MEMORIES ABOUT THE USER]:\n${memories.map((m: string) => `- ${m}`).join("\n")}`;
+  }
+}
+
 // Chat endpoint
 app.post("/api/chat", async (req, res) => {
   const {
@@ -833,9 +938,13 @@ app.post("/api/chat", async (req, res) => {
         ? "\n\n[MANDATORY LANGUAGE PREFERENCE: ENGLISH]\n- The user has set their language preference to English. Reply in fluent English."
         : "\n\n[DYNAMIC MULTILINGUAL RULE: ENGLISH & HINDI EXCELLENCE]\n- Automatically adapt to the user's language. If they write/speak in Hindi (Devanagari or Hinglish) or ask for Hindi, reply warmly in Hindi. If they speak English, reply in English.";
 
-    const memoryContext = memories.length > 0 
-      ? `\n\n[KRISHA'S PERSISTENT MEMORIES ABOUT THE USER]:\n${memories.map((m: string) => `- ${m}`).join("\n")}`
-      : "";
+    // Context Engine v1: budgeted memory injection — rank the recalled
+    // memories against the current request and keep only the highest-value
+    // ones within a bounded budget (no unconditional full-dump).
+    const memoryContext = buildMemoryContext(
+      (messages && messages.length > 0) ? messages[messages.length - 1]?.content || "" : "",
+      memories
+    );
 
     const userPreferenceContext = companionNotes.trim()
       ? `\n\n[USER CUSTOM PREFERENCES/NOTES]:\n${companionNotes}`
@@ -2404,6 +2513,13 @@ app.post("/api/research/search", async (req, res) => {
   if (!query) {
     return res.json({ success: false, error: "Missing search query" });
   }
+  // Context Engine v1: cache-first, network-last — a still-valid cached result
+  // set for this exact query is served instead of re-hitting the public
+  // engines (fresh-only: stale entries are never served for research).
+  const cached = getContextEngine().lookupKnowledge(`research_search:${query}`);
+  if (cached.hit && Array.isArray(cached.value) && cached.value.length > 0) {
+    return res.json({ success: true, engine: "cache", cached: true, results: cached.value });
+  }
   try {
     // Engine waterfall: DuckDuckGo (html → lite) then Bing RSS. The public
     // engines rate-limit by IP, so a fallback keeps research working.
@@ -2415,6 +2531,12 @@ app.post("/api/research/search", async (req, res) => {
     for (const engine of engines) {
       const results = await engine.run();
       if (results.length > 0) {
+        // Post-result caching (spec §13): bounded TTL; oversized result sets
+        // are silently skipped by the cache's size cap — never truncated.
+        getContextEngine().cacheKnowledge(`research_search:${query}`, results, {
+          ttlMs: 6 * 60 * 60_000,
+          source: "research_search",
+        });
         return res.json({ success: true, engine: engine.name, results });
       }
     }

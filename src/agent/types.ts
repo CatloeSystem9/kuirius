@@ -85,7 +85,13 @@ export type TaskStatus =
   | 'completed'
   | 'failed'
   | 'cancelled'
-  | 'interrupted';
+  | 'interrupted'
+  /**
+   * Intelligence Loop v1 (spec §9): steps executed but verification evidence
+   * was incomplete — the goal was NOT verifiably achieved. Honest terminal
+   * state; consolidation refuses to learn from these tasks.
+   */
+  | 'uncertain';
 
 export interface AgentTask {
   id: TaskId;
@@ -102,6 +108,24 @@ export interface AgentTask {
   memoryContext?: string[];
   /** Structured scratchpad carrying results between steps (Phase 10). */
   context?: Record<string, unknown>;
+  /**
+   * Intelligence Loop v1 — goal-level verification (EXPECTED vs ACTUAL).
+   * Honest by design: uncertainty is never reported as success. Recorded at
+   * terminal states; consolidation refuses to learn from 'uncertain'.
+   */
+  verification?: TaskVerification;
+}
+
+/** Goal/result comparison recorded when a task reaches a terminal state. */
+export interface TaskVerification {
+  outcome: 'pass' | 'uncertain' | 'fail';
+  /** What the goal asked for (bounded). */
+  expected: string;
+  /** What the evidence says was actually achieved (bounded). */
+  actual: string;
+  /** Why this outcome was reached (explainability). */
+  reason: string;
+  checkedAt: number;
 }
 
 /** Structured tool result — every tool must return this (Phase 3 contract). */

@@ -2,6 +2,7 @@ node_modules/
 build/
 dist/
 coverage/
+.krisha/
 .DS_Store
 *.log
 .env*

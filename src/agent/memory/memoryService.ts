@@ -354,6 +354,25 @@ export class MemoryService {
     return record;
   }
 
+  /**
+   * Recurrence confirmation (Memory Consolidation v1): an equivalent fact was
+   * seen again — bump confidence/usage/recurrence metadata on the EXISTING
+   * record instead of creating a duplicate. Deterministic and bounded.
+   */
+  confirmRecurrence(id: string, bump = 0.05, maxConfidence = 0.9, lastConfirmedAt?: number): MemoryRecord | null {
+    const record = this.get(id);
+    if (!record) return null;
+    record.confidence = clamp(Math.min(maxConfidence, Math.max(record.confidence, 0) + bump), 0, 1);
+    record.usageCount += 1;
+    const meta = { ...(record.metadata ?? {}) };
+    meta.recurrence = (Number(meta.recurrence) || 1) + 1;
+    if (typeof lastConfirmedAt === 'number') meta.lastConfirmedAt = lastConfirmedAt;
+    record.metadata = meta;
+    record.updatedAt = Date.now();
+    this.store.persist();
+    return record;
+  }
+
   /** Merge two records into one (keeping the stronger metadata). */
   merge(idA: string, idB: string, content?: string): MemoryRecord | null {
     const a = this.get(idA);
@@ -546,7 +565,8 @@ export class MemoryService {
   }
 }
 
-function isContradictory(a: PrefTriple, b: PrefTriple): boolean {
+/** Exported for the consolidation engine's conflict pre-check (same logic, one source of truth). */
+export function isContradictory(a: PrefTriple, b: PrefTriple): boolean {
   // Opposite polarity over the same object: "prefer X" vs "avoid X".
   const oppositePolarity =
     (a.relation === 'prefer' && b.relation === 'avoid') ||

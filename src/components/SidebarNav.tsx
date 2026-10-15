@@ -10,6 +10,7 @@ import {
   Orbit,
   AudioLines,
   CalendarCheck,
+  Gamepad2,
   ChevronUp,
   ChevronDown,
 } from 'lucide-react';
@@ -466,7 +467,29 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             )}
           </button>
 
-          {/* 10. Settings */}
+          {/* 10. Krix Arcade */}
+          <button
+            type="button"
+            id="nav-arcade"
+            title="🎮 Krix Arcade (Games & Strategy)"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('arcade');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
+              activeModal === 'arcade'
+                ? 'text-indigo-200 bg-indigo-600/25 border border-indigo-500/60 shadow-[0_0_18px_rgba(99,102,241,0.4)] ring-1 ring-indigo-400/40'
+                : 'text-slate-400 hover:text-indigo-300 hover:bg-indigo-950/40 border border-transparent hover:border-indigo-500/30 hover:shadow-[0_0_12px_rgba(99,102,241,0.25)]'
+            }`}
+          >
+            <Gamepad2 className="w-5 h-5 transition-transform group-hover:scale-110 group-hover:rotate-6" />
+            {activeModal === 'arcade' && (
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-indigo-400 shadow-[0_0_8px_#818cf8]" />
+            )}
+          </button>
+
+          {/* 11. Settings */}
           <button
             type="button"
             id="nav-settings"
@@ -637,6 +660,19 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             }`}
           >
             <CalendarCheck className="w-4 h-4" />
+          </button>
+
+          <button
+            id="mobile-nav-arcade"
+            title="🎮 Krix Arcade"
+            onClick={() => onSelectModal(activeModal === 'arcade' ? null : 'arcade')}
+            className={`p-2 rounded-lg text-xs transition-all ${
+              activeModal === 'arcade'
+                ? 'text-indigo-300 bg-indigo-950/60 ring-1 ring-indigo-500/40'
+                : 'text-slate-400 hover:text-indigo-300'
+            }`}
+          >
+            <Gamepad2 className="w-4 h-4" />
           </button>
 
           <button

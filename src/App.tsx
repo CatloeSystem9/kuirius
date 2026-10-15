@@ -79,6 +79,8 @@ import { GlobeModal } from './components/globe/GlobeModal';
 import { AudioTranscriptionModal } from './components/AudioTranscriptionModal';
 import { HabitActionCard } from './components/HabitActionCard';
 import { HabitsModal } from './components/HabitsModal';
+import { ArcadeModal } from './components/arcade/ArcadeModal';
+import type { GameId } from './components/arcade/types';
 import {
   loadHabits,
   loadCalendarEvents,
@@ -106,6 +108,7 @@ export default function App() {
   const [activeConvoId, setActiveConvoId] = useState<string | null>(getActiveConversationId);
 
   const [activeModal, setActiveModal] = useState<ActiveModal>(null);
+  const [arcadeInitialGame, setArcadeInitialGame] = useState<GameId | null>(null);
   const [initialFileSearch, setInitialFileSearch] = useState<string>('');
   const [initialFolderFilter, setInitialFolderFilter] = useState<string>('ALL');
   const [activeViewerFile, setActiveViewerFile] = useState<LocalIndexedFile | null>(null);
@@ -1116,6 +1119,34 @@ export default function App() {
       }
     }
 
+    // Arcade & Game Intent Detection
+    if (
+      /\b(open\s+arcade|krix\s+arcade|arcade|play\s+games?|play\s+chess|chess\s+game|play\s+battleship|play\s+sudoku|play\s+snake|play\s+platformer|reaction\s+test|simon\s+says|tangram)\b/i.test(
+        text
+      )
+    ) {
+      if (/\bchess\b/i.test(text)) {
+        setArcadeInitialGame('chess');
+      } else if (/\bbattleship\b/i.test(text)) {
+        setArcadeInitialGame('battleship');
+      } else if (/\bsnake\b/i.test(text)) {
+        setArcadeInitialGame('snake');
+      } else if (/\bsudoku\b/i.test(text)) {
+        setArcadeInitialGame('sudoku');
+      } else if (/\bplatformer\b/i.test(text)) {
+        setArcadeInitialGame('platformer');
+      } else if (/\breaction\b/i.test(text)) {
+        setArcadeInitialGame('reaction_test');
+      } else if (/\bsimon\b/i.test(text)) {
+        setArcadeInitialGame('simon_says');
+      } else if (/\btangram\b/i.test(text)) {
+        setArcadeInitialGame('tangram');
+      } else {
+        setArcadeInitialGame(null);
+      }
+      setActiveModal('arcade');
+    }
+
     // Analyze user message sentiment immediately
     const userEmotion = analyzeSentimentAndKeywords(text);
 
@@ -1998,6 +2029,15 @@ export default function App() {
           setActiveModal(null);
           handleSendMessage("Krisha, let's do our daily habits check-in! How am I doing on my goals today?");
         }}
+      />
+
+      <ArcadeModal
+        isOpen={activeModal === 'arcade'}
+        onClose={() => {
+          setActiveModal(null);
+          setArcadeInitialGame(null);
+        }}
+        initialGameId={arcadeInitialGame}
       />
     </div>
   );

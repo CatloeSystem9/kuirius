@@ -231,4 +231,5 @@ export type ActiveModal =
   | 'web_browser'
   | 'globe'
   | 'transcribe'
-  | 'habits';
+  | 'habits'
+  | 'arcade';

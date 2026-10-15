@@ -55,6 +55,7 @@ import { createBrowserTools as createBrowserAgentTools } from './browser/browser
 import { FilesystemService, ApplicationService } from './system/systemServices';
 import { HttpFsBackend, HttpAppBackend } from './system/httpSystem';
 import { createSystemTools } from './system/systemTools';
+import { DiagnosticsService, createDiagnosticTools } from './diagnostics';
 import { createGlobeTools } from './globeTools';
 
 export interface AgentHost {
@@ -116,6 +117,8 @@ export interface AgentSystem {
   longRun?: LongRunManager;
   /** Capability catalog (Phase 20) — lazy metadata-driven discovery. */
   capabilities?: CapabilityCatalog;
+  /** Self-Diagnostics v1 — runtime health and failure awareness service. */
+  diagnostics?: DiagnosticsService;
   detach: () => void;
 }
 
@@ -397,13 +400,34 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // routing cannot bypass permissions, verification or recovery. Telemetry
   // is passive: it records events that already happened, nothing else.
   const performance = getPerformanceTelemetry();
-  const modelRouter = new ModelRouter(createDefaultModelRegistry(), performance);
+  const defaultModelRegistry = createDefaultModelRegistry();
+  const modelRouter = new ModelRouter(defaultModelRegistry, performance);
   const chatClassifier = new CachedClassifier({ telemetry: performance });
   registry.registerAll(createRoutingTools(modelRouter, chatClassifier, performance));
 
+  // Self-Diagnostics v1: runtime health checks, failure awareness, and verified reporting.
+  const diagnostics = new DiagnosticsService({
+    core,
+    bus,
+    registry,
+    store,
+    storage: localStorageAdapter,
+    permissions,
+    contextEngine,
+    knowledgeGraph,
+    semantic,
+    memory: getMemoryService(),
+    consolidation,
+    recovery: core.recovery,
+    router: modelRouter,
+    modelRegistry: defaultModelRegistry,
+    safetyGate,
+  });
+  registry.registerAll(createDiagnosticTools(diagnostics));
+
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
@@ -448,6 +472,9 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // Long-run autonomy (Phase 19): event-driven session advancement on the bus.
   const detachLongRun = longRun.attach();
+
+  // Self-Diagnostics v1: event-driven failure awareness on the shared bus.
+  const detachDiagnostics = diagnostics.attach(bus);
 
   // Performance telemetry (Phase 17): passive recording of tool durations and
   // task completion times from events that already exist on the bus — no new
@@ -498,6 +525,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     safety,
     longRun,
     capabilities,
+    diagnostics,
     detach: () => {
       detachStepListener();
       detachLearning();
@@ -509,6 +537,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       detachConsolidation();
       detachResearch();
       detachLongRun();
+      detachDiagnostics();
       detachPerfTool();
       detachPerfTaskStart();
       detachPerfTaskEnd();

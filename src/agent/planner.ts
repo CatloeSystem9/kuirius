@@ -483,6 +483,44 @@ export function isResearchRequest(text: string): boolean {
   return clauses.slice(1).every((clause) => REPORT_CLAUSE_RE.test(clause));
 }
 
+/**
+ * Diagnostic intent classification (Self-Diagnostics v1).
+ * Conservative: matches explicit diagnostic queries ("check system health", "run diagnostics", "self-diagnostics").
+ */
+export function classifyDiagnosticIntent(clause: string): StepClassification | null {
+  const text = clause.trim();
+  if (!text) return null;
+
+  if (
+    /^(?:run\s+)?(?:system\s+)?(?:self-?)?diagnostics(?:\s+(?:check|report|suite))?$/i.test(text) ||
+    /^(?:check\s+)?(?:your|system|operational|runtime)?\s*(?:health|diagnostics)(?:\s+(?:check|status|report))?$/i.test(text) ||
+    /^(?:how\s+are\s+you\s+(?:doing|functioning)|system\s+health\s+check)$/i.test(text)
+  ) {
+    return {
+      toolName: 'diagnostics.health',
+      capability: 'diagnostics.health',
+      description: 'Check system health and runtime diagnostics',
+      input: { refresh: true },
+    };
+  }
+
+  const inspectMatch = text.match(/^(?:inspect|diagnose)\s+(?:the\s+)?(core|intelligence|execution|models|persistence|system)\s+(?:subsystem|health)$/i);
+  if (inspectMatch) {
+    return {
+      toolName: 'diagnostics.inspect',
+      capability: 'diagnostics.inspect',
+      description: `Inspect ${inspectMatch[1]} subsystem diagnostics`,
+      input: { subsystem: inspectMatch[1].toLowerCase() },
+    };
+  }
+
+  return null;
+}
+
+export function isDiagnosticIntent(text: string): boolean {
+  return classifyDiagnosticIntent(text) !== null;
+}
+
 /** Classify one clause into an intent (capability) + fallback tool name using the existing detectors. */
 export function classifyStep(clause: string): StepClassification | null {
   const text = clause.trim();
@@ -535,6 +573,10 @@ export function classifyStep(clause: string): StepClassification | null {
   // verbs, file targets stay on the filesystem detectors below.
   const researchIntent = classifyResearchIntent(text);
   if (researchIntent) return researchIntent;
+
+  // 3.8 Self-diagnostics intents (Self-Diagnostics v1)
+  const diagnosticIntent = classifyDiagnosticIntent(text);
+  if (diagnosticIntent) return diagnosticIntent;
 
   // 4. Files (before web: "find resume.pdf" must not become a Google search).
   const fileCmd = parseFileCommand(text);

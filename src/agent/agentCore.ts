@@ -35,6 +35,8 @@ export interface AgentCoreOptions {
   recovery?: RecoveryManager;
   /** Phase 16: hierarchical planning layer (validation, node lifecycle, bounded replanning). */
   planning?: PlanEngine;
+  /** Self-Diagnostics v1: runtime health checks and failure awareness service. */
+  diagnostics?: import('./diagnostics').DiagnosticsService;
   /**
    * Intelligence Loop v1 — supplies the Context Engine package for a task's
    * input (usually `contextEngine.getLastPackage`, which the USER_MESSAGE
@@ -57,6 +59,7 @@ export class AgentCore {
   readonly store: TaskStore;
   readonly permissions: PermissionManager;
   readonly recovery: RecoveryManager;
+  readonly diagnostics?: import('./diagnostics').DiagnosticsService;
   private planner: Planner;
   private planning?: PlanEngine;
   private readonly contextProvider?: AgentCoreOptions['contextProvider'];
@@ -85,6 +88,7 @@ export class AgentCore {
       permissions: this.permissions,
     });
     this.planning = options.planning;
+    this.diagnostics = options.diagnostics;
     this.stepTimeoutMs = options.stepTimeoutMs ?? 30_000;
     this.maxAttemptsPerStep = options.maxAttemptsPerStep ?? 2;
     this.retryDelayMs = options.retryDelayMs ?? 300;

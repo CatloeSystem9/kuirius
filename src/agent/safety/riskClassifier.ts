@@ -37,6 +37,7 @@ const READ_ONLY_TOOLS = new Set([
   'browser.get_state', 'browser.find', 'browser.wait',
   'model.route', 'perf.classify', 'perf.metrics',
   'safety.status', 'safety.audit', 'safety.emergency_stop',
+  'diagnostics.health', 'diagnostics.inspect',
   'system.note', 'chat.report',
   'memory.recall',
 ]);

@@ -13,9 +13,12 @@ import { getPerformanceTelemetry } from '../../routing/telemetry';
 export interface ModelCheckDeps {
   router?: ModelRouter;
   registry?: ModelRegistry;
+  modelRegistry?: ModelRegistry;
 }
 
 export function createModelChecks(deps: ModelCheckDeps): DiagnosticCheckDef[] {
+  const reg = deps.modelRegistry ?? deps.registry;
+
   return [
     {
       id: 'models.registry.profiles',
@@ -25,7 +28,7 @@ export function createModelChecks(deps: ModelCheckDeps): DiagnosticCheckDef[] {
       severity: 'warning',
       checkType: 'configuration',
       run(): DiagnosticCheckOutcome {
-        if (!deps.registry) {
+        if (!reg) {
           return {
             status: 'unknown',
             message: 'ModelRegistry instance not supplied to diagnostics.',
@@ -33,7 +36,7 @@ export function createModelChecks(deps: ModelCheckDeps): DiagnosticCheckDef[] {
           };
         }
 
-        const profiles = deps.registry.list();
+        const profiles = reg.list();
         if (profiles.length === 0) {
           return {
             status: 'degraded',
@@ -53,9 +56,9 @@ export function createModelChecks(deps: ModelCheckDeps): DiagnosticCheckDef[] {
     },
     {
       id: 'models.routing.config',
-      name: 'Model Router Route Computation',
+      name: 'Model Router Wiring',
       subsystem: 'models',
-      description: 'Verifies the Model Router can compute routes without external network calls.',
+      description: 'Passively verifies that a Model Router is attached; no route is computed and no telemetry is mutated.',
       severity: 'warning',
       checkType: 'passive',
       run(): DiagnosticCheckOutcome {
@@ -67,38 +70,11 @@ export function createModelChecks(deps: ModelCheckDeps): DiagnosticCheckDef[] {
           };
         }
 
-        try {
-          const route = deps.router.route({
-            taskType: 'chat',
-            complexity: 'simple',
-            requirements: { reasoning: false, coding: false, vision: false, toolUse: false, structuredOutput: false, streaming: false },
-          });
-
-          if (!route?.selectedModel) {
-            return {
-              status: 'degraded',
-              message: 'Model Router failed to select a model for standard chat requirements.',
-              remediation: 'Review model profile capabilities and routing rules.',
-            };
-          }
-
-          return {
-            status: 'healthy',
-            message: `Model Router selected model "${route.selectedModel.id}" for baseline chat.`,
-            evidence: {
-              selectedModel: route.selectedModel.id,
-              tier: route.selectedModel.tier,
-              reason: route.reason,
-            },
-          };
-        } catch (err: any) {
-          return {
-            status: 'unhealthy',
-            message: `Model Router evaluation failed: ${err?.message || String(err)}`,
-            evidence: { error: String(err) },
-            remediation: 'Inspect ModelRouter routing logic.',
-          };
-        }
+        return {
+          status: 'healthy',
+          message: 'Model Router is configured; diagnostics did not invoke routing or any model.',
+          evidence: { routerAttached: true, modelInvocation: false },
+        };
       },
     },
     {

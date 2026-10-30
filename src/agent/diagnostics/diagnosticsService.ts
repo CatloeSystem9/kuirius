@@ -17,9 +17,11 @@ import type { SemanticIntelligence } from '../semantic/semanticExpander';
 import type { MemoryService } from '../memory/memoryService';
 import type { ConsolidationEngine } from '../memory/consolidation/consolidationEngine';
 import type { RecoveryManager } from '../recovery';
+import type { Planner } from '../planner';
 import type { ModelRouter } from '../routing/router';
 import type { ModelRegistry } from '../routing/modelProfiles';
 import type { SafetyGate } from '../safety';
+import type { EmergencyStop } from '../safety/emergencyStop';
 
 import { DiagnosticRegistry } from './diagnosticRegistry';
 import { FailureTracker } from './failureTracker';
@@ -27,10 +29,12 @@ import type {
   DiagnosticCheckDef,
   DiagnosticCheckResult,
   DiagnosticReport,
+  DiagnosticRunMode,
   DiagnosticStatus,
   FailureEvent,
   FailureRecord,
   IssueDiagnosis,
+  OperationalStateSnapshot,
   SubsystemName,
 } from './diagnosticTypes';
 
@@ -54,20 +58,21 @@ export interface DiagnosticsServiceDeps {
   memory?: MemoryService;
   consolidation?: ConsolidationEngine;
   recovery?: RecoveryManager;
+  planner?: Planner;
   router?: ModelRouter;
   modelRegistry?: ModelRegistry;
   safetyGate?: SafetyGate;
+  emergencyStop?: EmergencyStop;
 }
 
 export class DiagnosticsService {
   readonly registry: DiagnosticRegistry;
   readonly failureTracker: FailureTracker;
   private busListeners: (() => void)[] = [];
-  private lastReport?: DiagnosticReport;
-  private lastReportTime = 0;
+  private reportsByMode = new Map<DiagnosticRunMode, DiagnosticReport>();
   private readonly reportCacheTtlMs = 5000;
 
-  constructor(deps: DiagnosticsServiceDeps = {}) {
+  constructor(private readonly deps: DiagnosticsServiceDeps = {}) {
     this.registry = new DiagnosticRegistry();
     this.failureTracker = new FailureTracker();
 
@@ -75,7 +80,7 @@ export class DiagnosticsService {
     this.registry.registerAll(createCoreChecks(deps));
     this.registry.registerAll(createIntelligenceChecks(deps));
     this.registry.registerAll(createExecutionChecks(deps));
-    this.registry.registerAll(createModelChecks(deps));
+    this.registry.registerAll(createModelChecks({ router: deps.router, modelRegistry: deps.modelRegistry }));
     this.registry.registerAll(createPersistenceChecks(deps));
     this.registry.registerAll(createSystemChecks(deps));
 
@@ -187,7 +192,7 @@ export class DiagnosticsService {
 
   getRecentFailures(limit?: number): FailureRecord[] {
     const list = this.failureTracker.list();
-    return limit ? list.slice(0, limit) : list;
+    return limit ? list.slice(0, Math.max(1, Math.min(limit, 20))) : list.slice(0, 20);
   }
 
   getIssues(): IssueDiagnosis[] {
@@ -195,17 +200,23 @@ export class DiagnosticsService {
   }
 
   /**
-   * Run all diagnostic checks and generate a comprehensive DiagnosticReport.
-   * If called within reportCacheTtlMs, returns the cached report unless refresh=true.
+   * Run local diagnostics on demand. The default is a passive, read-only report.
+   * Cached reports are clearly labeled so a prior diagnostic assessment is never
+   * mistaken for a live operational-state observation.
    */
-  async generateReport(options: { refresh?: boolean } = {}): Promise<DiagnosticReport> {
+  async generateReport(options: { refresh?: boolean; includeActiveProbes?: boolean } = {}): Promise<DiagnosticReport> {
     const now = Date.now();
-    if (!options.refresh && this.lastReport && now - this.lastReportTime < this.reportCacheTtlMs) {
-      return this.lastReport;
+    const runMode: DiagnosticRunMode = options.includeActiveProbes ? 'manual_probe' : 'passive';
+    const cached = this.reportsByMode.get(runMode);
+    if (!options.refresh && cached && now - cached.timestamp < this.reportCacheTtlMs) {
+      return {
+        ...cached,
+        cache: { source: 'cache', ageMs: now - cached.timestamp },
+      };
     }
 
     const start = Date.now();
-    const checkResults = await this.registry.runAll();
+    const checkResults = this.registry.runAll(undefined, { includeActiveProbes: options.includeActiveProbes });
     const durationMs = Date.now() - start;
 
     const subsystemHealth: Record<SubsystemName, DiagnosticStatus> = {
@@ -249,20 +260,24 @@ export class DiagnosticsService {
       overallStatus = 'unknown';
     }
 
-    const activeIssues = this.failureTracker.diagnoseIssues();
-    const recentFailures = this.failureTracker.list();
+    const activeIssues = this.failureTracker.diagnoseIssues().slice(0, 20);
+    const recentFailures = this.failureTracker.list().slice(0, 20);
 
     const summary = overallStatus === 'healthy'
-      ? `All systems operational (${healthyCount}/${checkResults.length} checks passed).`
+      ? `Diagnostic assessment is healthy (${healthyCount}/${checkResults.length} checks passed).`
       : overallStatus === 'degraded'
-      ? `System running in degraded mode (${degradedCount} degraded check(s), ${activeIssues.length} active issue(s)).`
-      : `Critical subsystem failure detected (${unhealthyCount} unhealthy check(s), ${activeIssues.length} active issue(s)).`;
+      ? `Diagnostic assessment is degraded (${degradedCount} degraded check(s), ${activeIssues.length} tracked issue(s)).`
+      : `Diagnostic assessment found ${unhealthyCount} unhealthy check(s) and ${activeIssues.length} tracked issue(s).`;
 
     const report: DiagnosticReport = {
+      diagnosticStatus: overallStatus,
       overallStatus,
       summary,
       timestamp: now,
       durationMs,
+      runMode,
+      cache: { source: 'fresh', ageMs: 0 },
+      operationalState: this.observeOperationalState(now),
       subsystemHealth,
       checkResults,
       activeIssues,
@@ -273,12 +288,32 @@ export class DiagnosticsService {
         degradedChecks: degradedCount,
         unhealthyChecks: unhealthyCount,
         unknownChecks: unknownCount,
-        activeFailuresCount: recentFailures.length,
+        trackedFailureCount: this.failureTracker.count(),
+        reportedFailureCount: recentFailures.length,
       },
     };
 
-    this.lastReport = report;
-    this.lastReportTime = now;
+    this.reportsByMode.set(runMode, report);
     return report;
+  }
+
+  /** Read control-plane state without treating it as a diagnostic conclusion. */
+  private observeOperationalState(observedAt: number): OperationalStateSnapshot {
+    const unavailableSources: string[] = [];
+    const state: OperationalStateSnapshot = { observedAt, unavailableSources };
+
+    if (this.deps.core) {
+      state.activeTaskCount = this.deps.core.getActiveTaskCount();
+    } else {
+      unavailableSources.push('AgentCore active-task snapshot');
+    }
+
+    if (this.deps.emergencyStop) {
+      state.emergencyStopActive = this.deps.emergencyStop.isActive();
+    } else {
+      unavailableSources.push('EmergencyStop state');
+    }
+
+    return state;
   }
 }

@@ -12,6 +12,7 @@ import type {
   IssueDiagnosis,
   SubsystemName,
 } from './diagnosticTypes';
+import { redactText } from '../safety/safetyTypes';
 
 export const MAX_FAILURE_RECORDS = 50;
 
@@ -49,7 +50,7 @@ export function inferAffectedCapabilities(subsystem: SubsystemName, source: stri
 /** Generates a stable deduplication fingerprint from error text. */
 export function createFailureFingerprint(subsystem: SubsystemName, source: string, error: string): string {
   // Normalize dynamic parts like timestamps, paths, or session IDs
-  const normalizedError = error
+  const normalizedError = redactText(error)
     .toLowerCase()
     .replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, '<uuid>')
     .replace(/\b\d{10,13}\b/g, '<timestamp>')
@@ -65,7 +66,7 @@ export class FailureTracker {
   private maxRecords: number;
 
   constructor(maxRecords: number = MAX_FAILURE_RECORDS) {
-    this.maxRecords = maxRecords;
+    this.maxRecords = Math.max(1, Math.min(Math.floor(maxRecords) || 1, MAX_FAILURE_RECORDS));
   }
 
   /**
@@ -74,33 +75,36 @@ export class FailureTracker {
    */
   recordFailure(event: FailureEvent): FailureRecord {
     const now = event.timestamp ?? Date.now();
-    const fingerprint = createFailureFingerprint(event.subsystem, event.source, event.error);
+    const source = redactText(event.source);
+    const error = redactText(event.error);
+    const fingerprint = createFailureFingerprint(event.subsystem, source, error);
     const existing = this.records.get(fingerprint);
 
     if (existing) {
       existing.occurrences += 1;
       existing.lastSeen = now;
-      existing.error = event.error;
-      if (event.taskId) existing.taskId = event.taskId;
-      if (event.stepId) existing.stepId = event.stepId;
-      if (event.toolName) existing.toolName = event.toolName;
+      existing.error = error;
+      if (event.taskId) existing.taskId = redactText(event.taskId);
+      if (event.stepId) existing.stepId = redactText(event.stepId);
+      if (event.toolName) existing.toolName = redactText(event.toolName);
       if (event.recoveryOutcome) existing.lastRecoveryOutcome = event.recoveryOutcome;
       return existing;
     }
 
-    const affectedCapabilities = inferAffectedCapabilities(event.subsystem, event.toolName || event.source);
+    const toolName = event.toolName ? redactText(event.toolName) : undefined;
+    const affectedCapabilities = inferAffectedCapabilities(event.subsystem, toolName || source);
 
     const newRecord: FailureRecord = {
       fingerprint,
       subsystem: event.subsystem,
-      source: event.source,
-      error: event.error,
+      source,
+      error,
       occurrences: 1,
       firstSeen: now,
       lastSeen: now,
-      taskId: event.taskId,
-      stepId: event.stepId,
-      toolName: event.toolName,
+      taskId: event.taskId ? redactText(event.taskId) : undefined,
+      stepId: event.stepId ? redactText(event.stepId) : undefined,
+      toolName,
       affectedCapabilities,
       lastRecoveryOutcome: event.recoveryOutcome,
     };
@@ -136,8 +140,13 @@ export class FailureTracker {
     return found;
   }
 
-  list(): FailureRecord[] {
-    return Array.from(this.records.values()).sort((a, b) => b.lastSeen - a.lastSeen);
+  list(limit: number = MAX_FAILURE_RECORDS): FailureRecord[] {
+    const capped = Math.max(1, Math.min(Math.floor(limit) || 1, this.maxRecords));
+    return Array.from(this.records.values()).sort((a, b) => b.lastSeen - a.lastSeen).slice(0, capped);
+  }
+
+  count(): number {
+    return this.records.size;
   }
 
   findBySubsystem(subsystem: SubsystemName): FailureRecord[] {

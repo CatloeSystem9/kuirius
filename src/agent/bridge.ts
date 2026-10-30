@@ -187,12 +187,13 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     storage: localStorageAdapter,
     getTask: (id) => store.get(id),
   });
+  const planner = new WorkflowAwarePlanner(new HeuristicPlanner(), learning);
   const core = new AgentCore({
     registry,
     events: bus,
     store,
     permissions,
-    planner: new WorkflowAwarePlanner(new HeuristicPlanner(), learning),
+    planner,
     planning,
     // Intelligence Loop v1: the task consumes the Context Engine package that
     // the USER_MESSAGE listener already built (zero extra computation) — its
@@ -419,9 +420,11 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     memory: getMemoryService(),
     consolidation,
     recovery: core.recovery,
+    planner,
     router: modelRouter,
     modelRegistry: defaultModelRegistry,
     safetyGate,
+    emergencyStop,
   });
   registry.registerAll(createDiagnosticTools(diagnostics));
 

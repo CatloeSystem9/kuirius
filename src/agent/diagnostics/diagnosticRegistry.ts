@@ -1,20 +1,60 @@
 /**
  * Self-Diagnostics v1: Diagnostic Registry.
  *
- * Manages diagnostic checks, runs them with bounded execution times,
- * catches unhandled exceptions to prevent agent crashes, and produces
- * structured check results.
+ * Manages bounded, synchronous diagnostic checks. V1 intentionally does not
+ * schedule timers or await arbitrary promises: default checks are local,
+ * deterministic observations, and active probes require explicit opt-in.
  */
 
 import type {
   DiagnosticCheckDef,
   DiagnosticCheckResult,
+  DiagnosticCheckOutcome,
+  DiagnosticEvidence,
+  DiagnosticEvidenceValue,
   SubsystemName,
   DiagnosticSeverity,
 } from './diagnosticTypes';
+import { redactText } from '../safety/safetyTypes';
 
 export interface RunCheckOptions {
-  timeoutMs?: number;
+  /** Active probes are never included in the passive default report. */
+  includeActiveProbes?: boolean;
+}
+
+export const MAX_DIAGNOSTIC_CHECKS = 32;
+const MAX_EVIDENCE_KEYS = 12;
+const MAX_EVIDENCE_ARRAY_ITEMS = 12;
+
+function boundedText(value: unknown, fallback = 'Unavailable'): string {
+  const text = typeof value === 'string' ? value : value === undefined || value === null ? fallback : String(value);
+  return redactText(text);
+}
+
+function sanitizeEvidenceValue(value: unknown, depth = 0): DiagnosticEvidenceValue {
+  if (depth >= 3) return '[truncated]';
+  if (value === null) return null;
+  if (typeof value === 'string') return boundedText(value);
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : '[non-finite]';
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_EVIDENCE_ARRAY_ITEMS).map((item) => sanitizeEvidenceValue(item, depth + 1));
+  }
+  if (value && typeof value === 'object') {
+    const entries = Object.entries(value as Record<string, unknown>).slice(0, MAX_EVIDENCE_KEYS);
+    return Object.fromEntries(entries.map(([key, item]) => [boundedText(key), sanitizeEvidenceValue(item, depth + 1)]));
+  }
+  return boundedText(value);
+}
+
+function sanitizeEvidence(evidence: unknown): DiagnosticEvidence | undefined {
+  if (!evidence || typeof evidence !== 'object' || Array.isArray(evidence)) return undefined;
+  const entries = Object.entries(evidence as Record<string, unknown>).slice(0, MAX_EVIDENCE_KEYS);
+  return Object.fromEntries(entries.map(([key, value]) => [boundedText(key), sanitizeEvidenceValue(value, 1)])) as DiagnosticEvidence;
+}
+
+function isDiagnosticStatus(value: unknown): value is DiagnosticCheckOutcome['status'] {
+  return value === 'healthy' || value === 'degraded' || value === 'unhealthy' || value === 'unknown';
 }
 
 export class DiagnosticRegistry {
@@ -22,8 +62,12 @@ export class DiagnosticRegistry {
 
   register(check: DiagnosticCheckDef): void {
     if (!check?.id) throw new Error('Diagnostic check must have a valid id');
+    if (typeof check.run !== 'function') throw new Error(`Diagnostic check "${check.id}" must define a synchronous run function`);
     if (this.checks.has(check.id)) {
       throw new Error(`Diagnostic check already registered: ${check.id}`);
+    }
+    if (this.checks.size >= MAX_DIAGNOSTIC_CHECKS) {
+      throw new Error(`Diagnostic registry is bounded to ${MAX_DIAGNOSTIC_CHECKS} checks`);
     }
     this.checks.set(check.id, check);
   }
@@ -59,14 +103,12 @@ export class DiagnosticRegistry {
   }
 
   /**
-   * Run a single diagnostic check safely under an isolated timer.
-   * If the check throws, times out, or returns invalid data, an honest
-   * unhealthy/degraded result is returned instead of bubbling an exception.
+   * Run one local check. Exceptions and malformed output become an evidence
+   * result; diagnostics never bubble an error into Agent Core execution.
    */
-  async runCheck(id: string, options: RunCheckOptions = {}): Promise<DiagnosticCheckResult> {
+  runCheck(id: string, _options: RunCheckOptions = {}): DiagnosticCheckResult {
     const check = this.checks.get(id);
     const now = Date.now();
-    const timeoutMs = Math.max(500, Math.min(options.timeoutMs ?? 3000, 10000));
 
     if (!check) {
       return {
@@ -86,18 +128,10 @@ export class DiagnosticRegistry {
 
     const start = Date.now();
     try {
-      const outcomePromise = Promise.resolve(check.run());
-      let timeoutHandle: any;
-
-      const timeoutPromise = new Promise<never>((_, reject) => {
-        timeoutHandle = setTimeout(() => {
-          reject(new Error(`Diagnostic check timed out after ${timeoutMs}ms`));
-        }, timeoutMs);
-      });
-
-      const outcome = await Promise.race([outcomePromise, timeoutPromise]).finally(() => {
-        if (timeoutHandle) clearTimeout(timeoutHandle);
-      });
+      const outcome = check.run();
+      if (!outcome || !isDiagnosticStatus(outcome.status) || typeof outcome.message !== 'string') {
+        throw new Error('Check returned an invalid diagnostic outcome');
+      }
 
       const durationMs = Date.now() - start;
 
@@ -109,15 +143,15 @@ export class DiagnosticRegistry {
         severity: check.severity,
         checkType: check.checkType,
         status: outcome.status,
-        message: outcome.message,
+        message: boundedText(outcome.message),
         timestamp: now,
         durationMs,
-        evidence: outcome.evidence,
-        remediation: outcome.remediation,
+        evidence: sanitizeEvidence(outcome.evidence),
+        remediation: outcome.remediation ? boundedText(outcome.remediation) : undefined,
       };
     } catch (err: any) {
       const durationMs = Date.now() - start;
-      const isTimeout = String(err?.message || '').includes('timed out');
+      const safeError = boundedText(err?.message || err, 'Unknown diagnostic check failure');
 
       return {
         id: check.id,
@@ -126,18 +160,15 @@ export class DiagnosticRegistry {
         description: check.description,
         severity: check.severity,
         checkType: check.checkType,
-        status: isTimeout ? 'degraded' : 'unhealthy',
-        message: `Check execution failed: ${err?.message || String(err)}`,
+        status: 'unhealthy',
+        message: `Check execution failed: ${safeError}`,
         timestamp: now,
         durationMs,
         evidence: {
-          errorName: err?.name,
-          errorMessage: err?.message,
-          stackTrace: err?.stack ? String(err.stack).slice(0, 300) : undefined,
+          errorName: boundedText(err?.name, 'Error'),
+          errorMessage: safeError,
         },
-        remediation: isTimeout
-          ? 'Subsystem did not respond within the diagnostic timeout. Inspect responsiveness.'
-          : 'Subsystem threw an unhandled error during check. Review subsystem state and stack trace.',
+        remediation: 'Review the check implementation and the referenced subsystem state.',
       };
     }
   }
@@ -145,10 +176,10 @@ export class DiagnosticRegistry {
   /**
    * Run all checks matching an optional filter.
    */
-  async runAll(filter?: {
+  runAll(filter?: {
     subsystem?: SubsystemName;
     severity?: DiagnosticSeverity;
-  }, options?: RunCheckOptions): Promise<DiagnosticCheckResult[]> {
+  }, options?: RunCheckOptions): DiagnosticCheckResult[] {
     let selected = this.list();
     if (filter?.subsystem) {
       selected = selected.filter((c) => c.subsystem === filter.subsystem);
@@ -156,10 +187,13 @@ export class DiagnosticRegistry {
     if (filter?.severity) {
       selected = selected.filter((c) => c.severity === filter.severity);
     }
+    if (!options?.includeActiveProbes) {
+      selected = selected.filter((c) => c.checkType !== 'active_probe');
+    }
 
     const results: DiagnosticCheckResult[] = [];
     for (const check of selected) {
-      results.push(await this.runCheck(check.id, options));
+      results.push(this.runCheck(check.id, options));
     }
     return results;
   }

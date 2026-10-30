@@ -1846,3 +1846,116 @@ model hints but do not execute (by design of the prepared library). Voice/
 wake-word and globe remain UI-layer capabilities exposed through the existing
 app surface (their agent-side hooks — globe tools — were already registered
 in Phase 1; no new integration was required).
+
+## 28. Self-Diagnostics v1: Runtime Health and Failure Awareness
+
+**Self-Diagnostics v1 — COMPLETE.** Self-Diagnostics v1 provides an architectural
+control plane that enables Krisha to inspect her own operational health, detect
+runtime failures in subsystems, distinguish degraded states from complete failure,
+and deliver verified diagnostic reports without altering system state or mutating
+storage.
+
+```
+       SHARED AGENT EVENT BUS (Passive event listener)
+  [TOOL_FAILED, TASK_FAILED, RECOVERY_FAILED, APP_LAUNCH_FAILED, ...]
+                             │
+                             ▼
+     ┌─────────────────────────────────────────────────────────┐
+     │                     FailureTracker                      │
+     │  - Bounded (≤50 records, LRU eviction)                  │
+     │  - Deduplication via fingerprinting                     │
+     │  - Capability impact analysis                           │
+     │  - Fact vs. Hypothesis diagnosis categorization         │
+     └──────────────────────────┬──────────────────────────────┘
+                                │
+    ┌───────────────────────────┴──────────────────────────────┐
+    │                   DiagnosticsService                     │
+    │  - 5-second report cache TTL (cache-first)               │
+    │  - Dual health status: diagnosticStatus & overallStatus  │
+    │  - Observes live operational state (tasks, e-stop)       │
+    └───────────────────────────┬──────────────────────────────┘
+                                │
+   ┌────────────────────────────┴─────────────────────────────┐
+   │                    DiagnosticRegistry                    │
+   │  - Max 32 checks, synchronous & deterministic            │
+   │  - Deep evidence sanitization (depth limit, redaction)   │
+   │  - Opt-in active probe separation (passive-first)        │
+   └────────┬───────────┬───────────┬───────────┬─────────┬───┘
+            │           │           │           │         │
+          Core    Intelligence  Execution    Models  Persistence & System
+```
+
+### 28.1 Architectural Principles
+
+1. **Strictly Passive-First & Non-Mutating**: Default diagnostic runs make NO
+   storage mutations, write/delete probes, or synthetic event injections. Opt-in
+   active probes (`intelligence.context_engine.probe`, `intelligence.knowledge_graph.probe`,
+   `execution.planner.probe`) are read-only and explicitly filtered out unless
+   `includeActiveProbes: true` is passed.
+2. **Health Assessment vs. Operational State Separation**: The diagnostic verdict
+   (`diagnosticStatus`) is an evidence-based assessment of health, entirely distinct
+   from live operational control-plane state (`OperationalStateSnapshot`: `activeTaskCount`,
+   `emergencyStopActive`, `unavailableSources`). Diagnostics never alter task lifecycle,
+   trigger emergency stops, or mutate task data.
+3. **Laptop-Friendly & Local-First**: Synchronous, zero background timers, zero
+   polling loops, bounded memory (max 32 checks, max 50 failure records, 5-second
+   cache TTL). Deterministic local checks execute in ~1ms without model or network calls.
+
+### 28.2 Layered Subsystem Coverage (20 Default Passive Checks)
+
+- **Core (`coreChecks.ts`)**:
+  - `core.runtime.availability`: verifies task store, tool registry, permission manager, and event bus availability.
+  - `core.task.lifecycle`: non-mutating sampling of task store (`store.sample(20)`) for contradictory timestamps and states.
+  - `core.events.bus`: passive inspection of recent event history without synthetic emissions.
+- **Intelligence (`intelligenceChecks.ts`)**:
+  - `intelligence.context_engine`: verifies Context Engine cache limits and budget configurations.
+  - `intelligence.knowledge_graph`: verifies node and edge bounds and drops.
+  - `intelligence.semantic`: inspects local semantic expansion bounds.
+  - `intelligence.memory`: validates MemoryService seed records and storage availability.
+  - `intelligence.consolidation`: verifies ConsolidationEngine wiring.
+  - Opt-in active probes: `intelligence.context_engine.probe` (verifies context packaging), `intelligence.knowledge_graph.probe` (verifies query statements).
+- **Execution (`executionChecks.ts`)**:
+  - `execution.tools.registry`: verifies standard tools (`system.note`, `chat.report`) and schema integrity.
+  - `execution.planner`: verifies HeuristicPlanner wiring and fallback planning.
+  - `execution.recovery`: inspects recovery manager state and strategy policies.
+  - `execution.permissions`: checks permission gate state and evaluation.
+  - Opt-in active probe: `execution.planner.probe` (verifies goal decomposition).
+- **Models (`modelChecks.ts`)**:
+  - `models.registry.profiles`: validates configured model profiles in ModelRegistry without LLM calls.
+  - `models.router.wiring`: verifies ModelRouter initialization and tier resolution.
+  - `models.api.keys`: inspects presence of GEMINI_API_KEY environment variable.
+  - `models.telemetry`: inspects passive routing and latency performance metrics.
+- **Persistence (`persistenceChecks.ts`)**:
+  - `persistence.storage.adapter`: tests storage read path without writing or deleting keys.
+  - `persistence.adapter.contract`: validates storage interface methods (`getItem`, `setItem`, `removeItem`).
+- **System (`systemChecks.ts`)**:
+  - `system.subsystem_wiring`: verifies cross-subsystem interconnections.
+  - `system.cycle_traces`: inspects cycle trace store bounds and trace records.
+
+### 28.3 Failure Awareness & Issue Diagnosis (`failureTracker.ts`)
+
+- **Event Bus Listener**: Attaches to `TOOL_FAILED`, `TASK_FAILED`, `RECOVERY_FAILED`, `RECOVERY_SUCCEEDED`,
+  `FS_OPERATION_FAILED`, and `APP_LAUNCH_FAILED`.
+- **Deduplication & Fingerprinting**: `createFailureFingerprint` groups recurring errors by subsystem,
+  tool, and normalized error message.
+- **Fact vs. Hypothesis**: Recommendations and causes are explicitly tagged (`isHypothesis: boolean`)
+  to ensure Krisha never claims a speculative diagnosis as verified fact.
+- **Capability Mapping**: Inferred affected capabilities (`inferAffectedCapabilities`) map failure sources
+  to concrete agent capabilities (e.g. `web.open_website` failure maps to `browser.open_url` and `browser.interaction`).
+
+### 28.4 Agent Tools & Intent Routing (`diagnosticTools.ts`, `planner.ts`)
+
+- `diagnostics.health`: Safe, free, read-only tool providing overall diagnostic status, subsystem health,
+  operational snapshot, and active issue count.
+- `diagnostics.inspect`: Safe, free, read-only tool allowing targeted inspection of individual subsystems
+  (`core`, `intelligence`, `execution`, `models`, `persistence`, `system`).
+- `HeuristicPlanner` & `classifyStep`: Natural language intent routing maps phrases like "check system health",
+  "run diagnostics", and "inspect core subsystem" directly to the diagnostic tools.
+
+### 28.5 Known Limitations
+
+- **No Remote Probing**: By design, default diagnostics do not make network calls or query remote APIs;
+  model checks evaluate profiles, keys, and telemetry rather than invoking billable model APIs.
+- **Ephemeral Failure Ring**: In-memory failure records are bounded (≤50) and reset across process restarts;
+  long-term historical trends rely on the standard application audit logs.
+

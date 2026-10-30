@@ -125,6 +125,21 @@ export class TaskStore {
     return Array.from(this.tasks.values()).sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
+  /**
+   * Bounded read-only sample for diagnostics. Unlike list(), this never sorts
+   * or copies the full task collection, so health checks cannot accidentally
+   * turn into a task-history scan.
+   */
+  sample(limit = 20): AgentTask[] {
+    const max = Math.max(1, Math.min(Math.floor(limit) || 1, 50));
+    const sample: AgentTask[] = [];
+    for (const task of this.tasks.values()) {
+      sample.push(task);
+      if (sample.length >= max) break;
+    }
+    return sample;
+  }
+
   clear(): void {
     this.tasks.clear();
     this.storage.removeItem(TASKS_KEY);

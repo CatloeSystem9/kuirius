@@ -19,6 +19,20 @@ export type DiagnosticStatus = 'healthy' | 'degraded' | 'unhealthy' | 'unknown';
 
 export type CheckType = 'passive' | 'active_probe' | 'configuration';
 
+/** A bounded recursive evidence value. Diagnostic evidence never contains raw objects. */
+export type DiagnosticEvidenceValue =
+  | string
+  | number
+  | boolean
+  | null
+  | DiagnosticEvidenceValue[]
+  | { [key: string]: DiagnosticEvidenceValue };
+
+export type DiagnosticEvidence = Record<string, DiagnosticEvidenceValue>;
+
+/** Whether a report used its passive default or explicitly included probes. */
+export type DiagnosticRunMode = 'passive' | 'manual_probe';
+
 /** A single diagnostic check definition. */
 export interface DiagnosticCheckDef {
   /** Unique stable check ID, e.g. 'core.runtime.availability' */
@@ -33,15 +47,19 @@ export interface DiagnosticCheckDef {
   severity: DiagnosticSeverity;
   /** Nature of the check: passive inspection, safe active probe, or configuration validation */
   checkType: CheckType;
-  /** Execution logic */
-  run: () => Promise<DiagnosticCheckOutcome> | DiagnosticCheckOutcome;
+  /**
+   * Synchronous local inspection only. Keeping v1 checks synchronous makes
+   * their execution bounded without background timers, polling, or model/API
+   * calls. Active probes are opt-in at report time and must still be read-only.
+   */
+  run: () => DiagnosticCheckOutcome;
 }
 
 /** The raw outcome returned by a check's run() method. */
 export interface DiagnosticCheckOutcome {
   status: DiagnosticStatus;
   message: string;
-  evidence?: Record<string, unknown>;
+  evidence?: DiagnosticEvidence;
   remediation?: string;
 }
 
@@ -57,7 +75,7 @@ export interface DiagnosticCheckResult {
   message: string;
   timestamp: number;
   durationMs: number;
-  evidence?: Record<string, unknown>;
+  evidence?: DiagnosticEvidence;
   remediation?: string;
 }
 
@@ -103,12 +121,38 @@ export interface IssueDiagnosis {
   userInterventionRequired: boolean;
 }
 
+/**
+ * A direct observation of live control-plane state. This is deliberately
+ * separate from a diagnostic assessment: a failing check does not alter this
+ * state, and a healthy assessment is not an operational command or guarantee.
+ */
+export interface OperationalStateSnapshot {
+  observedAt: number;
+  activeTaskCount?: number;
+  emergencyStopActive?: boolean;
+  unavailableSources: string[];
+}
+
+export interface DiagnosticCacheInfo {
+  source: 'fresh' | 'cache';
+  ageMs: number;
+}
+
 /** Comprehensive diagnostic report generated on demand. */
 export interface DiagnosticReport {
+  /** Point-in-time assessment derived from diagnostic evidence only. */
+  diagnosticStatus: DiagnosticStatus;
+  /**
+   * @deprecated Use diagnosticStatus. This remains an alias for compatibility;
+   * it is a diagnostic assessment, never an operational state transition.
+   */
   overallStatus: DiagnosticStatus;
   summary: string;
   timestamp: number;
   durationMs: number;
+  runMode: DiagnosticRunMode;
+  cache: DiagnosticCacheInfo;
+  operationalState: OperationalStateSnapshot;
   subsystemHealth: Record<SubsystemName, DiagnosticStatus>;
   checkResults: DiagnosticCheckResult[];
   activeIssues: IssueDiagnosis[];
@@ -119,6 +163,7 @@ export interface DiagnosticReport {
     degradedChecks: number;
     unhealthyChecks: number;
     unknownChecks: number;
-    activeFailuresCount: number;
+    trackedFailureCount: number;
+    reportedFailureCount: number;
   };
 }

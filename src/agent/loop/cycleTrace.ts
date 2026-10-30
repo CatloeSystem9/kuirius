@@ -97,6 +97,10 @@ export class CycleTraceStore {
     return this.traces.size;
   }
 
+  list(): CycleTrace[] {
+    return Array.from(this.traces.values());
+  }
+
   clear(): void {
     this.traces.clear();
   }

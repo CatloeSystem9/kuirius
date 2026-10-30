@@ -22,17 +22,17 @@ export function createDiagnosticTools(diagnostics: DiagnosticsService): AgentToo
       capabilities: ['diagnostics.health', 'system.health'],
       permissions: [],
       inputSchema: {
-        optional: ['refresh'],
-        types: { refresh: 'boolean' },
+        optional: ['refresh', 'includeActiveProbes'],
+        types: { refresh: 'boolean', includeActiveProbes: 'boolean' },
       },
       verification: {
         strategy: 'self_reported',
         description: 'Verified diagnostic report aggregated across all subsystem checks.',
       },
-      timeoutMs: 5000,
       async execute(input): Promise<ToolResult> {
         const refresh = Boolean(input?.refresh);
-        const report = await diagnostics.generateReport({ refresh });
+        const includeActiveProbes = Boolean(input?.includeActiveProbes);
+        const report = await diagnostics.generateReport({ refresh, includeActiveProbes });
 
         const formattedIssues = report.activeIssues.map((issue) => ({
           subsystem: issue.subsystem,
@@ -46,8 +46,11 @@ export function createDiagnosticTools(diagnostics: DiagnosticsService): AgentToo
 
         return ok({
           output: {
-            overallStatus: report.overallStatus,
+            diagnosticStatus: report.diagnosticStatus,
             summary: report.summary,
+            runMode: report.runMode,
+            cache: report.cache,
+            operationalState: report.operationalState,
             subsystemHealth: report.subsystemHealth,
             metrics: report.metrics,
             activeIssues: formattedIssues,
@@ -67,17 +70,19 @@ export function createDiagnosticTools(diagnostics: DiagnosticsService): AgentToo
       capabilities: ['diagnostics.inspect'],
       permissions: [],
       inputSchema: {
-        optional: ['subsystem'],
-        types: { subsystem: 'string' },
+        optional: ['subsystem', 'refresh', 'includeActiveProbes'],
+        types: { subsystem: 'string', refresh: 'boolean', includeActiveProbes: 'boolean' },
       },
       verification: {
         strategy: 'self_reported',
         description: 'Detailed subsystem diagnostics with check results and evidence.',
       },
-      timeoutMs: 5000,
       async execute(input): Promise<ToolResult> {
         const targetSubsystem = input?.subsystem as SubsystemName | undefined;
-        const report = await diagnostics.generateReport();
+        const report = await diagnostics.generateReport({
+          refresh: Boolean(input?.refresh),
+          includeActiveProbes: Boolean(input?.includeActiveProbes),
+        });
 
         let filteredChecks = report.checkResults;
         let filteredFailures = report.recentFailures;
@@ -90,7 +95,10 @@ export function createDiagnosticTools(diagnostics: DiagnosticsService): AgentToo
         return ok({
           output: {
             subsystem: targetSubsystem || 'all',
-            status: targetSubsystem ? report.subsystemHealth[targetSubsystem] : report.overallStatus,
+            diagnosticStatus: targetSubsystem ? report.subsystemHealth[targetSubsystem] : report.diagnosticStatus,
+            runMode: report.runMode,
+            cache: report.cache,
+            operationalState: report.operationalState,
             checks: filteredChecks.map((c) => ({
               id: c.id,
               name: c.name,

@@ -1,7 +1,7 @@
 /**
  * Self-Diagnostics v1: Core Runtime Checks.
  *
- * Verifies Agent Core, task lifecycle consistency, and event bus registration/delivery.
+ * Verifies Agent Core, a bounded task lifecycle sample, and event bus access.
  */
 
 import type { DiagnosticCheckDef, DiagnosticCheckOutcome } from '../diagnosticTypes';
@@ -61,7 +61,8 @@ export function createCoreChecks(deps: CoreCheckDeps): DiagnosticCheckDef[] {
           };
         }
 
-        const tasks = store.list();
+        const sampleLimit = 20;
+        const tasks = store.sample(sampleLimit);
         const contradictory: { taskId: string; reason: string }[] = [];
 
         for (const task of tasks) {
@@ -82,16 +83,16 @@ export function createCoreChecks(deps: CoreCheckDeps): DiagnosticCheckDef[] {
         if (contradictory.length > 0) {
           return {
             status: 'degraded',
-            message: `Detected ${contradictory.length} task(s) with contradictory lifecycle states.`,
-            evidence: { contradictoryTasks: contradictory },
+            message: `Detected ${contradictory.length} contradictory state(s) in a bounded task sample.`,
+            evidence: { contradictoryTasks: contradictory, sampledTasks: tasks.length, sampleLimit },
             remediation: 'Inspect task state mutations in AgentCore to ensure consistent transitions.',
           };
         }
 
         return {
           status: 'healthy',
-          message: `Task lifecycle states are consistent across ${tasks.length} inspected tasks.`,
-          evidence: { totalTasks: tasks.length },
+          message: `Task lifecycle states are consistent in a bounded sample of ${tasks.length} task(s).`,
+          evidence: { sampledTasks: tasks.length, sampleLimit },
         };
       },
     },
@@ -99,9 +100,9 @@ export function createCoreChecks(deps: CoreCheckDeps): DiagnosticCheckDef[] {
       id: 'core.events.bus',
       name: 'Agent Event Bus Registration & Delivery',
       subsystem: 'core',
-      description: 'Safely probes the event bus with a synthetic diagnostic event.',
+      description: 'Passively verifies that the bounded event buffer can be read.',
       severity: 'critical',
-      checkType: 'active_probe',
+      checkType: 'passive',
       run(): DiagnosticCheckOutcome {
         const bus = deps.bus ?? deps.core?.events;
         if (!bus) {
@@ -112,36 +113,27 @@ export function createCoreChecks(deps: CoreCheckDeps): DiagnosticCheckDef[] {
           };
         }
 
-        let received = false;
-        const testPayload = { probeId: `probe_${Date.now()}` };
-        const unsubscribe = bus.on('NOTICE', (evt) => {
-          if ((evt.payload as any)?.probeId === testPayload.probeId) {
-            received = true;
-          }
-        });
-
         try {
-          bus.emit({
-            name: 'NOTICE',
-            payload: testPayload,
-            timestamp: Date.now(),
-          });
-        } finally {
-          unsubscribe();
-        }
-
-        if (!received) {
+          const events = bus.recentEvents();
+          if (!Array.isArray(events)) {
+            return {
+              status: 'unhealthy',
+              message: 'Event bus recent-event buffer did not return an array.',
+              remediation: 'Review AgentEventBus buffer implementation.',
+            };
+          }
+          return {
+            status: 'healthy',
+            message: `Agent Event Bus buffer is readable (${events.length} buffered event(s)); no synthetic event was emitted.`,
+            evidence: { bufferedEvents: events.length },
+          };
+        } catch (err: any) {
           return {
             status: 'unhealthy',
-            message: 'Event bus did not synchronously dispatch probe event to subscriber.',
-            remediation: 'Review AgentEventBus event delivery mechanism.',
+            message: `Event bus buffer inspection failed: ${err?.message || String(err)}`,
+            remediation: 'Review AgentEventBus buffer implementation.',
           };
         }
-
-        return {
-          status: 'healthy',
-          message: 'Agent Event Bus successfully dispatched and detached test event.',
-        };
       },
     },
   ];

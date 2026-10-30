@@ -500,7 +500,10 @@ export function classifyDiagnosticIntent(clause: string): StepClassification | n
       toolName: 'diagnostics.health',
       capability: 'diagnostics.health',
       description: 'Check system health and runtime diagnostics',
-      input: { refresh: true },
+      // Passive diagnostics are cache-first by default. A caller may request a
+      // refresh explicitly through the tool, but ordinary health questions do
+      // not need to re-run deterministic local checks.
+      input: {},
     };
   }
 

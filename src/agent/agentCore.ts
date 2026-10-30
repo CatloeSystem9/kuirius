@@ -369,6 +369,15 @@ export class AgentCore {
     return this.controllers.has(taskId);
   }
 
+  /**
+   * Read-only execution snapshot for control-plane inspection. This is not a
+   * health verdict and never changes task state; diagnostics use it to keep
+   * live operational state distinct from their evidence-based assessment.
+   */
+  getActiveTaskCount(): number {
+    return this.controllers.size;
+  }
+
   private async runLoop(task: AgentTask): Promise<void> {
     const controller = this.controllers.get(task.id);
     const signal = controller?.signal ?? new AbortController().signal;

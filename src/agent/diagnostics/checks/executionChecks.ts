@@ -8,7 +8,6 @@
 import type { DiagnosticCheckDef, DiagnosticCheckOutcome } from '../diagnosticTypes';
 import type { ToolRegistry } from '../../toolRegistry';
 import type { Planner } from '../../planner';
-import { HeuristicPlanner } from '../../planner';
 import type { RecoveryManager } from '../../recovery';
 import type { PermissionManager } from '../../permissions';
 import type { SafetyGate } from '../../safety';
@@ -72,41 +71,24 @@ export function createExecutionChecks(deps: ExecutionCheckDeps): DiagnosticCheck
     },
     {
       id: 'execution.planner',
-      name: 'Planner Availability & Decomposition',
+      name: 'Planner Wiring',
       subsystem: 'execution',
-      description: 'Verifies the planner can decompose a basic goal into valid plan steps.',
+      description: 'Passively verifies that the configured planner is available; it never creates a diagnostic task or plan.',
       severity: 'critical',
-      checkType: 'active_probe',
+      checkType: 'passive',
       run(): DiagnosticCheckOutcome {
-        const planner = deps.planner ?? new HeuristicPlanner();
-        try {
-          const plan = planner.makePlan({
-            description: 'diagnostic test goal',
-            rawInput: 'diagnostic test goal',
-            kind: 'command',
-          });
-
-          if (!plan || !Array.isArray(plan.steps)) {
-            return {
-              status: 'unhealthy',
-              message: 'Planner returned an invalid plan structure.',
-              remediation: 'Inspect planner implementation.',
-            };
-          }
-
+        if (!deps.planner) {
           return {
-            status: 'healthy',
-            message: 'Planner is operational and successfully generated a diagnostic plan.',
-            evidence: { stepsCount: plan.steps.length },
-          };
-        } catch (err: any) {
-          return {
-            status: 'unhealthy',
-            message: `Planner threw an error during goal decomposition: ${err?.message || String(err)}`,
-            evidence: { error: String(err) },
-            remediation: 'Review planner logic and intent classifiers.',
+            status: 'degraded',
+            message: 'Planner instance is not attached to diagnostics.',
+            remediation: 'Provide the configured planner when constructing DiagnosticsService.',
           };
         }
+        return {
+          status: 'healthy',
+          message: 'Planner is wired for execution; no diagnostic plan was created.',
+          evidence: { plannerAttached: true },
+        };
       },
     },
     {
@@ -154,7 +136,9 @@ export function createExecutionChecks(deps: ExecutionCheckDeps): DiagnosticCheck
           };
         }
 
-        const fsWriteGranted = deps.permissions.has('filesystem.write');
+        const fsWriteGranted = typeof deps.permissions.isGranted === 'function'
+          ? deps.permissions.isGranted('filesystem.write')
+          : false;
         return {
           status: 'healthy',
           message: 'Permission Manager is active and enforcing access boundaries.',
@@ -163,6 +147,54 @@ export function createExecutionChecks(deps: ExecutionCheckDeps): DiagnosticCheck
             safetyGateAttached: Boolean(deps.safetyGate),
           },
         };
+      },
+    },
+    {
+      id: 'execution.planner.probe',
+      name: 'Planner Active Decomposition Probe',
+      subsystem: 'execution',
+      description: 'Opt-in, read-only active probe that verifies the planner can decompose a goal into valid plan steps.',
+      severity: 'warning',
+      checkType: 'active_probe',
+      run(): DiagnosticCheckOutcome {
+        if (!deps.planner) {
+          return {
+            status: 'degraded',
+            message: 'Planner is not attached for active probing.',
+            remediation: 'Provide the configured planner when constructing DiagnosticsService.',
+          };
+        }
+
+        try {
+          const plan = deps.planner.makePlan({
+            description: 'diagnostic test goal',
+            rawInput: 'diagnostic test goal',
+            kind: 'command',
+          });
+
+          if (!plan || !Array.isArray(plan.steps)) {
+            return {
+              status: 'unhealthy',
+              message: 'Planner active probe returned an invalid plan structure.',
+              remediation: 'Inspect planner makePlan implementation.',
+            };
+          }
+
+          return {
+            status: 'healthy',
+            message: 'Planner active probe succeeded: goal decomposed into plan steps.',
+            evidence: {
+              stepsCount: plan.steps.length,
+            },
+          };
+        } catch (err: any) {
+          return {
+            status: 'unhealthy',
+            message: `Planner active probe failed: ${err?.message || String(err)}`,
+            evidence: { error: String(err) },
+            remediation: 'Review planner logic and intent classifiers.',
+          };
+        }
       },
     },
   ];

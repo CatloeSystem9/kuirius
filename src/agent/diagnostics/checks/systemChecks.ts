@@ -77,7 +77,11 @@ export function createSystemChecks(deps: SystemCheckDeps): DiagnosticCheckDef[] 
       severity: 'informational',
       checkType: 'passive',
       run(): DiagnosticCheckOutcome {
-        const traces = deps.core?.cycleTrace?.list();
+        const traces = typeof deps.core?.cycleTrace?.list === 'function'
+          ? deps.core.cycleTrace.list()
+          : typeof deps.core?.cycleTrace?.size === 'number'
+          ? Array.from({ length: deps.core.cycleTrace.size })
+          : undefined;
         if (!traces) {
           return {
             status: 'unknown',

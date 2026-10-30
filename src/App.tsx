@@ -80,6 +80,7 @@ import { AudioTranscriptionModal } from './components/AudioTranscriptionModal';
 import { HabitActionCard } from './components/HabitActionCard';
 import { HabitsModal } from './components/HabitsModal';
 import { ArcadeModal } from './components/arcade/ArcadeModal';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import type { GameId } from './components/arcade/types';
 import {
   loadHabits,
@@ -767,12 +768,30 @@ export default function App() {
     const appCmd = detectAndParseAppLaunchCommand(text);
     let detectedAppAction: LaptopAppAction | null = null;
     if (appCmd.isAppCommand) {
-      if (appCmd.action === 'list_apps') {
+      if (appCmd.action === 'windows_start') {
+        const query = appCmd.searchQuery || appCmd.rawAppName || '';
         detectedAppAction = {
           type: 'list_apps',
-          appName: 'Downloaded Laptop Apps',
+          appName: query ? `Windows Start: ${query}` : 'Windows Start Menu',
         };
         setActiveAppAction(detectedAppAction);
+        setInitialAppSearch(query);
+        setActiveModal('apps');
+        setForcedPose('waving_greeting');
+        if (query && appCmd.app) {
+          setLastSpokenText(`Opening Windows Start and searching for ${appCmd.app.name}. You can press Enter to open it.`);
+        } else if (query) {
+          setLastSpokenText(`Opening Windows Start and searching for ${query}.`);
+        } else {
+          setLastSpokenText('Opening Windows Start. You can search any app on your laptop and press Enter to open it.');
+        }
+      } else if (appCmd.action === 'list_apps') {
+        detectedAppAction = {
+          type: 'list_apps',
+          appName: 'Windows Apps & Start Menu',
+        };
+        setActiveAppAction(detectedAppAction);
+        setInitialAppSearch('');
         setActiveModal('apps');
         setForcedPose('waving_greeting');
       } else if (appCmd.app) {
@@ -787,6 +806,7 @@ export default function App() {
         setActiveAppAction(detectedAppAction);
         launchLaptopApp(appCmd.app);
         setForcedPose('waving_greeting');
+        setLastSpokenText(`Opening ${appCmd.app.name} on your laptop.`);
       } else if (appCmd.rawAppName) {
         detectedAppAction = {
           type: 'launch_app',
@@ -1683,8 +1703,9 @@ export default function App() {
         {/* Central Full-Body 2D Character Figure (Movable & Draggable) */}
         <div
           className={`flex-1 flex items-center justify-center relative px-4 pt-10 sm:pt-4 overflow-hidden transition-colors duration-700 ${
-            isWhiteBackground ? 'bg-white' : 'bg-[#171722]'
+            isWhiteBackground ? 'bg-white' : 'bg-[#02030f]'
           }`}
+          style={{ backgroundColor: isWhiteBackground ? undefined : '#02030f' }}
         >
           <motion.div
             key={avatarKey}
@@ -1794,7 +1815,12 @@ export default function App() {
         </div>
 
         {/* Bottom Direct Chat Input Bar (Directly on screen with Web Action & File Action Preview) */}
-        <div className="pb-5 sm:pb-7 flex flex-col items-center justify-center z-20 w-full px-4">
+        <div
+          className={`pb-5 sm:pb-7 flex flex-col items-center justify-center z-20 w-full px-4 ${
+            isWhiteBackground ? '' : 'bg-[#02030f]'
+          }`}
+          style={{ backgroundColor: isWhiteBackground ? undefined : '#02030f' }}
+        >
           <WebActionCard
             action={activeWebAction}
             onDismiss={() => setActiveWebAction(null)}
@@ -1849,6 +1875,10 @@ export default function App() {
               setInitialFolderFilter('ALL');
             }}
             onOpenTranscribeModal={() => setActiveModal('transcribe')}
+            onOpenWindowsApps={() => {
+              setActiveModal('apps');
+              setInitialAppSearch('');
+            }}
             isLoading={isLoading}
             isSpeaking={isSpeaking}
             isLightMode={isWhiteBackground}
@@ -2014,31 +2044,35 @@ export default function App() {
         isLightMode={isWhiteBackground}
       />
 
-      <HabitsModal
-        isOpen={activeModal === 'habits'}
-        onClose={() => setActiveModal(null)}
-        habits={habits}
-        calendarEvents={calendarEvents}
-        onToggleHabit={handleToggleHabit}
-        onAddHabit={handleAddHabit}
-        onDeleteHabit={handleDeleteHabit}
-        onAddCalendarEvent={handleAddCalendarEvent}
-        onDeleteCalendarEvent={handleDeleteCalendarEvent}
-        onToggleCalendarEvent={handleToggleCalendarEvent}
-        onCheckInWithKrisha={() => {
-          setActiveModal(null);
-          handleSendMessage("Krisha, let's do our daily habits check-in! How am I doing on my goals today?");
-        }}
-      />
+      <ErrorBoundary fallbackTitle="Habits & Calendar Error" onReset={() => setActiveModal(null)}>
+        <HabitsModal
+          isOpen={activeModal === 'habits'}
+          onClose={() => setActiveModal(null)}
+          habits={habits}
+          calendarEvents={calendarEvents}
+          onToggleHabit={handleToggleHabit}
+          onAddHabit={handleAddHabit}
+          onDeleteHabit={handleDeleteHabit}
+          onAddCalendarEvent={handleAddCalendarEvent}
+          onDeleteCalendarEvent={handleDeleteCalendarEvent}
+          onToggleCalendarEvent={handleToggleCalendarEvent}
+          onCheckInWithKrisha={() => {
+            setActiveModal(null);
+            handleSendMessage("Krisha, let's do our daily habits check-in! How am I doing on my goals today?");
+          }}
+        />
+      </ErrorBoundary>
 
-      <ArcadeModal
-        isOpen={activeModal === 'arcade'}
-        onClose={() => {
-          setActiveModal(null);
-          setArcadeInitialGame(null);
-        }}
-        initialGameId={arcadeInitialGame}
-      />
+      <ErrorBoundary fallbackTitle="Arcade Error" onReset={() => setActiveModal(null)}>
+        <ArcadeModal
+          isOpen={activeModal === 'arcade'}
+          onClose={() => {
+            setActiveModal(null);
+            setArcadeInitialGame(null);
+          }}
+          initialGameId={arcadeInitialGame}
+        />
+      </ErrorBoundary>
     </div>
   );
 }

@@ -1,4 +1,4 @@
-import React, { useState, Suspense, lazy } from 'react';
+import React, { useState, useEffect, Suspense, lazy } from 'react';
 import {
   Gamepad2,
   X,
@@ -68,6 +68,12 @@ export const ArcadeModal: React.FC<ArcadeModalProps> = ({
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<GameCategory>('all');
   const [isMuted, setIsMutedState] = useState(isArcadeMuted);
+
+  useEffect(() => {
+    if (isOpen && initialGameId) {
+      setActiveGameId(initialGameId);
+    }
+  }, [isOpen, initialGameId]);
 
   const stats = getAllArcadeStats();
 

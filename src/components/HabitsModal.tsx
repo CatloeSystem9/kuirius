@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import {
   X,
@@ -66,15 +66,13 @@ export const HabitsModal: React.FC<HabitsModalProps> = ({
   const [isAddEventOpen, setIsAddEventOpen] = useState(false);
 
   // Calendar navigation state
-  const todayDate = useMemo(() => new Date(), []);
-  const [calendarMonth, setCalendarMonth] = useState<Date>(
-    new Date(todayDate.getFullYear(), todayDate.getMonth(), 1)
-  );
+  const [calendarMonth, setCalendarMonth] = useState<Date>(() => {
+    const now = new Date();
+    return new Date(now.getFullYear(), now.getMonth(), 1);
+  });
   const [selectedDateStr, setSelectedDateStr] = useState<string>(getTodayDateString());
-  const selectedDateObj = useMemo(() => {
-    const [y, m, d] = selectedDateStr.split('-').map(Number);
-    return new Date(y, m - 1, d);
-  }, [selectedDateStr]);
+  const [selectedY, selectedM, selectedD] = selectedDateStr.split('-').map(Number);
+  const selectedDateObj = new Date(selectedY, selectedM - 1, selectedD);
 
   // Form states for New Habit
   const [newTitle, setNewTitle] = useState('');
@@ -159,7 +157,8 @@ export const HabitsModal: React.FC<HabitsModalProps> = ({
   };
 
   const handleResetToToday = () => {
-    setCalendarMonth(new Date(todayDate.getFullYear(), todayDate.getMonth(), 1));
+    const now = new Date();
+    setCalendarMonth(new Date(now.getFullYear(), now.getMonth(), 1));
     setSelectedDateStr(todayStr);
   };
 

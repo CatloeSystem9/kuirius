@@ -17,6 +17,7 @@ import {
 } from 'lucide-react';
 import { LaptopAppAction } from '../types';
 import { getAllLaptopApps, launchLaptopApp } from '../utils/appLauncher';
+import { WindowsLogo } from './WindowsLogo';
 
 interface AppActionCardProps {
   action: LaptopAppAction | null;
@@ -139,11 +140,11 @@ export const AppActionCard: React.FC<AppActionCardProps> = ({
             <button
               type="button"
               onClick={onOpenAppsModal}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl text-[11px] font-medium bg-blue-950/60 hover:bg-blue-900/40 text-blue-300 border border-blue-800/30 transition-all cursor-pointer"
-              title="View all installed laptop apps"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl text-[11px] font-medium bg-blue-950/60 hover:bg-blue-900/40 text-blue-300 border border-blue-800/30 transition-all cursor-pointer"
+              title="Open Windows Start & search apps"
             >
-              <Layers className="w-3 h-3" />
-              <span>All Apps</span>
+              <WindowsLogo className="w-3.5 h-3.5" />
+              <span>Windows Start</span>
             </button>
           )}
 

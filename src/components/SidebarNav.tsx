@@ -14,6 +14,7 @@ import {
   ChevronUp,
   ChevronDown,
 } from 'lucide-react';
+import { WindowsLogo } from './WindowsLogo';
 import { ActiveModal, UserLocation } from '../types';
 
 interface SidebarNavProps {
@@ -332,11 +333,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             )}
           </button>
 
-          {/* 4. Downloaded Laptop Apps */}
+          {/* 4. Windows Option (Start Menu & App Search) */}
           <button
             type="button"
-            id="nav-apps"
-            title="Downloaded Laptop Apps"
+            id="nav-windows"
+            title="⊞ Windows Option (Search & Open Any Laptop App)"
             onPointerDown={(e) => e.stopPropagation()}
             onClick={(e) => {
               e.stopPropagation();
@@ -344,11 +345,11 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             }}
             className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
               activeModal === 'apps'
-                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                ? 'text-blue-200 bg-blue-600/25 border border-blue-400/60 shadow-[0_0_20px_rgba(0,120,215,0.45)] ring-1 ring-blue-400/40'
                 : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
             }`}
           >
-            <Laptop className="w-5 h-5 transition-transform group-hover:scale-110" />
+            <WindowsLogo className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'apps' && (
               <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
@@ -583,15 +584,16 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
           </button>
 
           <button
-            id="mobile-nav-apps"
+            id="mobile-nav-windows"
+            title="⊞ Windows Option (Search & Open Laptop Apps)"
             onClick={() => onSelectModal(activeModal === 'apps' ? null : 'apps')}
             className={`p-2 rounded-lg text-xs transition-all ${
               activeModal === 'apps'
-                ? 'text-blue-300 bg-blue-950/50'
+                ? 'text-blue-300 bg-blue-950/60 ring-1 ring-blue-500/40'
                 : 'text-slate-400 hover:text-blue-300'
             }`}
           >
-            <Laptop className="w-4 h-4" />
+            <WindowsLogo className="w-4 h-4" />
           </button>
 
           <button

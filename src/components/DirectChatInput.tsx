@@ -18,12 +18,14 @@ import {
 } from 'lucide-react';
 import { LanguagePreference } from '../types';
 import { AudioRecordingSession, transcribeAudio } from '../utils/transcribeService';
+import { WindowsLogo } from './WindowsLogo';
 
 interface DirectChatInputProps {
   onSendMessage: (text: string, useMapsGrounding?: boolean) => void;
   onTypingChange?: (text: string) => void;
   onOpenPdfOrFile?: () => void;
   onOpenTranscribeModal?: () => void;
+  onOpenWindowsApps?: () => void;
   isLoading: boolean;
   isSpeaking: boolean;
   voiceEnabled: boolean;
@@ -43,6 +45,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   onTypingChange,
   onOpenPdfOrFile,
   onOpenTranscribeModal,
+  onOpenWindowsApps,
   isLoading,
   isSpeaking,
   voiceEnabled,
@@ -176,7 +179,12 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   };
 
   return (
-    <div className="w-full max-w-2xl px-4 sm:px-6 flex flex-col items-center">
+    <div
+      className={`w-full max-w-2xl px-4 sm:px-6 flex flex-col items-center ${
+        isLightMode ? '' : 'bg-[#02030f]'
+      }`}
+      style={{ backgroundColor: isLightMode ? undefined : '#02030f' }}
+    >
       {/* Top Status Bar: Wake-word indicator & Quick feature pills */}
       <div className="mb-2 flex items-center gap-2 flex-wrap justify-center">
         {/* Wake-Word Status Pill / Indicator */}
@@ -368,6 +376,24 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
             title="Pick & Open PDF / Document from Laptop"
           >
             <Paperclip className="w-4 h-4" />
+          </button>
+        )}
+
+        {/* Windows Option Quick Button */}
+        {onOpenWindowsApps && (
+          <button
+            type="button"
+            onClick={onOpenWindowsApps}
+            id="btn-windows-option"
+            className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-full text-xs transition-all cursor-pointer flex-shrink-0 ${
+              isLightMode
+                ? 'bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200'
+                : 'bg-blue-600/15 hover:bg-blue-600/25 text-blue-300 border border-blue-500/30 shadow-[0_0_12px_rgba(59,130,246,0.2)]'
+            }`}
+            title="⊞ Windows Option — Click to search and open any app on your laptop"
+          >
+            <WindowsLogo className="w-3.5 h-3.5" />
+            <span className="hidden sm:inline font-medium text-[11px]">Windows</span>
           </button>
         )}
 

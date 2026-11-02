@@ -181,6 +181,36 @@ export interface HabitAction {
   }[];
 }
 
+export interface DetectedScreenText {
+  text: string;
+  kind?: string;
+  confidence?: number;
+}
+
+export interface DetectedScreenElement {
+  type: string;
+  text?: string;
+  bounds?: { x: number; y: number; width: number; height: number };
+  confidence?: number;
+  actionable?: boolean;
+}
+
+export interface ScreenVisionAction {
+  type: 'observe' | 'read_text' | 'detect_changes' | 'active_window';
+  question?: string;
+  summary: string;
+  application?: string;
+  activeWindowTitle?: string;
+  textSummary?: string;
+  texts: DetectedScreenText[];
+  elements?: DetectedScreenElement[];
+  dialogs?: { kind: string; text?: string; confidence?: number }[];
+  errors?: string[];
+  warnings?: string[];
+  snapshotUrl?: string;
+  timestamp: number;
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'model';
@@ -194,6 +224,7 @@ export interface Message {
   mapsAction?: MapsLocationAction;
   globeAction?: GlobeAction;
   habitAction?: HabitAction;
+  screenVisionAction?: ScreenVisionAction;
   mapsGrounding?: MapsGroundingPlace[];
 }
 
@@ -232,4 +263,5 @@ export type ActiveModal =
   | 'globe'
   | 'transcribe'
   | 'habits'
-  | 'arcade';
+  | 'arcade'
+  | 'screen_vision';

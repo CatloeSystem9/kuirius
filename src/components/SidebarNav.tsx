@@ -11,6 +11,7 @@ import {
   AudioLines,
   CalendarCheck,
   Gamepad2,
+  Eye,
   ChevronUp,
   ChevronDown,
 } from 'lucide-react';
@@ -446,7 +447,29 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             )}
           </button>
 
-          {/* 9. Daily Habits & Calendar */}
+          {/* 9. Screen Vision (Read & See User Screen) */}
+          <button
+            type="button"
+            id="nav-screen-vision"
+            title="👁️ Krisha Screen Vision: Read & See User's Screen"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('screen_vision');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
+              activeModal === 'screen_vision'
+                ? 'text-cyan-200 bg-cyan-600/25 border border-cyan-400/60 shadow-[0_0_20px_rgba(6,182,212,0.45)] ring-1 ring-cyan-400/40'
+                : 'text-slate-400 hover:text-cyan-300 hover:bg-cyan-950/40 border border-transparent hover:border-cyan-500/30 hover:shadow-[0_0_12px_rgba(6,182,212,0.2)]'
+            }`}
+          >
+            <Eye className="w-5 h-5 transition-transform group-hover:scale-110 text-cyan-400" />
+            {activeModal === 'screen_vision' && (
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-cyan-400 shadow-[0_0_8px_#22d3ee]" />
+            )}
+          </button>
+
+          {/* 10. Daily Habits & Calendar */}
           <button
             type="button"
             id="nav-habits"
@@ -649,6 +672,19 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
             }`}
           >
             <AudioLines className="w-4 h-4" />
+          </button>
+
+          <button
+            id="mobile-nav-screen-vision"
+            title="Read & See User Screen"
+            onClick={() => onSelectModal(activeModal === 'screen_vision' ? null : 'screen_vision')}
+            className={`p-2 rounded-lg text-xs transition-all ${
+              activeModal === 'screen_vision'
+                ? 'text-cyan-300 bg-cyan-950/50 ring-1 ring-cyan-500/40'
+                : 'text-slate-400 hover:text-cyan-300'
+            }`}
+          >
+            <Eye className="w-4 h-4 text-cyan-400" />
           </button>
 
           <button

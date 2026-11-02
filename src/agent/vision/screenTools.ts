@@ -37,16 +37,20 @@ function mapObserverError(err: unknown): ToolResult {
   return fail(`Screen observation failed: ${String((err as any)?.message || err)}`, { errorKind: 'execution_error', retryable: true });
 }
 
-/** Compact output for a state — summaries and bounded lists, never image data. */
+/** Compact output for a state — summaries and bounded lists, never raw image data. */
 function stateOutput(state: ScreenState) {
+  const visibleTexts = state.analysis.texts.slice(0, 25);
+  const textSummary = visibleTexts.map((t) => t.text).filter(Boolean).join(' • ');
+
   return {
     summary: state.analysis.summary,
-    application: state.analysis.application,
+    application: state.analysis.application || state.activeWindow.title || 'Desktop / Browser Screen',
     activeWindow: state.activeWindow.available
       ? { title: state.activeWindow.title, surface: state.activeWindow.surface }
       : { available: false },
-    texts: state.analysis.texts.slice(0, 10),
-    elements: state.analysis.elements.slice(0, 12),
+    textSummary: textSummary || undefined,
+    texts: visibleTexts,
+    elements: state.analysis.elements.slice(0, 20),
     dialogs: state.analysis.dialogs.slice(0, 5),
     errors: state.analysis.errors.slice(0, 5),
     warnings: state.analysis.warnings.slice(0, 5),
@@ -55,6 +59,7 @@ function stateOutput(state: ScreenState) {
     confidence: state.analysis.confidence,
     capturedAt: state.timestamp,
     stateId: state.id,
+    snapshotRef: state.snapshotRef,
   };
 }
 
@@ -62,7 +67,7 @@ export function createScreenTools(observer: ScreenObserver): AgentTool[] {
   return [
     {
       name: 'screen.observe',
-      description: 'Capture and analyze the current screen; returns what is visible (application, texts, elements, dialogs, errors) as structured state.',
+      description: 'Capture and visually read the user screen; returns what is visible (application, legible texts, interactive elements, dialogs, errors) as structured state.',
       category: 'vision',
       riskLevel: 'medium',
       cost: 'moderate',
@@ -72,7 +77,7 @@ export function createScreenTools(observer: ScreenObserver): AgentTool[] {
       inputSchema: {
         optional: ['question', 'analyze', 'maxAgeMs'],
         types: { question: 'string', analyze: 'string', maxAgeMs: 'number' },
-        validators: { analyze: (v) => v === 'auto' || v === 'cloud' },
+        validators: { analyze: (v) => v === 'auto' || v === 'cloud' || v === 'local' },
       },
       verification: SCREEN_VERIFICATION,
       timeoutMs: 25_000,

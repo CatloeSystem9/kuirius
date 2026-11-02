@@ -466,7 +466,9 @@ export const AppsModal: React.FC<AppsModalProps> = ({
                 return (
                   <button
                     key={app.id}
-                    ref={(el) => (itemRefs.current[index] = el)}
+                    ref={(el) => {
+                      itemRefs.current[index] = el;
+                    }}
                     onClick={() => {
                       setSelectedIndex(index);
                     }}

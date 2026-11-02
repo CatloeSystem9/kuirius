@@ -43,7 +43,6 @@ function defaultGrants(): PermissionGrants {
     'application.launch': true,
     'location.access': true,
     'memory.access': true,
-    // Desktop / recording / destructive domains: disabled until later phases.
     'screen.observation': false,
     'mouse.control': false,
     'keyboard.control': false,

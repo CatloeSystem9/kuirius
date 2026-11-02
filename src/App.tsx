@@ -17,6 +17,7 @@ import {
   DailyHabit,
   CalendarEvent,
   HabitAction,
+  ScreenVisionAction,
 } from './types';
 import {
   getStoredSettings,
@@ -79,6 +80,8 @@ import { GlobeModal } from './components/globe/GlobeModal';
 import { AudioTranscriptionModal } from './components/AudioTranscriptionModal';
 import { HabitActionCard } from './components/HabitActionCard';
 import { HabitsModal } from './components/HabitsModal';
+import { ScreenVisionCard } from './components/ScreenVisionCard';
+import { ScreenVisionModal } from './components/ScreenVisionModal';
 import { ArcadeModal } from './components/arcade/ArcadeModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import type { GameId } from './components/arcade/types';
@@ -142,6 +145,7 @@ export default function App() {
   const [activeFileAction, setActiveFileAction] = useState<LocalFileAction | null>(null);
   const [activeAppAction, setActiveAppAction] = useState<LaptopAppAction | null>(null);
   const [activeGlobeAction, setActiveGlobeAction] = useState<GlobeAction | null>(null);
+  const [activeScreenVisionAction, setActiveScreenVisionAction] = useState<ScreenVisionAction | null>(null);
   const [initialAppSearch, setInitialAppSearch] = useState<string>('');
 
   // Daily Habits & Calendar State
@@ -276,6 +280,9 @@ export default function App() {
       },
       openModal: (modal) => setActiveModal(modal),
       setPose: (pose) => setForcedPose(pose as VideoAnimationPose),
+      applyScreenVisionAction: (action) => {
+        setActiveScreenVisionAction(action);
+      },
     });
     const memoryAttachment = attachMemoryToSystem(system, getMemoryService());
     agentSystemRef.current = system;
@@ -592,7 +599,98 @@ export default function App() {
     }
   };
 
-    // Execute a multi-step request through the Agent Core and report honestly in chat.
+  // Directly capture and read user's screen with Gemini Vision
+  const handleReadScreen = async (customPrompt?: string) => {
+    try {
+      setIsLoading(true);
+      setExpression('listening_attentive');
+      setForcedPose('playful_gesture');
+      setLastSpokenText("Looking at your screen now. Please choose the window or screen you'd like me to see.");
+
+      // Grant screen observation permission in session
+      agentSystemRef.current?.permissions?.grant('screen.observation');
+
+      const observer = agentSystemRef.current?.screenObserver;
+      if (!observer) {
+        throw new Error('Screen observation system is not initialized.');
+      }
+
+      const promptQuestion =
+        customPrompt ||
+        'Read and visually inspect this screen. Describe the application, window title, all visible and legible text, key buttons, and any errors or notable content factual and clearly.';
+
+      const state = await observer.getCurrentState({
+        analyze: 'cloud',
+        question: promptQuestion,
+      });
+
+      const snapshotUrl = state.snapshotRef ? observer.getSnapshot(state.snapshotRef) : undefined;
+      const actionData: ScreenVisionAction = {
+        type: 'observe',
+        question: customPrompt,
+        summary: state.analysis.summary,
+        application: state.analysis.application || state.activeWindow?.title || 'Desktop / Browser Screen',
+        activeWindowTitle: state.activeWindow?.title,
+        textSummary: state.analysis.texts?.map((t) => t.text).filter(Boolean).join(' • '),
+        texts: state.analysis.texts || [],
+        elements: state.analysis.elements || [],
+        dialogs: state.analysis.dialogs,
+        errors: state.analysis.errors,
+        warnings: state.analysis.warnings,
+        snapshotUrl,
+        timestamp: state.timestamp,
+      };
+
+      setActiveScreenVisionAction(actionData);
+      setExpression('happy_sparkle');
+      setForcedPose('waving_greeting');
+
+      const speech = `I can see your screen! ${actionData.summary}`;
+      setLastSpokenText(speech);
+
+      // Record in current conversation
+      const now = Date.now();
+      const visionBotMsg: Message = {
+        id: 'msg_' + now,
+        role: 'model',
+        content: `👁️ **Screen Vision:** ${actionData.summary}${
+          actionData.textSummary ? `\n\n**Legible Screen Text:**\n${actionData.textSummary.slice(0, 350)}` : ''
+        }`,
+        timestamp: now,
+        expression: 'happy_sparkle',
+        screenVisionAction: actionData,
+      };
+
+      setConversations((prev) => {
+        if (prev.length === 0) return prev;
+        const active = prev.find((c) => c.id === activeConvoId) || prev[0];
+        return prev.map((c) => (c.id === active.id ? { ...c, messages: [...c.messages, visionBotMsg] } : c));
+      });
+
+      if (settings.voiceEnabled) {
+        speakKrishaText(
+          speech,
+          settings.voiceName || 'Aoede',
+          settings.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false),
+          undefined,
+          settings.languagePreference || 'auto',
+          settings.voicePitch ?? 1.0,
+          settings.voiceEngine || 'auto'
+        );
+      }
+    } catch (err: any) {
+      console.error('Screen vision error:', err);
+      const errMsg = `I could not read your screen: ${err?.message || 'Screen capture permission was not granted or cancelled.'}`;
+      setLastSpokenText(errMsg);
+      setExpression('thoughtful_gaze');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  // Execute a multi-step request through the Agent Core and report honestly in chat.
   const runAgentDelegated = async (text: string) => {
     const now = Date.now();
     const userEmotion = analyzeSentimentAndKeywords(text);
@@ -874,7 +972,7 @@ export default function App() {
         setActiveViewerFile(targetToOpen);
         setActiveModal('file_viewer');
         openOrDownloadFile(targetToOpen);
-        setForcedPose('pointing_document');
+        setForcedPose('playful_gesture');
         setExpression('happy_sparkle');
       } else {
         setInitialFileSearch(query);
@@ -1224,6 +1322,17 @@ export default function App() {
     setConversations(updatedConversations);
     saveStoredConversations(updatedConversations);
     setIsLoading(true);
+
+    // Screen vision commands: directly invoke real Gemini vision on user screen
+    const isScreenReadCommand =
+      /\b(read|see|look at|view|inspect|observe)\s+(?:the\s+|my\s+|user's\s+)?screen\b/i.test(text) ||
+      /\b(?:can you see|what(?:'s| is) on|read what(?:'s| is) on)\s+(?:the\s+|my\s+)?screen\b/i.test(text) ||
+      /\b(screen\s+vision|read\s+screen)\b/i.test(text);
+
+    if (isScreenReadCommand) {
+      handleReadScreen(text);
+      return;
+    }
 
     // -------------------------------------------------------------------
     // Wind information queries (Phase 2): answer "wind speed ..." style
@@ -1867,6 +1976,29 @@ export default function App() {
             }
             isLightMode={isWhiteBackground}
           />
+          <ScreenVisionCard
+            action={activeScreenVisionAction}
+            onDismiss={() => setActiveScreenVisionAction(null)}
+            onOpenModal={() => setActiveModal('screen_vision')}
+            onRescan={() => handleReadScreen()}
+            onSpeakText={(text) => {
+              setLastSpokenText(text);
+              if (settings.voiceEnabled) {
+                speakKrishaText(
+                  text,
+                  settings.voiceName || 'Aoede',
+                  settings.voiceSpeed,
+                  () => setIsSpeaking(true),
+                  () => setIsSpeaking(false),
+                  undefined,
+                  settings.languagePreference || 'auto',
+                  settings.voicePitch ?? 1.0,
+                  settings.voiceEngine || 'auto'
+                );
+              }
+            }}
+            isLightMode={isWhiteBackground}
+          />
           <DirectChatInput
             onSendMessage={handleSendMessage}
             onTypingChange={handleTypingReaction}
@@ -1879,6 +2011,7 @@ export default function App() {
               setActiveModal('apps');
               setInitialAppSearch('');
             }}
+            onReadScreen={() => handleReadScreen()}
             isLoading={isLoading}
             isSpeaking={isSpeaking}
             isLightMode={isWhiteBackground}
@@ -2073,6 +2206,31 @@ export default function App() {
           initialGameId={arcadeInitialGame}
         />
       </ErrorBoundary>
+
+      {/* 13. Screen Vision Studio Modal (Read & Inspect User Screen) */}
+      <ScreenVisionModal
+        isOpen={activeModal === 'screen_vision'}
+        onClose={() => setActiveModal(null)}
+        action={activeScreenVisionAction}
+        onRescanScreen={(q) => handleReadScreen(q)}
+        onSpeakText={(text) => {
+          setLastSpokenText(text);
+          if (settings.voiceEnabled) {
+            speakKrishaText(
+              text,
+              settings.voiceName || 'Aoede',
+              settings.voiceSpeed,
+              () => setIsSpeaking(true),
+              () => setIsSpeaking(false),
+              undefined,
+              settings.languagePreference || 'auto',
+              settings.voicePitch ?? 1.0,
+              settings.voiceEngine || 'auto'
+            );
+          }
+        }}
+        isLightMode={isWhiteBackground}
+      />
     </div>
   );
 }

@@ -257,7 +257,7 @@ export function extractGoal(text: string): AgentGoal {
  */
 export function classifyScreenIntent(text: string): StepClassification | null {
   const clean = text.trim();
-  if (!/\b(screen|display|monitor)\b/i.test(clean)) return null;
+  if (!/\b(screen|display|monitor|window|desktop)\b/i.test(clean) && !/\b(read|see|look at)\s+(?:user's|the|my)?\s*(?:screen|display|monitor)\b/i.test(clean)) return null;
 
   if (/what\s+changed?|did\s+the\s+screen\s+change|any\s+changes?\s+on/i.test(clean)) {
     return {
@@ -276,12 +276,13 @@ export function classifyScreenIntent(text: string): StepClassification | null {
     };
   }
   if (
-    /what(?:'s| is| am i)|\bread\b|\bcheck\b|look\s+at|describe|analyze|inspect|observe|wrong|error|dialog|popup|notification|visible|do\s+you\s+see|is\s+there/i.test(clean)
+    /what(?:'s| is| am i)|\bread\b|\bsee\b|\bcheck\b|look\s+at|describe|analyze|inspect|observe|wrong|error|dialog|popup|notification|visible|do\s+you\s+see|is\s+there|tell\s+me|show\s+me|view|watch|vision/i.test(clean) ||
+    /\b(read|see|look at|view)\s+(?:user's|the|my)?\s*screen\b/i.test(clean)
   ) {
     return {
       toolName: 'screen.observe',
       capability: 'screen.observe',
-      description: 'Observe and analyze the current screen',
+      description: 'Observe and visually read the user screen with Gemini vision',
       input: { question: clean },
     };
   }

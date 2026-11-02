@@ -31,9 +31,10 @@ export class GeminiVisionProvider implements VisionProvider {
       throw new ObserverError('provider_unavailable', 'Cloud vision requires an encoded frame, which this capture did not provide');
     }
 
+    const baseUrl = typeof window !== 'undefined' ? '' : (process.env.VISION_BASE_URL || 'http://localhost:3000');
     let response: Response;
     try {
-      response = await fetch('/api/vision/analyze', {
+      response = await fetch(`${baseUrl}/api/vision/analyze`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

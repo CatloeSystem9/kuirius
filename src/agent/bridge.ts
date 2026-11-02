@@ -67,6 +67,7 @@ export interface AgentHost {
   applyGlobeAction(action: import('../types').GlobeAction): void;
   openModal(modal: import('../types').ActiveModal): void;
   setPose(pose: string): void;
+  applyScreenVisionAction?(action: import('../types').ScreenVisionAction): void;
 }
 
 export interface AgentSystem {
@@ -128,6 +129,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   const registry = new ToolRegistry(bus);
   const store = new TaskStore();
   const permissions = new PermissionManager();
+  permissions.grant('screen.observation');
 
   // Learning + workflow acquisition (Phase 12): learns from task outcomes and
   // user corrections on the shared event bus; learned workflows are reuse
@@ -506,6 +508,29 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     if (event.taskId) perfTaskStarts.delete(event.taskId);
   });
 
+  // Screen Vision: surface observed screen state with snapshot and extracted text to the host UI
+  const detachScreenObserved = bus.on('SCREEN_OBSERVED', (event) => {
+    const payload = event.payload as any;
+    const state = payload?.state;
+    if (state && host.applyScreenVisionAction) {
+      const snapshotUrl = state.snapshotRef ? screenObserver.getSnapshot(state.snapshotRef) : undefined;
+      host.applyScreenVisionAction({
+        type: 'observe',
+        summary: state.analysis.summary,
+        application: state.analysis.application || state.activeWindow?.title || 'Desktop / Browser Screen',
+        activeWindowTitle: state.activeWindow?.title,
+        textSummary: state.analysis.texts?.map((t: any) => t.text).filter(Boolean).join(' • '),
+        texts: state.analysis.texts || [],
+        elements: state.analysis.elements || [],
+        dialogs: state.analysis.dialogs,
+        errors: state.analysis.errors,
+        warnings: state.analysis.warnings,
+        snapshotUrl,
+        timestamp: state.timestamp,
+      });
+    }
+  });
+
   return {
     core,
     bus,
@@ -546,6 +571,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       detachPerfTaskEnd();
       detachPerfTaskFail();
       detachPerfTaskCancel();
+      detachScreenObserved();
     },
   };
 }

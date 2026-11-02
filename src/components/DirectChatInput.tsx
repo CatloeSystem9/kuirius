@@ -13,6 +13,7 @@ import {
   Globe,
   AudioLines,
   MapPin,
+  Eye,
   X,
   Check,
 } from 'lucide-react';
@@ -26,6 +27,7 @@ interface DirectChatInputProps {
   onOpenPdfOrFile?: () => void;
   onOpenTranscribeModal?: () => void;
   onOpenWindowsApps?: () => void;
+  onReadScreen?: () => void;
   isLoading: boolean;
   isSpeaking: boolean;
   voiceEnabled: boolean;
@@ -46,6 +48,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   onOpenPdfOrFile,
   onOpenTranscribeModal,
   onOpenWindowsApps,
+  onReadScreen,
   isLoading,
   isSpeaking,
   voiceEnabled,
@@ -260,6 +263,23 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
           >
             <AudioLines className="w-3 h-3 text-blue-400" />
             <span>Transcribe Audio</span>
+          </button>
+        )}
+
+        {/* Read Screen Vision Pill */}
+        {onReadScreen && (
+          <button
+            type="button"
+            onClick={onReadScreen}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium transition-all cursor-pointer border backdrop-blur-md ${
+              isLightMode
+                ? 'bg-cyan-50/90 border-cyan-300 text-cyan-800 hover:text-cyan-950 hover:bg-cyan-100'
+                : 'bg-cyan-950/40 border-cyan-500/30 text-cyan-300 hover:text-cyan-100 hover:bg-cyan-900/40 shadow-[0_0_12px_rgba(6,182,212,0.15)]'
+            }`}
+            title="Read and see your screen with Gemini Vision"
+          >
+            <Eye className="w-3 h-3 text-cyan-400" />
+            <span>Read Screen</span>
           </button>
         )}
       </div>

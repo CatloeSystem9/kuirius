@@ -127,7 +127,7 @@ export class ScreenObserver {
    * are translated back to full-screen coordinates and the change signature
    * is always computed on the full frame.
    */
-  async getCurrentState(options: { analyze?: 'auto' | 'cloud'; question?: string; maxAgeMs?: number; region?: Bounds } = {}): Promise<ScreenState> {
+  async getCurrentState(options: { analyze?: 'auto' | 'cloud' | 'local'; question?: string; maxAgeMs?: number; region?: Bounds } = {}): Promise<ScreenState> {
     const maxAge = options.maxAgeMs ?? this.getRecommendedReuseWindow();
     if (this.lastState && maxAge > 0 && Date.now() - this.lastState.timestamp < maxAge) {
       return this.lastState; // unchanged-screen optimization: skip recapture entirely
@@ -136,7 +136,8 @@ export class ScreenObserver {
     const frame = await this.captureFrame();
     const analysisFrame = options.region ? cropFrame(frame, options.region) : frame;
 
-    const provider = options.analyze === 'cloud' ? this.providers.cloud : this.providers.local;
+    const useCloud = options.analyze === 'cloud';
+    const provider = useCloud ? this.providers.cloud : this.providers.local;
     if (!provider.available()) {
       throw new ObserverError('provider_unavailable', `Vision provider "${provider.name}" is unavailable`);
     }
@@ -175,8 +176,12 @@ export class ScreenObserver {
 
     this.lastState = state;
     this.pushHistory(state);
-    this.events?.emit({ name: 'SCREEN_OBSERVED', payload: { stateId: state.id, provider: analysis.provider }, timestamp: Date.now() });
+    this.events?.emit({ name: 'SCREEN_OBSERVED', payload: { stateId: state.id, provider: analysis.provider, state }, timestamp: Date.now() });
     return state;
+  }
+
+  getLastState(): ScreenState | null {
+    return this.lastState;
   }
 
   /** Bounded in-memory history of recent states (no image data) for comparisons. */

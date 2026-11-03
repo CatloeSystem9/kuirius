@@ -8,7 +8,7 @@
  *  4. Passive-first & safety enforcement: no storage mutation, no synthetic events, no network
  *  5. Read-only active probes: opt-in flag (includeActiveProbes), excluded by default
  *  6. Core runtime checks: AgentCore availability, task lifecycle consistency, event bus buffer
- *  7. Intelligence subsystem checks: ContextEngine, KnowledgeGraph, Semantic, Memory, Consolidation
+ *  7. Intelligence subsystem checks: ContextEngine, KnowledgeGraph, Semantic, Memory, Consolidation, Learned Skills
  *  8. Execution subsystem checks: ToolRegistry integrity, planner wiring, recovery, permissions
  *  9. Model & routing checks: profile listing, router wiring without invocation, API key detection
  * 10. Persistence checks: read path, storage contract without calling mutators
@@ -43,6 +43,7 @@ import type {
 } from '../src/agent/diagnostics';
 
 import { AgentEventBus } from '../src/agent/events';
+import { SkillEngine } from '../src/agent/skills';
 import { ToolRegistry } from '../src/agent/toolRegistry';
 import { TaskStore, MemoryStorage, type StorageAdapter } from '../src/agent/taskState';
 import { AgentCore } from '../src/agent/agentCore';
@@ -383,6 +384,11 @@ async function runTests(): Promise<void> {
       semantic,
       memory,
       consolidation,
+      skills: new SkillEngine({
+        registry: new ToolRegistry(new AgentEventBus()),
+        events: new AgentEventBus(),
+        storage,
+      }),
     });
 
     const registry = new DiagnosticRegistry();
@@ -390,12 +396,12 @@ async function runTests(): Promise<void> {
 
     // Passive run
     const passiveResults = registry.runAll();
-    assertEqual(passiveResults.length, 5, 'Passive intelligence checks count is 5');
+    assertEqual(passiveResults.length, 6, 'Passive intelligence checks count is 6');
     assert(passiveResults.every((r) => r.status === 'healthy'), 'All passive intelligence checks pass');
 
     // Active probe run (includes context_engine.probe and knowledge_graph.probe)
     const probeResults = registry.runAll(undefined, { includeActiveProbes: true });
-    assertEqual(probeResults.length, 7, 'Intelligence checks with active probes count is 7');
+    assertEqual(probeResults.length, 8, 'Intelligence checks with active probes count is 8');
     assert(probeResults.every((r) => r.status === 'healthy'), 'All intelligence active probes pass');
 
     // Missing contextEngine

@@ -1959,3 +1959,107 @@ storage.
 - **Ephemeral Failure Ring**: In-memory failure records are bounded (≤50) and reset across process restarts;
   long-term historical trends rely on the standard application audit logs.
 
+
+## 28. Learned Skills v1
+
+**Learned Skills v1 — COMPLETE.** Krisha can now turn genuinely verified task
+executions into structured, validated, reusable skills — the curated tier
+ABOVE the Phase 12 workflow candidates (which remain reuse *suggestions*).
+A learned skill is not a saved conversation: it is validated structured data
+with provenance, preconditions, an expected outcome and reliability tracking.
+
+### 28.1 New module (`src/agent/skills/`)
+
+- `skillTypes.ts` — the `LearnedSkill` data model (id, name, description,
+  purpose, trigger pattern + keywords + domains, ordered steps, preconditions,
+  required tools/permissions, expected outcome, sensitive flag, provenance,
+  validation record, version + history, stats, EWMA reliability) plus the
+  bounded constants and the reliability smoothing function.
+- `skillValidator.ts` — deterministic validation before anything is stored:
+  2–10 executable steps, every tool resolvable in the CURRENT registry, no
+  high/critical-risk tools, secret-like values rejected, templates bounded
+  and serializable. Shares the Phase 12 secret-detection definition.
+- `skillStore.ts` — bounded (≤30), schema-versioned, corruption-tolerant
+  persistence under its own storage key (`krisha_skills_v1`), same
+  StorageAdapter convention and repair-don't-drop philosophy as Phase 12.
+- `skillEngine.ts` — the pipeline: observe verified completions → extract →
+  validate → dedupe (identical sequence reinforces; same goal with a new
+  verified sequence becomes a new VERSION — never a near-duplicate) → store →
+  mirror to Knowledge Graph + Memory. Retrieval ranks skills by token
+  similarity + bounded Semantic Intelligence expansion + reliability +
+  environment coverage, with explicit transparent blockers. `planFromSkill`
+  instantiates a NORMAL plan (skillFrom marker) after re-checking
+  preconditions; `recordOutcome` applies EWMA smoothing (a single failure
+  never collapses a proven skill: 1.0 → 0.8) and disables a skill decaying
+  below 0.15; `auditStale` reports outdated/unreliable skills.
+- `skillPlanner.ts` — `SkillAwarePlanner`, a thin decorator over the existing
+  planner chain (skill reuse → Phase 12 workflow reuse → heuristic planning).
+  No second planner loop.
+- `skillTools.ts` — `skill.list`, `skill.search`, `skill.stats` (safe,
+  read-only) and `skill.disable`, `skill.forget` (learned-data management,
+  `memory.access`). There is deliberately NO create-skill-from-text tool.
+
+### 28.2 Learning gates (safety by construction)
+
+Skills are learned ONLY from tasks that (a) completed, (b) carry the honest
+Intelligence-Loop goal verification `pass` (strict all-steps-verified
+fallback), (c) contain ≥2 executable completed steps, (d) contain no
+high/critical-risk tools, and (e) pass deterministic validation. Failures,
+cancellations, timeouts, uncertain results, user messages and unverified
+model plans never create skills. Sensitive workflows (medium-risk tools or
+desktop/write/terminal/hardware permissions) are flagged and surfaced; the
+Phase 18 gate still evaluates every reused step at execution.
+
+### 28.3 Reuse never bypasses anything
+
+A reused skill becomes an ordinary `AgentPlan` executed by the existing
+AgentCore through the ToolRegistry and the Phase 18 SafetyGate — permissions,
+step verification, retry, recovery, cancellation and timeouts all apply
+unchanged. Preconditions (tool availability + permission state) are
+re-validated immediately before instantiation, so a skill whose environment
+changed is never run. Skill-driven tasks are excluded from Phase 12
+re-learning (no near-duplicate artifacts).
+
+### 28.4 Integration
+
+Phase 12 (coexisting learning layer; shared sanitizer/secret definitions),
+Semantic Intelligence (goal expansion for matching + near-duplicate
+detection), Knowledge Graph (skills indexed as `component` nodes with `uses`
+edges to their tools), Memory Service (compact mirrors; consolidation sees
+them through the normal memory path), Self-Diagnostics (passive
+`intelligence.learned_skills` check), event bus (`SKILL_LEARNED`,
+`SKILL_REINFORCED`, `SKILL_UPDATED`, `SKILL_REJECTED`, `SKILL_REUSED`).
+
+### 28.5 Verification
+
+- `scripts/test-skills.ts`: **123 assertions, 0 failed** — extraction,
+  failed/uncertain/timeout/cancellation rejection, no-skill-from-messages,
+  validation units, high-risk refusal, secret redaction, duplicate
+  reinforcement, version updates, full learn→floor→reuse lifecycle through
+  the core, missing prerequisites, permission enforcement, semantic matching
+  with explainable blockers, reliability smoothing/decay/disable/dedupe,
+  persistence across restarts and corruption tolerance, Phase 12 coexistence,
+  graph/memory/diagnostics integration, discovery tools, bounded store.
+- `scripts/runtime-check-skills.ts`: **35 checks PASS** — production wiring
+  (HeuristicPlanner chain + Phase 18 gate + audit + emergency stop): natural
+  language → plan → gated execution → learned skill → reinforcement →
+  skill-driven reuse (every step gate-evaluated with decision metadata),
+  restart fidelity, emergency-stop semantics (side effects blocked, read-only
+  work continues), revoked-permission denial, audit redaction, cheap matching.
+- Full regression: **28/29 suites PASS**; TypeScript CLEAN; lint CLEAN;
+  production build exit 0. The single failing suite
+  (`test-intelligence-loop.ts`) is PRE-EXISTING and unrelated to skills: its
+  harness expects planner intent classifiers (`answer`, "write the file X
+  with content Y", `network_fetch`) that do not exist anywhere in
+  `src/agent/planner.ts` — unimplemented Intelligence-Loop planner work that
+  predates and is independent of Learned Skills v1 (proven by classification
+  probe; the suite imports no skills code).
+
+### 28.6 Known limitations
+
+Skill inputs are reused as sanitized templates (no automatic parameter
+substitution yet) — a skill matches goals similar to its source task, and
+context-ref chaining works only where the source run used it. Reinforcement
+counts same-sequence verified reruns as successful uses (honest evidence,
+but not independent reuse). Voice/UI presentation of skills is not exposed
+(no UI change was permitted); discovery is via tools and DevTools.

@@ -2114,3 +2114,54 @@ kept out of the browser bundle by design.
 **Tools:** project.approve_root, project.list, project.inspect,
 project.changes, project.status, project.forget — all low/safe risk,
 requiring filesystem.read or memory.access grants.
+
+## 30. System stabilisation & integrity audit
+
+A maintenance pass that repaired the long-standing Intelligence Loop
+regression, audited Learned Skills v1 and Project Awareness v1 against their
+specifications, and fixed the integration gaps it found. No UI, server, or
+roadmap changes; no new dependencies.
+
+**Intelligence Loop repair (root cause).** `test-intelligence-loop.ts`
+(written 2026-10-07, untouched since) registered its mock tools under an
+invented capability vocabulary (`answer`, `filesystem_write`,
+`network_fetch`, `observe_screen`, `project_manage`) that matches nothing in
+the production planner, which emits dotted capabilities
+(`filesystem.read`, `screen.observe`, `chat.report`, ...) — so every
+production-classified step failed tool resolution. Additionally, two
+assertions passed only vacuously (the underlying tasks failed, so the
+consolidation idempotency guard never saw a natural completion event), and
+two fixtures predated current production bounds (cache payloads below
+MIN_CACHEABLE_RESULT_CHARS; a memory question without the analyzer's
+documented memory-query cue). Fixes: the harness now registers tools under
+the planner's real emitted names (the same convention as
+`test-agent-core.ts`), asserts consolidation through the engine's public
+`task_result` path and genuinely verifies the duplicate-event guard, and
+uses fixtures within production bounds. One real planner gap was closed:
+"write the file X with content Y" now classifies to the EXISTING
+`filesystem.create` tool (which supports content) instead of falling to an
+honest "not executable yet" note — conservative guards (explicit 'write'
+verb, path-ish target, explicit 'with content' clause) keep ordinary chat
+unhijacked. Questions still route to the documented `system.note` fallback;
+no network classifier was invented.
+
+**Project Awareness integrity fixes.** (1) The Knowledge Graph mirror is now
+REBUILT on every index: files/modules removed from a project are pruned from
+the graph (reference-counted — a node is deleted only when nothing else
+points at it, so records shared with other systems or projects survive), and
+`project.forget` removes the project's graph records AND releases its
+durable memory records through the existing `MemoryService.forget` API
+(only records carrying the engine's own metadata markers). (2) Manifests are
+always re-read on incremental scans so parsed frameworks/dependencies survive
+re-indexing; unchanged non-manifest files are still never re-read. (3) The
+secret-name matcher also covers `secrets.json`/`credentials.json`-style
+names, and a private-key CONTENT probe excludes innocent-looking config
+files carrying key material. Both are regression-tested in
+`scripts/test-projects.ts` (207 assertions).
+
+**Audit results.** Learned Skills v1 and Project Awareness v1 verified
+against their specifications: verified-success-only learning, EWMA
+reliability with honest unverified-outcome weighting, secret redaction,
+precondition re-validation immediately before reuse, gated execution, bounded
+persistence with repair-don't-drop, approval-gated read-only scanning,
+metadata-only storage, on-demand-only work (no polling, no timers).

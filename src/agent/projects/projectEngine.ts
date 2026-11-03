@@ -9,6 +9,7 @@
  */
 import type { AgentEventBus } from '../events';
 import type { KnowledgeGraphFacade } from '../knowledge/index';
+import type { KnowledgeNode } from '../knowledge/knowledgeTypes';
 import type { MemoryService } from '../memory/memoryService';
 import { hashKey } from '../routing/cache';
 import type { StorageAdapter } from '../taskState';
@@ -229,8 +230,15 @@ export class ProjectEngine {
 
   /** Remove a project's knowledge AND its approval (both halves of consent). */
   forget(root: string): boolean {
-    const removed = this.store.remove(root);
-    this.store.revoke(root);
+    const normalized = normalizeRoot(root);
+    const profile = this.profile(normalized);
+    const removed = this.store.remove(normalized);
+    this.store.revoke(normalized);
+    if (removed) {
+      this.events?.emit({ name: 'PROJECT_STATUS_UPDATED', payload: { root: normalized, forgotten: true }, timestamp: Date.now() });
+      this.removeGraphMirror(profile?.root ?? normalized);
+      this.removeMemoryMirror(profile, normalized);
+    }
     return removed;
   }
 
@@ -242,10 +250,15 @@ export class ProjectEngine {
    * frameworks ('uses'). This is ALSO the retrieval path: the Context Engine
    * already queries graph statements, so project questions surface this
    * knowledge with zero extra retrieval machinery.
+   *
+   * The mirror is REBUILT on every index: records for files or modules that
+   * no longer exist (or for a forgotten project) are pruned, so the graph
+   * never claims a removed file is still part of the project.
    */
   private mirrorToGraph(profile: ProjectProfile): void {
     if (!this.knowledgeGraph) return;
     try {
+      this.pruneGraphMirror(profile.root, profile);
       const graph = this.knowledgeGraph.graph;
       const projectNode = graph.upsertNode({
         type: 'project',
@@ -275,6 +288,98 @@ export class ProjectEngine {
       }
     } catch {
       // the graph must never break project indexing
+    }
+  }
+
+  /**
+   * Every project node recorded for this root (a renamed project leaves its
+   * old label behind). Bounded lookup — the graph caps nodes, so this scan
+   * is cheap and never polls.
+   */
+  private projectGraphNodes(root: string): KnowledgeNode[] {
+    if (!this.knowledgeGraph) return [];
+    try {
+      const lower = normalizeRoot(root).toLowerCase();
+      return this.knowledgeGraph.graph.getNodesByType('project', 64).filter((n) => typeof n.properties?.root === 'string' && normalizeRoot(n.properties.root).toLowerCase() === lower);
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Remove graph records that no longer match the fresh profile: edges and
+   * project-owned nodes for files/modules that disappeared. A child node is
+   * deleted only when NO other system references it (any non-
+   * project_awareness edge keeps it alive — cross-system integrity first).
+   * Called with a null profile when the project is forgotten entirely.
+   */
+  private pruneGraphMirror(root: string, profile: ProjectProfile | null): void {
+    if (!this.knowledgeGraph) return;
+    try {
+      const graph = this.knowledgeGraph.graph;
+      const keepLabels = new Set<string>();
+      if (profile) {
+        for (const m of profile.modules.slice(0, 12)) keepLabels.add(`${profile.name}/${m.path}`.slice(0, 80));
+        for (const f of profile.importantFiles.filter((f) => f.role === 'entry' || f.role === 'manifest').slice(0, 12)) keepLabels.add(`${profile.name}/${f.path}`.slice(0, 80));
+      }
+      for (const projectNode of this.projectGraphNodes(root)) {
+        for (const edge of [...graph.getIncomingRelations(projectNode.id, 64), ...graph.getOutgoingRelations(projectNode.id, 64)]) {
+          if (edge.source !== 'project_awareness') continue;
+          const otherId = edge.sourceId === projectNode.id ? edge.targetId : edge.sourceId;
+          const other = graph.getNode(otherId);
+          const otherLabel = other?.label ?? '';
+          // Framework 'uses' edges are removed when stale; the shared tool
+          // node itself may be referenced by other projects, so it stays.
+          const childStays = profile !== null && (keepLabels.has(otherLabel) || edge.relationship === 'uses');
+          // Reference check happens BEFORE the edge is removed: the node is
+          // only deletable when nothing else will still point at it.
+          const deletable = !childStays && !!other && this.nodeHasNoOtherReferences(other.id, edge.id);
+          graph.deleteEdge(edge.id);
+          if (deletable) graph.deleteNode(other!.id);
+        }
+        if (profile === null) graph.deleteNode(projectNode.id);
+      }
+    } catch {
+      // pruning must never break indexing or forgetting
+    }
+  }
+
+  /** True when no edge other than `ignoreEdgeId` still references the node. */
+  private nodeHasNoOtherReferences(nodeId: string, ignoreEdgeId?: string): boolean {
+    if (!this.knowledgeGraph) return false;
+    try {
+      const graph = this.knowledgeGraph.graph;
+      const edges = [...graph.getIncomingRelations(nodeId, 32), ...graph.getOutgoingRelations(nodeId, 32)].filter((e) => e.id !== ignoreEdgeId);
+      return edges.length === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Full graph cleanup when a project is forgotten (never throws). */
+  private removeGraphMirror(root: string): void {
+    this.pruneGraphMirror(root, null);
+  }
+
+  /**
+   * Release the durable memory records this engine wrote for a forgotten
+   * project — through the EXISTING MemoryService.forget API. Only records
+   * carrying this engine's own metadata markers (projectId / root) are
+   * removed; user memories are never touched. Never throws.
+   */
+  private removeMemoryMirror(profile: ProjectProfile | undefined, root: string): void {
+    if (!this.memory) return;
+    try {
+      const lower = normalizeRoot(root).toLowerCase();
+      for (const record of [...this.memory.records]) {
+        const meta = record.metadata as { projectId?: unknown; root?: unknown } | undefined;
+        const metaRoot = typeof meta?.root === 'string' ? normalizeRoot(meta.root).toLowerCase() : '';
+        if ((profile && meta?.projectId === profile.id) || (metaRoot && metaRoot === lower)) {
+          this.memory.forget(record.id);
+        }
+      }
+    } catch {
+      // memory must never break forgetting
     }
   }
 

@@ -153,6 +153,23 @@ export function classifySystemIntent(clause: string): StepClassification | null 
     };
   }
 
+  // "Write the file X with content Y" — the existing filesystem.create tool
+  // supports content, so this natural phrasing maps to it instead of falling
+  // to an honest "not executable yet" note. Conservative: explicit 'write'
+  // verb, a path-ish target (same guard as read/delete), and an explicit
+  // 'with content' clause — ordinary chat is never hijacked.
+  if ((m = text.match(/^write\s+(?:the\s+)?(?:file\s+)?(.+?)\s+with\s+content\s+(.+)$/i))) {
+    const target = m[1].trim();
+    if (!/\.\w{1,5}$/.test(target) && !/[\\/]/.test(target)) return null;
+    const content = m[2].trim().replace(/^["']+|["']+$/g, '');
+    return {
+      toolName: 'filesystem.create',
+      capability: 'filesystem.create',
+      description: `Write ${content.length} characters to "${target}"`,
+      input: { path: target, type: 'file', content },
+    };
+  }
+
   if ((m = text.match(/^delete\s+(?:the\s+)?(?:file|folder|directory)?\s*:?\s*(.+)$/i))) {
     const target = m[1].trim();
     if (!/[\\/]/.test(target) && !/\.\w{1,5}$/i.test(target)) return null; // require a path-ish target

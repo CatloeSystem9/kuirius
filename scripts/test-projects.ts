@@ -432,6 +432,16 @@ function makePythonProject(dir: string): void {
   assert(JSON.stringify(statements).includes('part_of') || JSON.stringify(statements).includes('uses'), 'relationship statements rendered');
   assert(!JSON.stringify(statements).includes('API_KEY'), 'no secret values can surface through retrieval');
   assert(p.stats.secretsExcluded > 0, 'sanity: fixture had secrets');
+  // Removed files must not leave misleading graph records: delete a module
+  // directory, re-index, and the stale component node is pruned.
+  nodeFs.rmSync(nodePath.join(dir, 'src', 'components'), { recursive: true, force: true });
+  const reindexed = (await h.engine.index(dir)).profile!;
+  assert(!reindexed.modules.some((m) => m.path === 'src/components'), 'removed module gone from the fresh profile');
+  const afterPrune = h.knowledgeGraph.graph.getNodesByType('component', 30).map((n) => n.label);
+  assert(!afterPrune.some((l) => l.includes('src/components')), 'removed module pruned from the graph');
+  assert(afterPrune.some((l) => l === 'alpha-app/src' || l.startsWith('alpha-app/src/')), 'still-present module kept in the graph');
+  assert(h.knowledgeGraph.graph.getNodesByType('project', 20).some((n) => n.label.includes('alpha-app')), 'project node survives the re-index');
+  assert(h.knowledgeGraph.graph.getNodesByType('tool', 30).some((n) => n.label === 'React'), 'shared framework tool node survives pruning');
 }
 
 // ---------------------------------------------------------------- Test 10
@@ -506,6 +516,30 @@ function makePythonProject(dir: string): void {
   const engine3 = h.restart();
   assertEqual(engine3.listApproved().length, 0, 'approval revocation survives restart');
   assertEqual(engine3.profile(dir), undefined, 'profile removal survives restart');
+  // No misleading graph records survive the forget either.
+  const graphAfterForget = new KnowledgeGraphFacade({ storage: h.storage });
+  assert(!graphAfterForget.graph.getNodesByType('project', 20).some((n) => String(n.properties?.root ?? '').toLowerCase().includes('mu')), 'forgotten project has no graph node');
+  assert(!graphAfterForget.graph.getNodesByType('component', 30).some((n) => n.label.startsWith('mu-persist/')), 'forgotten project has no module nodes');
+  // The durable memory record this engine wrote is released too (through the
+  // existing MemoryService.forget API — only project-awareness records).
+  const memoryAfterForget = new MemoryService(h.storage);
+  assert(
+    !memoryAfterForget.records.some((r) => {
+      const m = r.metadata as { root?: string } | undefined;
+      return typeof m?.root === 'string' && m.root.toLowerCase().includes('mu');
+    }),
+    'forgotten project memory record released'
+  );
+  // Cross-system scenario: re-index AFTER a restart — fresh store, fresh
+  // graph, same identity.
+  assertEqual((await engine3.approveRoot(dir)).ok, true, 're-approval after restart works');
+  const reIndexed = await engine3.index(dir);
+  assertEqual(reIndexed.ok, true, 're-index after restart works');
+  assertEqual(reIndexed.profile!.id, p2!.id, 'project id stable across forget + restart + re-index');
+  assertEqual(reIndexed.profile!.name, 'mu-persist', 'identity stable across restart');
+  const graphRebuilt = new KnowledgeGraphFacade({ storage: h.storage });
+  assert(graphRebuilt.graph.getNodesByType('project', 20).some((n) => n.label.includes('mu-persist')), 'graph mirror rebuilt after restart');
+  engine3.forget(dir); // leave the fixture forgotten for the cleanup section
 }
 
 // ---------------------------------------------------------------- Test 13

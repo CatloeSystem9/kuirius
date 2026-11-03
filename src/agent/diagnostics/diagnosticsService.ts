@@ -59,6 +59,8 @@ export interface DiagnosticsServiceDeps {
   consolidation?: ConsolidationEngine;
   /** Learned Skills v1 — validated reusable-capability engine. */
   skills?: import('../skills').SkillEngine;
+  /** Project Awareness v1 — read-only understanding of approved projects. */
+  projects?: import('../projects').ProjectEngine;
   recovery?: RecoveryManager;
   planner?: Planner;
   router?: ModelRouter;

@@ -12,6 +12,7 @@ import type { SemanticIntelligence } from '../../semantic/semanticExpander';
 import type { MemoryService } from '../../memory/memoryService';
 import type { ConsolidationEngine } from '../../memory/consolidation/consolidationEngine';
 import type { SkillEngine } from '../../skills';
+import type { ProjectEngine } from '../../projects';
 
 export interface IntelligenceCheckDeps {
   contextEngine?: ContextEngine;
@@ -20,6 +21,7 @@ export interface IntelligenceCheckDeps {
   memory?: MemoryService;
   consolidation?: ConsolidationEngine;
   skills?: SkillEngine;
+  projects?: ProjectEngine;
 }
 
 export function createIntelligenceChecks(deps: IntelligenceCheckDeps): DiagnosticCheckDef[] {
@@ -269,6 +271,52 @@ export function createIntelligenceChecks(deps: IntelligenceCheckDeps): Diagnosti
             message: `Learned-skills inspection failed: ${err?.message || String(err)}`,
             evidence: { error: String(err) },
             remediation: 'Review SkillEngine statistics and store repair logic.',
+          };
+        }
+      },
+    },
+    {
+      id: 'intelligence.project_awareness',
+      name: 'Project Awareness State',
+      subsystem: 'intelligence',
+      description: 'Passively inspects bounded project-awareness counters (approved roots, indexed projects, staleness) without scanning any directory.',
+      severity: 'informational',
+      checkType: 'passive',
+      run(): DiagnosticCheckOutcome {
+        if (!deps.projects) {
+          return {
+            status: 'degraded',
+            message: 'ProjectEngine is not configured.',
+            remediation: 'Initialize ProjectEngine in bridge.ts.',
+          };
+        }
+
+        try {
+          const stats = deps.projects.stats();
+          if (!stats || typeof stats.projects !== 'number' || typeof stats.approvedRoots !== 'number') {
+            return {
+              status: 'unhealthy',
+              message: 'ProjectEngine did not return a valid statistics snapshot.',
+              remediation: 'Inspect ProjectStore persistence and statistics implementation.',
+            };
+          }
+
+          return {
+            status: 'healthy',
+            message: `Project awareness is readable (${stats.approvedRoots} approved roots, ${stats.projects} indexed projects, ${stats.stale} stale).`,
+            evidence: {
+              approvedRoots: stats.approvedRoots,
+              projects: stats.projects,
+              stale: stats.stale,
+              kinds: stats.kinds,
+            },
+          };
+        } catch (err: any) {
+          return {
+            status: 'unhealthy',
+            message: `Project-awareness inspection failed: ${err?.message || String(err)}`,
+            evidence: { error: String(err) },
+            remediation: 'Review ProjectEngine statistics and store repair logic.',
           };
         }
       },

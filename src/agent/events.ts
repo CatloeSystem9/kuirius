@@ -96,6 +96,10 @@ export type AgentEventName =
   | 'SKILL_UPDATED'
   | 'SKILL_REJECTED'
   | 'SKILL_REUSED'
+  // Project Awareness v1 — read-only understanding of approved projects
+  | 'PROJECT_INDEXED'
+  | 'PROJECT_STATUS_UPDATED'
+  | 'PROJECT_CHANGES'
   // Phase 16 — Advanced Planning (hierarchical, adaptive, bounded)
   | 'PLAN_CREATED'
   | 'PLAN_UPDATED'

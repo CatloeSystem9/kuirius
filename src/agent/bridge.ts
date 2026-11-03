@@ -51,6 +51,7 @@ import {
 import { EmergencyStop, SafetyAuditLog, SafetyGate, ScopedPermissionManager, createSafetyTools, type SafetyToolsDeps } from './safety';
 import { LongRunManager, createLongRunTools } from './longrun';
 import { CapabilityCatalog, createCapabilityTools, SpecialistCatalogSource, PublicApisCatalogSource } from './capabilities';
+import { ProjectEngine, HttpProjectFs, createProjectTools } from './projects';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -87,6 +88,8 @@ export interface AgentSystem {
   learning?: LearningService;
   /** Learned Skills v1 — validated reusable-capability engine. */
   skills?: SkillEngine;
+  /** Project Awareness v1 — read-only understanding of approved projects. */
+  projects?: ProjectEngine;
   /** Multimodal intelligence service (Phase 14). */
   multimodal?: MultimodalService;
   /** Proactive intelligence service (Phase 15). */
@@ -415,6 +418,23 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   const capabilities = new CapabilityCatalog([new SpecialistCatalogSource(), new PublicApisCatalogSource()]);
   registry.registerAll(createCapabilityTools(capabilities));
 
+  // Project Awareness v1: read-only understanding of EXPLICITLY approved
+  // project roots — identity, languages, frameworks, entry points, module
+  // structure, dev progress and change detection. Strictly on-demand (no
+  // polling, no background scanning), metadata-only (never file contents,
+  // never secrets), disk access rides the existing Phase 9 /api/fs backend
+  // and every tool passes the Phase 18 gate. Project knowledge mirrors into
+  // the Knowledge Graph + Memory, so the Context Engine and Semantic
+  // Intelligence retrieve it through their existing pipelines.
+  const projects = new ProjectEngine({
+    fs: new HttpProjectFs(new HttpFsBackend()),
+    storage: localStorageAdapter,
+    knowledgeGraph,
+    memory: getMemoryService(),
+    events: bus,
+  });
+  registry.registerAll(createProjectTools({ projects }));
+
   // Model routing (Phase 17): deterministic classification + smallest-capable
   // model selection over the registry of configured models. Decision-only —
   // the tools compute routes and read metrics; they execute nothing, so
@@ -440,6 +460,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     memory: getMemoryService(),
     consolidation,
     skills,
+    projects,
     recovery: core.recovery,
     planner,
     router: modelRouter,
@@ -456,7 +477,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, projects, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.

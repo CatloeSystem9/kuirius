@@ -2063,3 +2063,54 @@ context-ref chaining works only where the source run used it. Reinforcement
 counts same-sequence verified reruns as successful uses (honest evidence,
 but not independent reuse). Voice/UI presentation of skills is not exposed
 (no UI change was permitted); discovery is via tools and DevTools.
+
+## 29. Project Awareness v1
+
+Krisha now understands the user's software projects: identity, languages,
+frameworks, dependencies, entry points, module structure, development
+progress (goal / progress / blockers / completed work) and what changed
+since the last look — while remaining strictly read-only, approval-gated,
+metadata-only and bounded.
+
+**Boundaries (hard):** only EXPLICITLY approved roots are ever read
+(`project.approve_root` verifies the directory exists and is listable;
+unapproved roots are refused, never silently accessed). Indexing never
+modifies, moves, deletes or executes anything. Secret-shaped files
+(`.env*`, keys, credentials, service accounts, …) are never read or
+stored — by name pattern AND by content probe (private-key blocks) — and
+are only counted. Storage is metadata-only: paths, sizes, sigs, names.
+
+**Scanning (`projectScanner.ts`):** one on-demand BFS per index — depth <= 6,
+<= 80 dirs, <= 200 entries/dir, no file content ever persisted. Excluded
+dirs: node_modules, dist, build, .git, coverage, venvs, __pycache__, ... .
+Manifests (package.json, go.mod, Cargo.toml, pyproject.toml,
+requirements.txt, .csproj, pom.xml) are parsed (bounded 96 KB reads) for
+name, kind, frameworks, dependency NAMES and entry points. Language
+histograms come from extensions. Directory digests (djb2 over bounded
+entry shapes) plus size:mtime file signatures make change detection and
+incrementality cheap: unchanged non-manifest files are never re-read
+(readsSaved), manifests are re-read so parsed data stays correct.
+
+**Persistence (`projectStore.ts`):** schema-versioned envelope under
+`krisha_projects_v1` via the StorageAdapter convention; repair-don't-drop;
+hard caps (10 projects); approvals and profiles are stored together so
+`project.forget` removes both halves of consent.
+
+**Engine (`projectEngine.ts`):** approveRoot / index / refreshIfStale /
+changes / status / profile / stats / forget. Fully on-demand — no polling,
+no timers, no background scanning. Events: PROJECT_INDEXED,
+PROJECT_STATUS_UPDATED, PROJECT_CHANGES.
+
+**Integration (no duplicates):** the engine mirrors <= 31 nodes / <= 30 edges
+per project into the EXISTING Knowledge Graph (project node, modules and
+key files via part_of, frameworks via uses) — which is also the retrieval
+path, since the Context Engine already queries graph statements. Durable
+identity records go through the EXISTING MemoryService. Disk access rides
+the EXISTING Phase 9 /api/fs backend (`HttpProjectFs`), so zero server
+routes changed. Tools pass the ToolRegistry -> Phase 18 SafetyGate like
+every other capability; `NodeProjectFs` (tests / server-side only) is
+kept out of the browser bundle by design.
+
+**Tools:** project.approve_root, project.list, project.inspect,
+project.changes, project.status, project.forget — all low/safe risk,
+requiring filesystem.read or memory.access grants.

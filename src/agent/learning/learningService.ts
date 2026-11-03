@@ -140,6 +140,12 @@ export class LearningService {
   learnFromTask(task: AgentTask): LearnOutcome {
     if (!task.plan) return { learned: false, reason: 'no plan' };
 
+    // A skill-driven task (Learned Skills v1) records its outcome against the
+    // reused SKILL — learning a workflow from it would create a near-duplicate.
+    if (task.plan.skillFrom) {
+      return { learned: false, reason: 'skill-driven task (outcome recorded by the skill engine)' };
+    }
+
     // A plan instantiated from a learned workflow updates THAT workflow's
     // usage statistics instead of creating a near-duplicate.
     if (task.plan.learnedFrom) {

@@ -77,6 +77,8 @@ export interface AgentPlan {
   evidenceKey?: string;
   /** Set when the plan was instantiated from a learned workflow (Phase 12). */
   learnedFrom?: { workflowId: string; version: number; score: number };
+  /** Set when the plan was instantiated from a validated learned skill (Learned Skills v1). */
+  skillFrom?: { skillId: string; version: number; score: number };
 }
 
 export type TaskStatus =

@@ -57,6 +57,8 @@ export interface DiagnosticsServiceDeps {
   semantic?: SemanticIntelligence;
   memory?: MemoryService;
   consolidation?: ConsolidationEngine;
+  /** Learned Skills v1 — validated reusable-capability engine. */
+  skills?: import('../skills').SkillEngine;
   recovery?: RecoveryManager;
   planner?: Planner;
   router?: ModelRouter;

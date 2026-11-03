@@ -11,6 +11,7 @@ import type { KnowledgeGraphFacade } from '../../knowledge';
 import type { SemanticIntelligence } from '../../semantic/semanticExpander';
 import type { MemoryService } from '../../memory/memoryService';
 import type { ConsolidationEngine } from '../../memory/consolidation/consolidationEngine';
+import type { SkillEngine } from '../../skills';
 
 export interface IntelligenceCheckDeps {
   contextEngine?: ContextEngine;
@@ -18,6 +19,7 @@ export interface IntelligenceCheckDeps {
   semantic?: SemanticIntelligence;
   memory?: MemoryService;
   consolidation?: ConsolidationEngine;
+  skills?: SkillEngine;
 }
 
 export function createIntelligenceChecks(deps: IntelligenceCheckDeps): DiagnosticCheckDef[] {
@@ -222,6 +224,53 @@ export function createIntelligenceChecks(deps: IntelligenceCheckDeps): Diagnosti
           status: 'healthy',
           message: 'Memory Consolidation engine is wired and active.',
         };
+      },
+    },
+    {
+      id: 'intelligence.learned_skills',
+      name: 'Learned Skills State',
+      subsystem: 'intelligence',
+      description: 'Passively inspects bounded learned-skill counters without running a match or a skill.',
+      severity: 'informational',
+      checkType: 'passive',
+      run(): DiagnosticCheckOutcome {
+        if (!deps.skills) {
+          return {
+            status: 'degraded',
+            message: 'SkillEngine is not configured.',
+            remediation: 'Initialize SkillEngine in bridge.ts.',
+          };
+        }
+
+        try {
+          const stats = deps.skills.stats();
+          if (!stats || typeof stats.skills !== 'number' || typeof stats.avgReliability !== 'number') {
+            return {
+              status: 'unhealthy',
+              message: 'SkillEngine did not return a valid statistics snapshot.',
+              remediation: 'Inspect SkillStore persistence and statistics implementation.',
+            };
+          }
+
+          return {
+            status: 'healthy',
+            message: `Learned-skills store is readable (${stats.skills} skills, ${stats.reusable} reusable).`,
+            evidence: {
+              skills: stats.skills,
+              reusable: stats.reusable,
+              sensitive: stats.sensitive,
+              disabled: stats.disabled,
+              avgReliability: stats.avgReliability,
+            },
+          };
+        } catch (err: any) {
+          return {
+            status: 'unhealthy',
+            message: `Learned-skills inspection failed: ${err?.message || String(err)}`,
+            evidence: { error: String(err) },
+            remediation: 'Review SkillEngine statistics and store repair logic.',
+          };
+        }
       },
     },
     {

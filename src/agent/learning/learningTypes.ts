@@ -201,7 +201,7 @@ export function sanitizeTemplate(input: Record<string, unknown>): Record<string,
   return out;
 }
 
-const SECRET_VALUE_RE = /\bsk-[a-z0-9]{12,}\b|\bghp_[a-z0-9]{20,}\b|\bAKIA[0-9A-Z]{12,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----/i;
+export const SECRET_VALUE_RE = /\bsk-[a-z0-9]{12,}\b|\bghp_[a-z0-9]{20,}\b|\bAKIA[0-9A-Z]{12,}\b|-----BEGIN [A-Z ]*PRIVATE KEY-----/i;
 
 export function maskIfSecretLike(value: string): string {
   if (SECRET_VALUE_RE.test(value)) return '[redacted]';

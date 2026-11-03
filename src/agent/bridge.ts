@@ -19,6 +19,7 @@ import { BrowserCaptureSource } from './vision/browserCapture';
 import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, HeuristicPlanner } from './planner';
 import { LearningService } from './learning/learningService';
 import { WorkflowAwarePlanner } from './learning/workflowPlanner';
+import { SkillEngine, SkillAwarePlanner, createSkillTools } from './skills';
 import { getMemoryService } from './memory/memoryService';
 import { ConsolidationEngine } from './memory/consolidation';
 import { ComputerControlService } from './computer/computerControl';
@@ -84,6 +85,8 @@ export interface AgentSystem {
   keyboardControl?: KeyboardControlService;
   /** Learning + workflow acquisition service (Phase 12). */
   learning?: LearningService;
+  /** Learned Skills v1 — validated reusable-capability engine. */
+  skills?: SkillEngine;
   /** Multimodal intelligence service (Phase 14). */
   multimodal?: MultimodalService;
   /** Proactive intelligence service (Phase 15). */
@@ -189,7 +192,22 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     storage: localStorageAdapter,
     getTask: (id) => store.get(id),
   });
-  const planner = new WorkflowAwarePlanner(new HeuristicPlanner(), learning);
+  // Learned Skills v1: the VALIDATED tier above Phase 12 workflow candidates.
+  // Skills are learned only from genuinely verified task executions (honest
+  // goal-level verification), validated deterministically, matched through
+  // the existing Semantic Intelligence layer, and reused ONLY as normal plans
+  // that run through the Agent Core + ToolRegistry + Phase 18 SafetyGate.
+  const skills = new SkillEngine({
+    registry,
+    events: bus,
+    storage: localStorageAdapter,
+    semantic,
+    knowledgeGraph,
+    memory: getMemoryService(),
+    permissions,
+    taskResolver: (taskId) => store.get(taskId),
+  });
+  const planner = new SkillAwarePlanner(new WorkflowAwarePlanner(new HeuristicPlanner(), learning), skills);
   const core = new AgentCore({
     registry,
     events: bus,
@@ -421,6 +439,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     semantic,
     memory: getMemoryService(),
     consolidation,
+    skills,
     recovery: core.recovery,
     planner,
     router: modelRouter,
@@ -430,13 +449,22 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   });
   registry.registerAll(createDiagnosticTools(diagnostics));
 
+  // Learned Skills v1 tools: read-only discovery + learned-data management
+  // (disable/forget). There is deliberately no "create skill from text" tool —
+  // skills come only from verified task executions.
+  registry.registerAll(createSkillTools({ skills }));
+
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
   const detachLearning = learning.attach();
+
+  // Learned Skills v1: subscribe to the shared bus (verified-success learning
+  // + skill-reuse outcome recording). Event-driven only; never polls.
+  const detachSkills = skills.attach();
 
   // Adaptive observation (Phase 13): event-driven triggers on the shared bus.
   const detachObservation = adaptiveObserver.attach(bus);
@@ -540,6 +568,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     adaptiveObserver,
     keyboardControl,
     learning,
+    skills,
     multimodal,
     proactive,
     planning,
@@ -557,6 +586,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     detach: () => {
       detachStepListener();
       detachLearning();
+      detachSkills();
       detachObservation();
       detachMultimodal();
       detachProactive();

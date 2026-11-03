@@ -90,6 +90,12 @@ export type AgentEventName =
   | 'WORKFLOW_DETECTED'
   | 'WORKFLOW_LEARNED'
   | 'WORKFLOW_REUSED'
+  // Learned Skills v1 — validated reusable capabilities (tier above Phase 12)
+  | 'SKILL_LEARNED'
+  | 'SKILL_REINFORCED'
+  | 'SKILL_UPDATED'
+  | 'SKILL_REJECTED'
+  | 'SKILL_REUSED'
   // Phase 16 — Advanced Planning (hierarchical, adaptive, bounded)
   | 'PLAN_CREATED'
   | 'PLAN_UPDATED'

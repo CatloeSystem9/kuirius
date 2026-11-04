@@ -9,7 +9,7 @@
  */
 import type { AgentEventBus } from '../events';
 import type { KnowledgeGraphFacade } from '../knowledge/index';
-import type { KnowledgeNode } from '../knowledge/knowledgeTypes';
+import type { KnowledgeEdge, KnowledgeNode } from '../knowledge/knowledgeTypes';
 import type { MemoryService } from '../memory/memoryService';
 import { hashKey } from '../routing/cache';
 import type { StorageAdapter } from '../taskState';
@@ -292,15 +292,32 @@ export class ProjectEngine {
   }
 
   /**
-   * Every project node recorded for this root (a renamed project leaves its
-   * old label behind). Bounded lookup — the graph caps nodes, so this scan
-   * is cheap and never polls.
+   * Every project node recorded for this root, found through the COMPLETE
+   * edge snapshot below — `getNodesByType` caps at maxQueryResults (10),
+   * which could hide stale nodes from renamed or forgotten projects.
    */
-  private projectGraphNodes(root: string): KnowledgeNode[] {
+  private projectGraphNodes(root: string, allEdges: KnowledgeEdge[]): KnowledgeNode[] {
     if (!this.knowledgeGraph) return [];
     try {
+      const graph = this.knowledgeGraph.graph;
       const lower = normalizeRoot(root).toLowerCase();
-      return this.knowledgeGraph.graph.getNodesByType('project', 64).filter((n) => typeof n.properties?.root === 'string' && normalizeRoot(n.properties.root).toLowerCase() === lower);
+      const seen = new Set<string>();
+      const found: KnowledgeNode[] = [];
+      const candidates = new Set<string>();
+      for (const e of allEdges) {
+        candidates.add(e.sourceId);
+        candidates.add(e.targetId);
+      }
+      // Union with the by-type listing so an edge-less (empty) project node
+      // is still found.
+      for (const n of graph.getNodesByType('project', 64)) candidates.add(n.id);
+      for (const id of candidates) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const n = graph.getNode(id);
+        if (n && n.type === 'project' && typeof n.properties?.root === 'string' && normalizeRoot(n.properties.root).toLowerCase() === lower) found.push(n);
+      }
+      return found;
     } catch {
       return [];
     }
@@ -309,21 +326,35 @@ export class ProjectEngine {
   /**
    * Remove graph records that no longer match the fresh profile: edges and
    * project-owned nodes for files/modules that disappeared. A child node is
-   * deleted only when NO other system references it (any non-
-   * project_awareness edge keeps it alive — cross-system integrity first).
-   * Called with a null profile when the project is forgotten entirely.
+   * deleted only when NOTHING else will still point at it (cross-system
+   * integrity first). Called with a null profile when the project is
+   * forgotten entirely.
+   *
+   * Uses one complete edge snapshot instead of the per-node relation
+   * queries, which silently cap at maxQueryResults (10) — a project with
+   * more than 10 mirrored parts would otherwise leave stale records, and a
+   * hidden reference could cause a premature node deletion.
    */
   private pruneGraphMirror(root: string, profile: ProjectProfile | null): void {
     if (!this.knowledgeGraph) return;
     try {
       const graph = this.knowledgeGraph.graph;
+      const allEdges = graph.getAllEdges(graph.limits.maxEdges);
+      const edgesByNode = new Map<string, KnowledgeEdge[]>();
+      for (const e of allEdges) {
+        for (const id of [e.sourceId, e.targetId]) {
+          const list = edgesByNode.get(id);
+          if (list) list.push(e);
+          else edgesByNode.set(id, [e]);
+        }
+      }
       const keepLabels = new Set<string>();
       if (profile) {
         for (const m of profile.modules.slice(0, 12)) keepLabels.add(`${profile.name}/${m.path}`.slice(0, 80));
         for (const f of profile.importantFiles.filter((f) => f.role === 'entry' || f.role === 'manifest').slice(0, 12)) keepLabels.add(`${profile.name}/${f.path}`.slice(0, 80));
       }
-      for (const projectNode of this.projectGraphNodes(root)) {
-        for (const edge of [...graph.getIncomingRelations(projectNode.id, 64), ...graph.getOutgoingRelations(projectNode.id, 64)]) {
+      for (const projectNode of this.projectGraphNodes(root, allEdges)) {
+        for (const edge of edgesByNode.get(projectNode.id) ?? []) {
           if (edge.source !== 'project_awareness') continue;
           const otherId = edge.sourceId === projectNode.id ? edge.targetId : edge.sourceId;
           const other = graph.getNode(otherId);
@@ -331,28 +362,17 @@ export class ProjectEngine {
           // Framework 'uses' edges are removed when stale; the shared tool
           // node itself may be referenced by other projects, so it stays.
           const childStays = profile !== null && (keepLabels.has(otherLabel) || edge.relationship === 'uses');
-          // Reference check happens BEFORE the edge is removed: the node is
-          // only deletable when nothing else will still point at it.
-          const deletable = !childStays && !!other && this.nodeHasNoOtherReferences(other.id, edge.id);
+          // Reference check against the SNAPSHOT (before any deletion): the
+          // node is only deletable when nothing else will still point at it.
+          const remaining = (edgesByNode.get(otherId) ?? []).filter((x) => x.id !== edge.id);
+          const deletable = !childStays && !!other && remaining.length === 0;
           graph.deleteEdge(edge.id);
-          if (deletable) graph.deleteNode(other!.id);
+          if (deletable) graph.deleteNode(other.id);
         }
         if (profile === null) graph.deleteNode(projectNode.id);
       }
     } catch {
       // pruning must never break indexing or forgetting
-    }
-  }
-
-  /** True when no edge other than `ignoreEdgeId` still references the node. */
-  private nodeHasNoOtherReferences(nodeId: string, ignoreEdgeId?: string): boolean {
-    if (!this.knowledgeGraph) return false;
-    try {
-      const graph = this.knowledgeGraph.graph;
-      const edges = [...graph.getIncomingRelations(nodeId, 32), ...graph.getOutgoingRelations(nodeId, 32)].filter((e) => e.id !== ignoreEdgeId);
-      return edges.length === 0;
-    } catch {
-      return false;
     }
   }
 

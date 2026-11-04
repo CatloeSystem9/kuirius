@@ -792,6 +792,39 @@ function makePythonProject(dir: string): void {
   assertEqual(degraded.status, 'degraded', 'check degraded without an engine');
 }
 
+// ---------------------------------------------------------------- Test 21
+{
+  console.log('Test 21 — Pruning with more than 10 mirrored parts (relation-query cap)');
+  // The graph's per-node relation queries cap at maxQueryResults (10); this
+  // fixture produces 8 modules + 9 entry/manifest files = 17 incoming edges,
+  // which exposed a stale-record bug in a cap-blind prune implementation.
+  const big = fixtureDir('psi');
+  const bigFiles: Record<string, string> = { 'package.json': '{"name":"big-app","dependencies":{"react":"^18.0.0"}}', 'README.md': '# big-app' };
+  for (let i = 0; i < 8; i++) bigFiles[`mod${i}/index.ts`] = 'export {};';
+  writeFiles(big, bigFiles);
+  const hBig = makeHarness();
+  await hBig.engine.approveRoot(big);
+  const pBig = (await hBig.engine.index(big)).profile!;
+  assertEqual(pBig.modules.length, 8, 'eight modules indexed');
+  const incoming = hBig.knowledgeGraph.graph.getAllEdges(1500).filter((e) => e.source === 'project_awareness' && e.relationship === 'part_of').length;
+  assert(incoming >= 17, `fixture exceeds the 10-edge relation cap (${incoming} part_of edges)`);
+  assert(hBig.knowledgeGraph.graph.getNodesByType('component', 30).some((n) => n.label.includes('big-app/mod3')), 'sanity: mod3 node mirrored');
+  // Remove every module directory, then re-index — every stale record must go.
+  for (let i = 0; i < 8; i++) nodeFs.rmSync(nodePath.join(big, `mod${i}`), { recursive: true, force: true });
+  const pAfter = (await hBig.engine.index(big)).profile!;
+  assertEqual(pAfter.modules.length, 0, 'no modules remain in the fresh profile');
+  const stale = hBig.knowledgeGraph.graph.getNodesByType('component', 30).filter((n) => n.label.includes('big-app/mod'));
+  assertEqual(stale.length, 0, 'ALL stale module nodes pruned despite the relation cap');
+  const edgesLeft = hBig.knowledgeGraph.graph.getAllEdges(1500).filter((e) => e.source === 'project_awareness' && e.relationship === 'part_of');
+  assertEqual(edgesLeft.length, 1, 'only the manifest file edge remains');
+  assert(hBig.knowledgeGraph.graph.getNodesByType('project', 20).some((n) => n.label.includes('big-app')), 'project node intact');
+  // Forget with >10 edges: the project node AND all its edges must go.
+  assertEqual(hBig.engine.forget(big), true, 'forget succeeds with >10 mirrored parts');
+  assertEqual(hBig.knowledgeGraph.graph.getAllEdges(1500).filter((e) => e.source === 'project_awareness').length, 0, 'all project_awareness edges removed on forget');
+  assert(!hBig.knowledgeGraph.graph.getNodesByType('project', 20).some((n) => n.label.includes('big-app')), 'project node removed on forget');
+  assertEqual(hBig.knowledgeGraph.graph.getNodesByType('file', 30).filter((n) => n.label.startsWith('big-app/')).length, 0, 'no stale file nodes on forget');
+}
+
 // ---------------------------------------------------------------- cleanup
 for (const dir of roots) {
   try {

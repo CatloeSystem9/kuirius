@@ -2147,17 +2147,21 @@ no network classifier was invented.
 
 **Project Awareness integrity fixes.** (1) The Knowledge Graph mirror is now
 REBUILT on every index: files/modules removed from a project are pruned from
-the graph (reference-counted — a node is deleted only when nothing else
-points at it, so records shared with other systems or projects survive), and
-`project.forget` removes the project's graph records AND releases its
-durable memory records through the existing `MemoryService.forget` API
-(only records carrying the engine's own metadata markers). (2) Manifests are
-always re-read on incremental scans so parsed frameworks/dependencies survive
-re-indexing; unchanged non-manifest files are still never re-read. (3) The
-secret-name matcher also covers `secrets.json`/`credentials.json`-style
-names, and a private-key CONTENT probe excludes innocent-looking config
-files carrying key material. Both are regression-tested in
-`scripts/test-projects.ts` (207 assertions).
+the graph. The prune works from a COMPLETE edge snapshot
+(`getAllEdges(limits.maxEdges)`) rather than per-node relation queries,
+which hard-cap at `maxQueryResults` (10) — the cap-blind version silently
+left stale records behind for projects with more than 10 indexed parts.
+Deletion is reference-counted against the snapshot: a node is removed only
+when nothing else in the graph still points at it, so records shared with
+other systems or projects survive. `project.forget` removes the project's
+graph records AND releases its durable memory records through the existing
+`MemoryService.forget` API (only records carrying the engine's own metadata
+markers). (2) Manifests are always re-read on incremental scans so parsed
+frameworks/dependencies survive re-indexing; unchanged non-manifest files
+are still never re-read. (3) The secret-name matcher also covers
+`secrets.json`/`credentials.json`-style names, and a private-key CONTENT
+probe excludes innocent-looking config files carrying key material. All are
+regression-tested in `scripts/test-projects.ts` (218 assertions).
 
 **Audit results.** Learned Skills v1 and Project Awareness v1 verified
 against their specifications: verified-success-only learning, EWMA

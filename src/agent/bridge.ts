@@ -52,6 +52,7 @@ import { EmergencyStop, SafetyAuditLog, SafetyGate, ScopedPermissionManager, cre
 import { LongRunManager, createLongRunTools } from './longrun';
 import { CapabilityCatalog, createCapabilityTools, SpecialistCatalogSource, PublicApisCatalogSource } from './capabilities';
 import { ProjectEngine, HttpProjectFs, createProjectTools } from './projects';
+import { GoalEngine, createGoalTools } from './goals';
 import { HttpBrowserBackend } from './browser/httpBrowser';
 import { createBrowserTools as createBrowserAgentTools } from './browser/browserTools';
 import { FilesystemService, ApplicationService } from './system/systemServices';
@@ -90,6 +91,8 @@ export interface AgentSystem {
   skills?: SkillEngine;
   /** Project Awareness v1 — read-only understanding of approved projects. */
   projects?: ProjectEngine;
+  /** Goal Continuity v1 — persistent user objectives across sessions. */
+  goals?: GoalEngine;
   /** Multimodal intelligence service (Phase 14). */
   multimodal?: MultimodalService;
   /** Proactive intelligence service (Phase 15). */
@@ -435,6 +438,25 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   });
   registry.registerAll(createProjectTools({ projects }));
 
+  // Goal Continuity v1: durable, bounded user objectives across sessions.
+  // Goals are created/changed only from sufficiently clear user statements
+  // (deterministic local detection — the host calls goals.observeMessage for
+  // every message; no polling, no AI calls). Resumption restores context and
+  // PROPOSES a next step — it never executes anything; every mutation rides
+  // the Phase 18 gate via goal.* tools. Knowledge mirrors ride the existing
+  // MemoryService + KnowledgeGraph so Context Engine retrieval sees goals
+  // through pipelines that already exist.
+  const goals = new GoalEngine({
+    storage: localStorageAdapter,
+    events: bus,
+    memory: getMemoryService(),
+    knowledge: knowledgeGraph,
+    projects,
+    skills,
+    getTask: (id) => store.get(id),
+  });
+  registry.registerAll(createGoalTools({ goals }));
+
   // Model routing (Phase 17): deterministic classification + smallest-capable
   // model selection over the registry of configured models. Decision-only —
   // the tools compute routes and read metrics; they execute nothing, so
@@ -461,6 +483,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     consolidation,
     skills,
     projects,
+    goals,
     recovery: core.recovery,
     planner,
     router: modelRouter,
@@ -477,7 +500,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // DevTools debug hook for manual verification / later permission UI (no UI surface).
   if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, projects, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
+    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, projects, goals, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
   }
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
@@ -520,6 +543,11 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // Memory Consolidation v1: event-driven durable-knowledge consolidation
   // (USER_MESSAGE / TASK_COMPLETED). Bounded per event; never polls.
   const detachConsolidation = consolidation.attach(bus);
+
+  // Goal Continuity v1: event-driven goal milestone tracking + forgotten-
+  // project cleanup on the shared bus. Task completion feeds milestones;
+  // cancellation changes nothing (emergency stop stays authoritative).
+  const detachGoals = goals.attach(bus);
 
   // Deep Research (additional capability): task-lifecycle cleanup of research dossiers.
   const detachResearch = research.attach(bus);
@@ -590,6 +618,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     keyboardControl,
     learning,
     skills,
+    goals,
     multimodal,
     proactive,
     planning,
@@ -608,6 +637,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       detachStepListener();
       detachLearning();
       detachSkills();
+      detachGoals();
       detachObservation();
       detachMultimodal();
       detachProactive();

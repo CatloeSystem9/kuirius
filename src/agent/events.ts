@@ -131,7 +131,11 @@ export type AgentEventName =
   | 'RESEARCH_ROUND_COMPLETED'
   | 'RESEARCH_COMPLETED'
   | 'RESEARCH_INSUFFICIENT_EVIDENCE'
-  | 'RESEARCH_FAILED';
+  | 'RESEARCH_FAILED'
+  // Goal Continuity v1 — persistent user objectives across sessions
+  | 'GOAL_STATUS_UPDATED'
+  | 'GOAL_MILESTONE_RECORDED'
+  | 'GOAL_RESUMPTION_BRIEFED';
 
 export interface AgentEvent<P = unknown> {
   name: AgentEventName;

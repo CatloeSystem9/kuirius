@@ -812,6 +812,12 @@ export default function App() {
   const handleSendMessage = async (text: string, forceMapsGrounding?: boolean) => {
     if (!text.trim() || isLoading) return;
 
+    // Goal Continuity v1: observe every message for goal lifecycle statements
+    // (create / confirm / complete / pause / resume / abandon). Pure local
+    // detection — no I/O, no AI calls, no UI change; it never acts, only
+    // records and briefs.
+    agentSystemRef.current?.goals?.observeMessage(text);
+
     // ---- Agent Core delegation (Phase 1 / 4 / 5 / 6 / 9 + Deep Research capability) ----
     // Multi-step, screen-observation, mouse-control, keyboard-control,
     // filesystem/application, and deep-research requests run through the agent

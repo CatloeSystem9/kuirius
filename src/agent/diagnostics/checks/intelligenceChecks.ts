@@ -22,6 +22,7 @@ export interface IntelligenceCheckDeps {
   consolidation?: ConsolidationEngine;
   skills?: SkillEngine;
   projects?: ProjectEngine;
+  goals?: import('../../goals').GoalEngine;
 }
 
 export function createIntelligenceChecks(deps: IntelligenceCheckDeps): DiagnosticCheckDef[] {
@@ -317,6 +318,57 @@ export function createIntelligenceChecks(deps: IntelligenceCheckDeps): Diagnosti
             message: `Project-awareness inspection failed: ${err?.message || String(err)}`,
             evidence: { error: String(err) },
             remediation: 'Review ProjectEngine statistics and store repair logic.',
+          };
+        }
+      },
+    },
+    {
+      id: 'intelligence.goal_continuity',
+      name: 'Goal Continuity State',
+      subsystem: 'intelligence',
+      description: 'Passively inspects bounded goal-continuity counters (goals by lifecycle state, milestones) without touching any conversation.',
+      severity: 'informational',
+      checkType: 'passive',
+      run(): DiagnosticCheckOutcome {
+        if (!deps.goals) {
+          return {
+            status: 'degraded',
+            message: 'GoalEngine is not configured.',
+            remediation: 'Initialize GoalEngine in bridge.ts.',
+          };
+        }
+
+        try {
+          const stats = deps.goals.stats();
+          if (!stats || typeof stats.total !== 'number' || typeof stats.active !== 'number') {
+            return {
+              status: 'unhealthy',
+              message: 'GoalEngine did not return a valid statistics snapshot.',
+              remediation: 'Inspect GoalStore persistence and statistics implementation.',
+            };
+          }
+
+          return {
+            status: 'healthy',
+            message: `Goal continuity is readable (${stats.active} active, ${stats.paused} paused, ${stats.blocked} blocked, ${stats.proposed} proposed of ${stats.total} goals; ${stats.milestones} milestones).`,
+            evidence: {
+              total: stats.total,
+              proposed: stats.proposed,
+              active: stats.active,
+              paused: stats.paused,
+              blocked: stats.blocked,
+              completed: stats.completed,
+              abandoned: stats.abandoned,
+              withProjectRefs: stats.withProjectRefs,
+              milestones: stats.milestones,
+            },
+          };
+        } catch (err: any) {
+          return {
+            status: 'unhealthy',
+            message: `Goal-continuity inspection failed: ${err?.message || String(err)}`,
+            evidence: { error: String(err) },
+            remediation: 'Review GoalEngine statistics and store repair logic.',
           };
         }
       },

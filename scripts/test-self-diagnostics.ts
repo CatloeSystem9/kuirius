@@ -46,6 +46,7 @@ import { AgentEventBus } from '../src/agent/events';
 import { SkillEngine } from '../src/agent/skills';
 import { ProjectEngine } from '../src/agent/projects';
 import { NodeProjectFs } from '../src/agent/projects/projectFsNode';
+import { GoalEngine } from '../src/agent/goals';
 import { ToolRegistry } from '../src/agent/toolRegistry';
 import { TaskStore, MemoryStorage, type StorageAdapter } from '../src/agent/taskState';
 import { AgentCore } from '../src/agent/agentCore';
@@ -392,6 +393,10 @@ async function runTests(): Promise<void> {
         storage,
       }),
       projects: new ProjectEngine({ fs: new NodeProjectFs(), storage }),
+      // Goal Continuity v1 — the passive goal-continuity check is part of the
+      // intelligence registry, so the harness wires a real engine (same
+      // pattern as skills/projects above).
+      goals: new GoalEngine({ storage }),
     });
 
     const registry = new DiagnosticRegistry();
@@ -399,12 +404,12 @@ async function runTests(): Promise<void> {
 
     // Passive run
     const passiveResults = registry.runAll();
-    assertEqual(passiveResults.length, 7, 'Passive intelligence checks count is 7');
+    assertEqual(passiveResults.length, 8, 'Passive intelligence checks count is 8');
     assert(passiveResults.every((r) => r.status === 'healthy'), 'All passive intelligence checks pass');
 
     // Active probe run (includes context_engine.probe and knowledge_graph.probe)
     const probeResults = registry.runAll(undefined, { includeActiveProbes: true });
-    assertEqual(probeResults.length, 9, 'Intelligence checks with active probes count is 9');
+    assertEqual(probeResults.length, 10, 'Intelligence checks with active probes count is 10');
     assert(probeResults.every((r) => r.status === 'healthy'), 'All intelligence active probes pass');
 
     // Missing contextEngine

@@ -2169,3 +2169,82 @@ reliability with honest unverified-outcome weighting, secret redaction,
 precondition re-validation immediately before reuse, gated execution, bounded
 persistence with repair-don't-drop, approval-gated read-only scanning,
 metadata-only storage, on-demand-only work (no polling, no timers).
+
+## 31. Goal Continuity v1
+
+A persistent, lightweight goal-continuity subsystem: Krisha now remembers
+what the user is trying to accomplish across conversations and restarts,
+tracks progress and milestones, and restores context — proposing the next
+step, never executing one on its own. No UI changes, no new dependencies, no
+network calls, no embeddings, no polling or timers.
+
+**Lifecycle.** Goals carry stable ids (`goal_` + timestamp/entropy, assigned
+once), a bounded description, provenance snippet (`originMessage` ≤160
+chars), up to 20 milestones, bounded progress lists (completed / remaining /
+blockers, ≤10 × 200 chars each), up to 3 approved-project references, and
+dependency ids. Statuses: `proposed → active ↔ paused ↔ blocked`, plus
+`completed`/`abandoned` as terminals, enforced by a deterministic transition
+table (invalid transitions are rejected, never guessed). Storage:
+`krisha_goals_v1`, schema version 1, cap 24 goals over the shared
+StorageAdapter — repair-don't-drop loading, future schema starts clean
+(never guesses), write failures never break the engine, and eviction removes
+completed/abandoned (oldest first), then stalest proposed — open work is
+never evicted.
+
+**Creation and updates (conservative by design).** Intent detection is
+deterministic regex in the Context Engine's MEMORY_PATTERNS style: explicit
+commitments ("let's build X", "I want to Y") create ACTIVE goals; soft
+interest ("I'm thinking of building X") creates only a PROPOSED goal that
+becomes active after an explicit short confirmation ("yes" / "go ahead");
+questions, hypotheticals and chatter create nothing. Restatements update the
+existing goal (similarity ≥ 0.62 or a full token-subset match) instead of
+duplicating it; a completed goal is never silently resumed — a new similar
+statement starts a new goal. Lifecycle statements ("we completed X", "pause
+this", "that goal is finished", "let's drop that goal") resolve their target
+by content similarity (≥ 0.5) or, for generic references ("this objective"),
+only when EXACTLY ONE goal is open — with several open goals the statement
+is flagged, never applied. The host calls `goals.observeMessage(text)` once
+per message (App.tsx, one line); the engine also attaches to the shared bus:
+TASK_COMPLETED records milestones for similar ACTIVE goals (never
+auto-completing), TASK_FAILED only bumps activity, TASK_CANCELLED changes
+nothing (emergency-stop semantics preserved), and
+`PROJECT_STATUS_UPDATED {forgotten:true}` strips stale project references
+(lazily revalidated against approved profiles on briefing).
+
+**Resumption, not execution.** `resumptionBriefing(input)` ranks open goals
+by relevance (or recency with no input) and returns bounded briefings —
+status, completed-so-far, remaining, blockers, satisfied dependencies,
+project refs — plus a hint when a VERIFIED reusable learned skill matches
+(`SkillEngine.match`, score ≥ 0.6, no blockers; hints are informational
+only). Briefings are emitted as `GOAL_RESUMPTION_BRIEFED` events with a
+per-goal 10-minute rate limit; unrelated messages brief nothing. The engine
+never calls a tool; every goal mutation is exposed only through Phase 18
+gates via `goal.list`/`goal.brief` (riskLevel safe) and
+`goal.create`/`goal.update`/`goal.forget` (low, `memory.access`), so
+emergency stop blocks goal mutations exactly like every other capability.
+
+**Reusing existing systems (no duplicates).** Durable context rides the
+existing MemoryService — one compact `[goal <id8>] …` mirror record per goal
+(metadata marker `goalId`, tag `goal-continuity`), updated on transitions
+and released through `MemoryService.forget` on forgetting; the marker scans
+touch only the engine's own records, never user memories. Relationships ride
+the existing KnowledgeGraph: one `goal` node per goal with a `User --owns-->
+goal` edge, `related_to` edges to approved project nodes and `blocks` edges
+for dependencies, all tagged `goal_continuity`. Graph pruning uses one
+COMPLETE edge snapshot (the cap-blindness lesson from §30: per-node relation
+queries hard-cap at maxQueryResults=10) and reference-counted deletion;
+nodes owned by other systems (projects, the user node) are never deleted.
+Because mirrors live in memory/graph, chat context and agent-task context
+retrieve goals through pipelines that already exist — no ContextEngine or
+server changes. Self-Diagnostics gained a passive `intelligence.goal_continuity`
+check reading the engine's bounded stats snapshot.
+
+**Integration.** `bridge.ts` constructs the engine (storage, bus, memory,
+knowledge graph, projects, skills, task resolver) and registers its tools;
+`AgentSystem.goals` exposes it; `detach()` unwinds it. Regression-tested in
+`scripts/test-goal-continuity.ts` (163 assertions) covering creation,
+dedup, transitions, confirmation flow, multi-goal ambiguity, cap eviction,
+restart persistence, corrupted/future storage, briefings and rate limiting,
+project association and forgetting, memory-mirror ownership, >10-edge graph
+pruning, task milestones vs cancellation, permission denial, emergency stop,
+and verified-only skill hints.

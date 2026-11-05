@@ -61,6 +61,8 @@ export interface DiagnosticsServiceDeps {
   skills?: import('../skills').SkillEngine;
   /** Project Awareness v1 — read-only understanding of approved projects. */
   projects?: import('../projects').ProjectEngine;
+  /** Goal Continuity v1 — persistent user objectives across sessions. */
+  goals?: import('../goals').GoalEngine;
   recovery?: RecoveryManager;
   planner?: Planner;
   router?: ModelRouter;

@@ -73,6 +73,7 @@ import { WebActionCard } from './components/WebActionCard';
 import { LocalFileActionCard } from './components/LocalFileActionCard';
 import { AppActionCard } from './components/AppActionCard';
 import { MapsLocationCard } from './components/MapsLocationCard';
+import { RollbackApprovalCard } from './components/RollbackApprovalCard';
 import { LocationDetailsModal } from './components/LocationDetailsModal';
 import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { WebBrowserModal } from './components/WebBrowserModal';
@@ -1972,6 +1973,8 @@ export default function App() {
             onChangeLocation={() => setActiveModal('location')}
             isLightMode={isWhiteBackground}
           />
+          {/* E5 M3 — the only operator approval surface for rollback challenges */}
+          <RollbackApprovalCard isLightMode={isWhiteBackground} />
           <HabitActionCard
             action={activeHabitAction}
             onDismiss={() => setActiveHabitAction(null)}

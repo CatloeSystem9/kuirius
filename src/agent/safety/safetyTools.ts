@@ -46,7 +46,7 @@ export function createSafetyTools(deps: SafetyToolsDeps): AgentTool[] {
     },
     {
       name: 'safety.emergency_stop',
-      description: 'Activate or deactivate the safety emergency stop: cancels active tasks, revokes temporary permissions, and blocks new side-effecting actions until resumed. Read-only work continues; the system stays recoverable.',
+      description: 'Activate the safety emergency stop: cancels active tasks, revokes temporary permissions, and blocks new side-effecting actions. E5 M1: the stop is persisted server-side and CANNOT be deactivated through any tool — only the operator recovery CLI (with the recovery credential) can lift it.',
       category: 'system',
       riskLevel: 'low',
       cost: 'free',
@@ -58,16 +58,29 @@ export function createSafetyTools(deps: SafetyToolsDeps): AgentTool[] {
         optional: ['reason'],
         types: { activate: 'boolean', reason: 'string' },
       },
-      verification: { strategy: 'self_reported', description: 'The stop state itself is the verifiable effect; audited.' },
+      verification: { strategy: 'self_reported', description: 'The stop state itself is the verifiable effect; audited server-side.' },
       timeoutMs: 5_000,
       async execute(input): Promise<any> {
-        const activate = input.activate === true;
-        if (activate) {
-          const result = emergencyStop.activate(String(input.reason ?? 'operator requested emergency stop'));
-          return { success: true, output: { summary: `EMERGENCY STOP ACTIVE: ${result.reason}. Side-effecting actions are blocked until resume.`, ...result } };
+        // E5 M1c (decision D3/D4): activation is safety-positive and remains
+        // model-callable. DEACTIVATION IS STRUCTURALLY ABSENT — the only
+        // recovery path is the operator recovery CLI + recovery credential.
+        if (input.activate !== true) {
+          return {
+            success: false,
+            errorKind: 'invalid_input',
+            retryable: false,
+            error: 'deactivation is not available through tools — only the operator recovery CLI with the recovery credential can lift an emergency stop',
+          };
         }
-        emergencyStop.deactivate();
-        return { success: true, output: { summary: 'Emergency stop released — normal permission-checked operation resumes.', active: false } };
+        const result = emergencyStop.activate(String(input.reason ?? 'operator requested emergency stop'));
+        return {
+          success: true,
+          output: {
+            summary: `EMERGENCY STOP ACTIVE: ${result.reason}. Side-effecting actions are blocked until operator recovery.`,
+            ...result,
+            recovery: 'operator CLI required (krisha-recovery) — the model cannot lift this stop',
+          },
+        };
       },
     },
     {

@@ -406,8 +406,10 @@ const ctx = (h: Harness, taskId = 't1') => ({
   assert(status.success && (status.output as any).emergencyStop.active === false, 'safety.status readable through the registry');
   const stop = await h.registry.execute('safety.emergency_stop', { activate: true, reason: 'tool-invoked halt' }, c);
   assert(stop.success && (stop.output as any).active === true, 'emergency stop operable through the registry');
-  const blockedDuring = await h.registry.execute('safety.emergency_stop', { activate: false }, c);
-  assert(blockedDuring.success, 'resume operable (stop is itself audited, not blocked)');
+  // E5 M1c: model deactivation is structurally absent — the tool refuses any
+  // deactivation input; recovery is operator-CLI-only with the credential.
+  const deactivateAttempt = await h.registry.execute('safety.emergency_stop', { activate: false }, c);
+  assert(!deactivateAttempt.success, 'model deactivation refused (E5: no tool can lift an emergency stop)');
   const auditRead = await h.registry.execute('safety.audit', { limit: 10 }, c);
   assert(auditRead.success && (auditRead.output as any).entries.length >= 2, 'audit readable through the registry');
   // NO tool in the registry can grant permissions.

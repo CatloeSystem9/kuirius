@@ -13,49 +13,26 @@ import fs from 'fs';
 import fsp from 'fs/promises';
 import path from 'path';
 import os from 'os';
+// E5 M1: path-safety authority moved to serverSafety.ts (hardened resolution
+// + protected-storage refusal). Re-exported for compatibility.
+import { resolveSafePath, allowedRoots, assertNotProtected, isProtectedPath, OPEN_FILE_EXTENSIONS } from './serverSafety';
+// E5 M2: all sandbox-managed MUTATIONS flow through sandboxCore (identity
+// revalidation, parent-directory validation, E4 safe staging, in-process
+// stop/permission gate). Reads keep the M1 path guards; bounded file reads
+// gain identity verification.
+import {
+  sandboxCreateFile, sandboxCreateDir, sandboxRename, sandboxCopy, sandboxMove, sandboxDelete,
+  readVerifiedFile,
+} from './sandboxCore';
+// E5 M3: deletions capture into E7 quarantine (retention until a valid
+// release decision) via the injected hook — keeps sandboxCore free of the
+// quarantine dependency while every real delete retains its data.
+import { captureNode as quarantineCaptureNode } from './quarantineCore';
+
+export { resolveSafePath, allowedRoots };
 
 // ------------------------------------------------------------- path safety
-
-function allowedRoots(): string[] {
-  const env = process.env.KRISHA_FS_ROOTS;
-  const roots = env
-    ? env.split(';')
-    : [os.homedir(), os.tmpdir(), process.cwd()];
-  return roots.map((r) => path.resolve(r.trim())).filter(Boolean);
-}
-
-const SYSTEM_WRITE_DENYLIST = ['C:\\Windows', 'C:\\Program Files', 'C:\\Program Files (x86)', 'C:\\ProgramData'];
-
-export function resolveSafePath(rawPath: string, operation: 'read' | 'write'): string {
-  if (typeof rawPath !== 'string' || rawPath.trim().length === 0) {
-    throw new Error('Path is required');
-  }
-  if (/[<>|?*\x00-\x1F]/.test(rawPath)) {
-    throw new Error(`Path contains invalid characters: "${rawPath.slice(0, 60)}"`);
-  }
-  // Relative paths (no drive letter) resolve against the TEMP directory —
-  // never against the project directory, so unqualified creates are safe.
-  const trimmed = rawPath.trim();
-  const isAbsolute = /^[a-zA-Z]:[\\/]/.test(trimmed) || trimmed.startsWith('\\\\');
-  const resolved = path.resolve(isAbsolute ? trimmed : path.join(os.tmpdir(), trimmed));
-  const normalized = resolved.toLowerCase().replace(/[\\/]+$/, '');
-
-  const inRoot = allowedRoots().some((root) => {
-    const r = root.toLowerCase().replace(/[\\/]+$/, '');
-    return normalized === r || normalized.startsWith(r + '\\') || normalized.startsWith(r + '/');
-  });
-  if (!inRoot) {
-    throw new Error(`Path "${resolved}" is outside the allowed filesystem roots — traversal rejected`);
-  }
-
-  if (operation === 'write') {
-    const denied = SYSTEM_WRITE_DENYLIST.some((dir) => normalized.startsWith(dir.toLowerCase()));
-    if (denied) {
-      throw new Error(`Writing to a protected system location is not allowed: ${resolved}`);
-    }
-  }
-  return resolved;
-}
+// (resolution rules live in serverSafety.ts — hardened in E5 M1)
 
 const TEXT_EXTENSIONS = new Set([
   'txt', 'md', 'json', 'csv', 'tsv', 'log', 'xml', 'yml', 'yaml', 'ini', 'cfg', 'conf', 'env',
@@ -122,6 +99,7 @@ export async function fsSearch(rootPath: string, query: string, maxDepth = 4): P
 
   const walk = async (dir: string, depth: number): Promise<void> => {
     if (truncated || depth > maxDepth || matches.length >= 50) return;
+    if (isProtectedPath(dir)) return; // E5: never enumerate protected storage
     let names: string[];
     try {
       names = await fsp.readdir(dir);
@@ -160,8 +138,9 @@ export async function fsSearch(rootPath: string, query: string, maxDepth = 4): P
 
 const READ_MAX_BYTES = 64 * 1024;
 
-export async function fsReadFile(filePath: string, offset = 0): Promise<{ path: string; content: string; truncated: boolean; size: number; offset: number }> {
+export async function fsReadFile(filePath: string, offset = 0): Promise<{ path: string; content: string; truncated: boolean; size: number; offset: number; identityVerified: boolean }> {
   const fullPath = resolveSafePath(filePath, 'read');
+  assertNotProtected(fullPath, 'read');
   if (!isTextPath(fullPath)) throw new Error(`"${path.basename(fullPath)}" is not a recognized text file — binary formats are not read`);
   const st = await fsp.stat(fullPath);
   if (st.isDirectory()) throw new Error('Path is a directory, not a file');
@@ -169,8 +148,18 @@ export async function fsReadFile(filePath: string, offset = 0): Promise<{ path: 
   const handle = await fsp.open(fullPath, 'r');
   try {
     const length = Math.min(READ_MAX_BYTES, Math.max(0, st.size - start));
-    const buffer = Buffer.alloc(length);
-    if (length > 0) await handle.read(buffer, 0, length, start);
+    // E5 M2 — identity-verified read: the node must present the same
+    // filesystem identity before and after the read for the content to be
+    // reported as verified. Additive field; content behavior unchanged.
+    const { content: buffer, verified } = readVerifiedFile(fullPath, () => {
+      const b = Buffer.alloc(length);
+      if (length > 0) {
+        // readSync on the open handle keeps the read inside this sync block
+        const bytesRead = fs.readSync(handle.fd, b, 0, length, start);
+        if (bytesRead !== length) throw new Error('short read');
+      }
+      return b;
+    });
     // Binary sniff: reject chunks with suspicious NUL density.
     if (buffer.subarray(0, 1024).includes(0)) throw new Error('File appears to be binary');
     return {
@@ -179,6 +168,7 @@ export async function fsReadFile(filePath: string, offset = 0): Promise<{ path: 
       truncated: start + length < st.size,
       size: st.size,
       offset: start,
+      identityVerified: verified,
     };
   } finally {
     await handle.close();
@@ -186,77 +176,50 @@ export async function fsReadFile(filePath: string, offset = 0): Promise<{ path: 
 }
 
 export async function fsCreate(targetPath: string, type: 'file' | 'dir', content?: string): Promise<FsEntry> {
-  const fullPath = resolveSafePath(targetPath, 'write');
-  const exists = fs.existsSync(fullPath);
-  if (exists) throw new Error(`"${fullPath}" already exists — refusing to overwrite`);
-  if (type === 'dir') {
-    await fsp.mkdir(fullPath);
-  } else {
-    await fsp.writeFile(fullPath, typeof content === 'string' ? content : '', { flag: 'wx' });
-  }
-  return statEntry(fullPath);
+  // E5 M2 — staged create (journal-first, O_EXCL staging, identity-verified
+  // commit) through the sandbox core.
+  return type === 'dir'
+    ? sandboxCreateDir(targetPath)
+    : sandboxCreateFile(targetPath, typeof content === 'string' ? content : '');
 }
 
 export async function fsRename(fromPath: string, newName: string): Promise<FsEntry> {
-  if (!newName || /[\\/:*?"<>|]/.test(newName)) throw new Error(`Invalid new name "${newName.slice(0, 40)}"`);
-  const from = resolveSafePath(fromPath, 'write');
-  const to = resolveSafePath(path.join(path.dirname(from), newName), 'write');
-  if (!fs.existsSync(from)) throw new Error(`Source "${from}" does not exist`);
-  if (fs.existsSync(to)) throw new Error(`Destination "${to}" already exists`);
-  await fsp.rename(from, to);
-  return statEntry(to);
-}
-
-async function copyOrMove(fromPath: string, toPath: string, mode: 'copy' | 'move', overwrite: boolean): Promise<FsEntry> {
-  const from = resolveSafePath(fromPath, 'read');
-  let to = resolveSafePath(toPath, 'write');
-  if (!fs.existsSync(from)) throw new Error(`Source "${from}" does not exist`);
-  const fromStat = await fsp.stat(from);
-  // If the destination is an existing directory, move into it.
-  if (fs.existsSync(to) && (await fsp.stat(to)).isDirectory()) {
-    to = path.join(to, path.basename(from));
-  }
-  if (fs.existsSync(to) && !overwrite) {
-    throw new Error(`Destination "${to}" already exists — set overwrite to replace it`);
-  }
-  if (fromStat.isDirectory() && mode === 'copy') {
-    await fsp.cp(from, to, { recursive: true, force: overwrite, errorOnExist: !overwrite });
-  } else if (mode === 'copy') {
-    await fsp.copyFile(from, to);
-  } else {
-    await fsp.rename(from, to);
-  }
-  return statEntry(to);
+  // E5 M2 — identity-revalidated rename with parent-directory validation.
+  return sandboxRename(fromPath, newName);
 }
 
 export async function fsCopy(fromPath: string, toPath: string, overwrite = false): Promise<FsEntry> {
-  return copyOrMove(fromPath, toPath, 'copy', overwrite);
+  // E5 M2 — two-agreeing-reads copy through verified staging.
+  return sandboxCopy(fromPath, toPath, overwrite);
 }
 
 export async function fsMove(fromPath: string, toPath: string, overwrite = false): Promise<FsEntry> {
-  return copyOrMove(fromPath, toPath, 'move', overwrite);
+  // E5 M2 — identity-revalidated move (same-volume rename).
+  return sandboxMove(fromPath, toPath, overwrite);
 }
 
-export async function fsDelete(targetPath: string, recursive = false): Promise<{ path: string; deleted: true }> {
-  const fullPath = resolveSafePath(targetPath, 'write');
-  if (!fs.existsSync(fullPath)) throw new Error(`"${fullPath}" does not exist`);
-  const st = await fsp.stat(fullPath);
-  if (st.isDirectory()) {
-    const remaining = await fsp.readdir(fullPath);
-    if (remaining.length > 0 && !recursive) {
-      throw new Error(`Directory "${fullPath}" is not empty — recursive deletion is required but must be explicitly requested`);
-    }
-    await fsp.rm(fullPath, { recursive });
-  } else {
-    await fsp.unlink(fullPath);
-  }
-  return { path: fullPath, deleted: true };
+export async function fsDelete(targetPath: string, recursive = false): Promise<{ path: string; deleted: true; replacedAfterDelete?: boolean; quarantined?: boolean; quarantineId?: string; opId: string }> {
+  // E5 M2 — identity-revalidated delete; E5 M3 (E7) — content is captured
+  // into quarantine so a later validated rollback/release remains possible.
+  return sandboxDelete(targetPath, recursive, quarantineCaptureNode);
 }
 
 /** Open a file with its OS-associated application via ShellExecute. */
 export async function fsOpenWithAssociation(filePath: string): Promise<string> {
   const fullPath = resolveSafePath(filePath, 'read');
+  assertNotProtected(fullPath, 'read');
   if (!fs.existsSync(fullPath)) throw new Error(`"${fullPath}" does not exist`);
+  // E5 M1d — file-association execution policy (decision D8): allowlist-only.
+  // Scripts, executables, interpreters, and unknown types are refused
+  // UNCONDITIONALLY — no confirmation path overrides this refusal, because
+  // `cmd start` executes whatever the (potentially hijacked) association
+  // binds. A hijacked association for an allowlisted type is an
+  // environmental residual (machine-compromise class). Text content can be
+  // inspected safely through the bounded /api/fs/read preview instead.
+  const ext = path.extname(fullPath).slice(1).toLowerCase();
+  if (!OPEN_FILE_EXTENSIONS.has(ext)) {
+    throw new Error(`Opening "${path.basename(fullPath)}" is not permitted — ".${ext || 'unknown'}" is not on the safe-open allowlist (use the text preview instead)`);
+  }
   // Spawn detached via cmd start — validated path only, never arbitrary commands.
   const { spawn } = await import('child_process');
   const child = spawn('cmd.exe', ['/c', 'start', '', fullPath], { detached: true, stdio: 'ignore', windowsHide: true });

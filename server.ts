@@ -4,6 +4,23 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Modality } from "@google/genai";
 import dotenv from "dotenv";
+// E5 M1 — server-side safety foundation: persistent emergency stop, protected
+// storage, server-side permission enforcement, audit, recovery pipe. All
+// initialization inside is SYNCHRONOUS and completes at import time, before
+// any route below can serve a request.
+import {
+  createBodySizeGuard,
+  enforce,
+  stopSnapshot,
+  activateStop,
+  rateLimit,
+} from "./serverSafety";
+// E5 M3 — rollback planning/challenges + E7 quarantine (imported for their
+// synchronous init side effects: none — they are pure consumers of the M1/M2
+// stores; route handlers below use them exclusively).
+import * as rollback from "./rollbackCore";
+import * as quarantine from "./quarantineCore";
+import { startIntegrityMonitor, lastIntegrityReport, configuredIntervalMs } from "./integrityMonitor";
 import {
   CachedClassifier,
   createDefaultModelRegistry,
@@ -22,8 +39,71 @@ dotenv.config();
 
 const app = express();
 const PORT = 3000;
+// E5 M1 (decision D1): loopback by default. LAN exposure requires an explicit
+// KRISHA_BIND override and is a separately designed feature (decision D6).
+const BIND = process.env.KRISHA_BIND || "127.0.0.1";
+
+// E5 M1d — request size guard BEFORE body parsing: 1 MB default, 10 MB only
+// for the endpoints that legitimately carry base64 media payloads.
+const LARGE_BODY_PATHS = new Set(["/api/audio/transcribe", "/api/vision/analyze"]);
+app.use(createBodySizeGuard(LARGE_BODY_PATHS, 1 * 1024 * 1024, 10 * 1024 * 1024));
 
 app.use(express.json({ limit: "10mb" }));
+
+// E5 M1b — server-side enforcement on EVERY side-effecting route. The
+// browser-side gate is a first filter; this is the authoritative boundary
+// (direct HTTP cannot bypass it). Decision is per-request: rate limit →
+// emergency stop → permission → audit. Read-only routes are not gated.
+const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean; rate?: { group: string; limit: number; windowMs: number } }> = {
+  "/api/fs/create": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/fs/rename": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/fs/copy": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/fs/move": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/fs/delete": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/fs/open": { permission: "filesystem.read", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
+  "/api/app/launch": { permission: "application.launch", stopBlock: true, rate: { group: "app", limit: 20, windowMs: 60_000 } },
+  "/api/app/close": { permission: "application.launch", stopBlock: true, rate: { group: "app", limit: 20, windowMs: 60_000 } },
+  "/api/app/focus": { permission: "application.launch", stopBlock: true, rate: { group: "app", limit: 20, windowMs: 60_000 } },
+  "/api/computer/mouse": { permission: "mouse.control", stopBlock: true, rate: { group: "computer", limit: 10, windowMs: 60_000 } },
+  "/api/computer/keyboard": { permission: "keyboard.control", stopBlock: true, rate: { group: "computer", limit: 10, windowMs: 60_000 } },
+  "/api/browser/navigate": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/click": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/type": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/scroll": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/refresh": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/back": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/browser/forward": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
+  "/api/memory/extract": { permission: "memory.access", stopBlock: true, rate: { group: "memory", limit: 10, windowMs: 60_000 } },
+  // E5 M1 acceptance: the only disk write outside the fs/app/computer/browser
+  // routes is the context-engine cache write in /api/research/search
+  // (JsonFileStorage.flush → <cwd>/.krisha/context-cache-v1.json). While the
+  // emergency stop is ACTIVE that cache write must not occur, so this route
+  // is stop-blocked. It needs no capability (cache-first research is a read
+  // of public engines otherwise) and no extra rate group.
+  "/api/research/search": { stopBlock: true },
+  // E5 M3 — rollback + quarantine. Mutating routes carry the full M1
+  // enforcement (permission → stop 423 → audit) and tight rate limits;
+  // read/authorization routes are audited and rate-limited only. There is
+  // deliberately NO route that both plans and approves: the model can request
+  // plans; approval happens only through the Krisha UI affordance.
+  "/api/rollback/execute": { permission: "filesystem.write", stopBlock: true, rate: { group: "rollback", limit: 10, windowMs: 60_000 } },
+  "/api/quarantine/release": { permission: "filesystem.write", stopBlock: true, rate: { group: "rollback", limit: 10, windowMs: 60_000 } },
+  "/api/rollback/plan": { stopBlock: false, rate: { group: "rollback", limit: 20, windowMs: 60_000 } },
+  "/api/rollback/approve": { stopBlock: false, rate: { group: "rollback", limit: 20, windowMs: 60_000 } },
+  "/api/rollback/decline": { stopBlock: false, rate: { group: "rollback", limit: 20, windowMs: 60_000 } },
+  "/api/rollback/pending": { stopBlock: false, rate: { group: "rollback", limit: 60, windowMs: 60_000 } },
+  "/api/quarantine/list": { stopBlock: false, rate: { group: "rollback", limit: 30, windowMs: 60_000 } },
+  "/api/quarantine/scan": { stopBlock: false, rate: { group: "rollback", limit: 10, windowMs: 60_000 } },
+};
+
+app.use((req, res, next) => {
+  const rule = ENFORCED_ROUTES[req.path];
+  if (!rule) {
+    next();
+    return;
+  }
+  enforce({ permission: rule.permission, stopBlock: rule.stopBlock, rate: rule.rate })(req, res, next);
+});
 
 // Lazy Google GenAI Client
 let genAIClient: GoogleGenAI | null = null;
@@ -1879,9 +1959,20 @@ class PowerShellWorker {
     this.proc = null;
   }
 
-  /** Serialize requests; the mouse layer issues one action at a time. */
+  private pendingCount = 0;
+
+  /** Serialize requests; the mouse layer issues one action at a time.
+   *  E5 M1d: bounded queue — overflow is rejected, never silently queued. */
   run(script: string): Promise<string> {
-    const task = this.queue.then(() => this.runNow(script));
+    if (this.pendingCount >= 8) {
+      return Promise.reject(new Error("PowerShell worker queue full"));
+    }
+    this.pendingCount += 1;
+    const task = this.queue
+      .then(() => this.runNow(script))
+      .finally(() => {
+        this.pendingCount -= 1;
+      });
     this.queue = task.catch(() => undefined);
     return task;
   }
@@ -2621,6 +2712,73 @@ app.post('/api/fs/move', (req, res) => fsResult(res, () => sys.fsMove(String(req
 app.post('/api/fs/delete', (req, res) => fsResult(res, () => sys.fsDelete(String(req.body?.path ?? ''), req.body?.recursive === true)));
 app.post('/api/fs/open', (req, res) => fsResult(res, () => sys.fsOpenWithAssociation(String(req.body?.path ?? ''))));
 
+// ---- E5 M1: server-authoritative safety status + activation ----
+// There is deliberately NO HTTP deactivation endpoint: deactivation runs
+// exclusively through the recovery CLI + named pipe + credential.
+app.get("/api/safety/stop", (req, res) => {
+  res.json({ success: true, result: stopSnapshot() });
+});
+app.post("/api/safety/stop/activate", (req, res) => {
+  if (!rateLimit("stop-activate", 5, 60_000)) {
+    res.status(429).json({ success: false, error: "rate_limited" });
+    return;
+  }
+  try {
+    const result = activateStop(String(req.body?.reason ?? "operator requested emergency stop"), "http");
+    res.json({ success: true, result: { ...result, snapshot: stopSnapshot() } });
+  } catch (err) {
+    res.status(409).json({ success: false, error: String((err as Error)?.message || err) });
+  }
+});
+
+// ---- E5 H4: read-only runtime integrity status (no authorization change) ----
+app.get("/api/integrity/status", (req, res) => {
+  const report = lastIntegrityReport();
+  if (!report) {
+    res.json({ success: false, error: "integrity monitoring has not evaluated yet", intervalMs: configuredIntervalMs() });
+    return;
+  }
+  res.json({ success: true, result: report, intervalMs: configuredIntervalMs() });
+});
+
+// ---- E5 M3: rollback planning + operator-bound challenge lifecycle ----
+// The model may REQUEST a plan; approval happens ONLY through the Krisha UI
+// affordance (operator click → /api/rollback/approve). Plans and challenge
+// bindings live server-side; clients pass opaque ids only.
+function rollbackResult(res: import("express").Response, fn: () => unknown): void {
+  try {
+    res.json({ success: true, result: fn() });
+  } catch (err) {
+    res.json({ success: false, error: String((err as Error)?.message || err) });
+  }
+}
+app.get("/api/rollback/pending", (req, res) => rollbackResult(res, () => rollback.pendingChallenges()));
+app.post("/api/rollback/plan", (req, res) => rollbackResult(res, () => rollback.planRollback(String(req.body?.opId ?? ""))));
+app.post("/api/rollback/approve", (req, res) => rollbackResult(res, () => rollback.approveChallenge(String(req.body?.challengeId ?? ""))));
+app.post("/api/rollback/decline", (req, res) => rollbackResult(res, () => rollback.declineChallenge(String(req.body?.challengeId ?? ""))));
+app.post("/api/rollback/execute", (req, res) => rollbackResult(res, () => rollback.executeRollback({
+  opId: String(req.body?.opId ?? ""),
+  planHash: String(req.body?.planHash ?? ""),
+  challengeId: String(req.body?.challengeId ?? ""),
+})));
+
+// ---- E5 M3: E7 quarantine (operator release by exact path declaration) ----
+app.get("/api/quarantine/list", (req, res) => rollbackResult(res, () => quarantine.listQuarantine()));
+// E5 H1/H2 — explicit, audited integrity scan. Read-only: it authorizes nothing,
+// releases nothing, deletes nothing — orphaned artifacts stay locked and are
+// reported for operator review. H2: bounded pagination with digest-bound
+// continuation (an artifact-set change fails the continuation closed).
+app.post("/api/quarantine/scan", (req, res) => rollbackResult(res, () => quarantine.auditedQuarantineScan({
+  continuation: req.body?.continuation && typeof req.body.continuation === 'object'
+    ? { after: req.body.continuation.after === undefined ? undefined : String(req.body.continuation.after), digest: req.body.continuation.digest === undefined ? undefined : String(req.body.continuation.digest) }
+    : undefined,
+  limit: Number.isFinite(Number(req.body?.limit)) && Number(req.body?.limit) > 0 ? Number(req.body.limit) : undefined,
+})));
+app.post("/api/quarantine/release", (req, res) => rollbackResult(res, () => {
+  const declared = Array.isArray(req.body?.declaredPaths) ? req.body.declaredPaths.map((p: unknown) => String(p)) : [];
+  return quarantine.releaseQuarantine(declared);
+}));
+
 app.post('/api/app/discover', (req, res) =>
   fsResult(res, () => sys.appDiscover(req.body?.force === true).then((apps) => sys.appSearch(apps, String(req.body?.query ?? ''))))
 );
@@ -2647,9 +2805,18 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Krisha server running on http://0.0.0.0:${PORT}`);
+  const httpServer = app.listen(PORT, BIND, () => {
+    console.log(`Krisha server running on http://${BIND}:${PORT}${BIND === "127.0.0.1" ? " (loopback — E5 D1)" : " (LAN-EXPOSED — explicit KRISHA_BIND override)"}`);
   });
+  // E5 H4 — server-owned runtime integrity monitoring: bounded, unref'd
+  // periodic evaluation (default 60 s, KRISHA_INTEGRITY_INTERVAL_MS to
+  // configure) + read-only status endpoint below. Monitoring reports; it
+  // never repairs, releases, or changes the stop state.
+  startIntegrityMonitor();
+  console.log(`[E5] integrity monitoring active (interval ${configuredIntervalMs()} ms)`);
+  // E5 M1d — bounded request lifetimes.
+  httpServer.requestTimeout = 60_000;
+  httpServer.headersTimeout = 65_000;
 }
 
 startServer();

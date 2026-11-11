@@ -113,7 +113,9 @@ export interface AgentSystem {
   modelRouter?: ModelRouter;
   /** Passive performance telemetry (Phase 17). */
   performance?: ReturnType<typeof getPerformanceTelemetry>;
-  /** Safety + permission hardening (Phase 18). */
+  /** Safety + permission hardening (Phase 18). E5 M1: the host handle holds
+   *  NO deactivation authority — recovery runs exclusively through the
+   *  operator recovery CLI with the recovery credential. */
   safety?: {
     gate: SafetyGate;
     scoped: ScopedPermissionManager;
@@ -121,7 +123,6 @@ export interface AgentSystem {
     emergencyStop: EmergencyStop;
     /** Emergency stop: cancel tasks, revoke temporary grants, block side effects. */
     emergencyStopNow: (reason: string) => void;
-    resume: () => void;
   };
   /** Long-run autonomy (Phase 19) — persistent bounded task sessions. */
   longRun?: LongRunManager;
@@ -383,8 +384,36 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       // cancellation is best-effort; the gate still blocks side effects
     }
     scopedPermissions.revokeAllTemporary();
-    void reason;
+    // E5 M1a: persist the stop server-side — the server state is the
+    // authoritative, durable one. A failed sync leaves the stop active
+    // in-memory only and is surfaced (never silently dropped).
+    void fetch("/api/safety/stop/activate", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ reason }),
+    })
+      .then((res) => {
+        if (!res.ok) console.warn("[E5] emergency-stop server persistence failed:", res.status);
+      })
+      .catch((err) => console.warn("[E5] emergency-stop server persistence unreachable:", err));
   });
+
+  // E5 M1a: hydration — the server owns the durable stop state. A page that
+  // loads while the server reports an active/uncertain stop activates its
+  // local gate immediately (fail-closed), before any tool can execute.
+  void fetch("/api/safety/stop")
+    .then((res) => (res.ok ? res.json() : null))
+    .then((body) => {
+      const snapshot = body?.result;
+      if (snapshot && snapshot.kind !== "INACTIVE" && !emergencyStop.isActive()) {
+        emergencyStop.activate(`server-authoritative stop (generation ${snapshot.generation ?? "?"})`);
+        console.warn("[E5] hydrated fail-closed: server reports emergency stop", snapshot.kind);
+      }
+    })
+    .catch(() => {
+      // Server unreachable at hydration: the local gate keeps its own state
+      // and the server-side enforcement remains the authoritative boundary.
+    });
   const safetyDeps: SafetyToolsDeps = { gate: safetyGate, scoped: scopedPermissions, audit: safetyAudit, emergencyStop };
   registry.registerAll(createSafetyTools(safetyDeps));
   const safety = {
@@ -396,7 +425,9 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       const result = emergencyStop.activate(reason);
       return result;
     },
-    resume: () => emergencyStop.deactivate(),
+    // E5 M1c: `resume` REMOVED — the renderer and the model hold no
+    // deactivation authority. Recovery: operator CLI (krisha-recovery) with
+    // the recovery credential, enforced server-side.
   };
 
   // Long-run autonomy (Phase 19): persistent bounded task sessions over the
@@ -498,10 +529,13 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // skills come only from verified task executions.
   registry.registerAll(createSkillTools({ skills }));
 
-  // DevTools debug hook for manual verification / later permission UI (no UI surface).
-  if (typeof window !== 'undefined') {
-    (window as any).__KRISHA_AGENT__ = { core, bus, registry, permissions, screenObserver, adaptiveObserver, computerControl, keyboardControl, computerUseAgent, browserAgent, filesystemService, applicationService, learning, skills, projects, goals, multimodal, proactive, planning, contextEngine, knowledgeGraph, semantic, consolidation, research, modelRouter, performance, safety, longRun, capabilities, diagnostics };
-  }
+  // E5 M1c (decision D3): the privileged browser global is REMOVED entirely,
+  // in development and production. It previously exposed the raw
+  // EmergencyStop instance (deactivate()), the PermissionManager
+  // (grant/revoke), the gate, and the full tool registry to any page
+  // JavaScript. The UI consumes agent functionality through module imports —
+  // the global had zero consumers — and page scripts must hold no
+  // privileged handles.
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
   const detachLearning = learning.attach();

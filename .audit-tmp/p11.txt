@@ -1,0 +1,11 @@
+from ['"].*?/server['"]
+from ['"].*?/serverSafety
+from ['"].*?/integrityMonitor
+from ['"].*?/quarantineCore
+from ['"].*?/rollbackCore
+from ['"].*?/sandboxCore
+from ['"].*?/browserCdp
+from ['"].*?/systemAgentServer
+from ['"].*?/krisha-recovery
+from ['"]stream['"]
+from ['"]node:stream['"]

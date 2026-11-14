@@ -1,0 +1,6 @@
+reference types=
+reference lib=
+types\s*:\s*\[
+"types"
+es2020
+ES2020

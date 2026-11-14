@@ -1,0 +1,4 @@
+rb\.executeRollback\(\{
+s\.taskId
+fsCreate\(path\.join\(fsRoots
+s\.toolName\+'

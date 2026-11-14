@@ -28,6 +28,8 @@ interface DirectChatInputProps {
   onOpenTranscribeModal?: () => void;
   onOpenWindowsApps?: () => void;
   onReadScreen?: () => void;
+  /** Action Transparency: live activity entries rendered directly above the input. */
+  aboveInput?: React.ReactNode;
   isLoading: boolean;
   isSpeaking: boolean;
   voiceEnabled: boolean;
@@ -49,6 +51,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   onOpenTranscribeModal,
   onOpenWindowsApps,
   onReadScreen,
+  aboveInput,
   isLoading,
   isSpeaking,
   voiceEnabled,
@@ -182,12 +185,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   };
 
   return (
-    <div
-      className={`w-full max-w-2xl px-4 sm:px-6 flex flex-col items-center ${
-        isLightMode ? '' : 'bg-[#02030f]'
-      }`}
-      style={{ backgroundColor: isLightMode ? undefined : '#02030f' }}
-    >
+    <div className="w-full max-w-2xl px-4 sm:px-6 flex flex-col items-center">
       {/* Top Status Bar: Wake-word indicator & Quick feature pills */}
       <div className="mb-2 flex items-center gap-2 flex-wrap justify-center">
         {/* Wake-Word Status Pill / Indicator */}
@@ -351,6 +349,9 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
         )}
       </AnimatePresence>
 
+      {/* Action Transparency: live activity stream, directly above the input */}
+      {aboveInput}
+
       {/* Main Input Form */}
       <form
         onSubmit={handleSend}
@@ -359,7 +360,7 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
             ? 'border-emerald-500 shadow-[0_0_35px_rgba(16,185,129,0.4)]'
             : isLightMode
             ? 'bg-white/95 border border-slate-300/80 shadow-[0_10px_35px_rgba(0,0,0,0.08)] focus-within:border-blue-500 focus-within:shadow-[0_10px_35px_rgba(59,130,246,0.15)]'
-            : 'bg-[#070b16]/90 border border-blue-900/35 hover:border-blue-500/40 focus-within:border-blue-500/60 shadow-[0_0_35px_rgba(2,4,10,0.8)]'
+            : 'bg-white/[0.045] border border-white/[0.08] hover:border-blue-400/30 focus-within:border-blue-400/45'
         }`}
       >
         {/* Microphone Button (Audio Transcription with gemini-3.5-transcribe) */}

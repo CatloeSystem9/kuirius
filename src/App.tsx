@@ -69,6 +69,8 @@ import { SettingsModal } from './components/SettingsModal';
 import { LocalFilesModal } from './components/LocalFilesModal';
 import { AppsModal } from './components/AppsModal';
 import { DirectChatInput } from './components/DirectChatInput';
+import { ActivityStream } from './components/ActivityStream';
+import { createActivityFeed, attachActivityFeedToSystem, type ActivityFeed, type ActivityEntry } from './utils/activityFeed';
 import { WebActionCard } from './components/WebActionCard';
 import { LocalFileActionCard } from './components/LocalFileActionCard';
 import { AppActionCard } from './components/AppActionCard';
@@ -269,6 +271,16 @@ export default function App() {
   // agent surfaces its results through the same action cards / modals.
   const agentSystemRef = useRef<AgentSystem | null>(null);
 
+  // ---- Action Transparency: live activity stream above the composer ----
+  // One feed instance for the session; sentences come from REAL events only
+  // (agent bus via attachActivityFeedToSystem + explicit state transitions
+  // below). Running actions, approvals and important errors persist until
+  // resolved/dismissed; everything else fades after ~5 s.
+  const activityFeedRef = useRef<ActivityFeed | null>(null);
+  if (!activityFeedRef.current) activityFeedRef.current = createActivityFeed();
+  const [activityEntries, setActivityEntries] = useState<ActivityEntry[]>([]);
+  const [activityArchive, setActivityArchive] = useState<ActivityEntry[]>([]);
+
   // ---- E5: emergency-stop status surface (Phase 3 audit) ----
   // The renderer holds NO deactivation authority (E5 M1c): this UI can show
   // the stop state and ACTIVATE it; recovery stays with the operator CLI.
@@ -281,11 +293,18 @@ export default function App() {
       if (!res.ok) return;
       const body = await res.json();
       const snapshot = body?.result;
+      const active = Boolean(snapshot && snapshot.kind !== 'INACTIVE');
       setEmergencyStopState({
-        active: Boolean(snapshot && snapshot.kind !== 'INACTIVE'),
+        active,
         kind: snapshot?.kind,
         generation: snapshot?.generation ?? null,
       });
+      // Action Transparency: reflect the real stop state in the stream.
+      if (active) {
+        activityFeedRef.current?.push('Emergency stop active — recovery requires the operator CLI.', 'error', { sticky: true, key: 'estop' });
+      } else {
+        activityFeedRef.current?.resolve('estop');
+      }
     } catch {
       // server unreachable — keep the last known state
     }
@@ -301,6 +320,7 @@ export default function App() {
       // local gate activation below still applies
     }
     agentSystemRef.current?.safety?.emergencyStopNow('operator requested emergency stop (UI)');
+    activityFeedRef.current?.push('Emergency stop activated — tasks stopped and side effects blocked.', 'error', { sticky: true, key: 'estop' });
     await refreshEmergencyStop();
   }, [refreshEmergencyStop]);
   useEffect(() => {
@@ -347,7 +367,16 @@ export default function App() {
     });
     const memoryAttachment = attachMemoryToSystem(system, getMemoryService());
     agentSystemRef.current = system;
+    // Action Transparency: feed the stream from the real event bus.
+    const feed = activityFeedRef.current!;
+    const detachActivityBus = attachActivityFeedToSystem(feed, system.bus);
+    const unsubscribeFeed = feed.subscribe((entries, archive) => {
+      setActivityEntries(entries);
+      setActivityArchive(archive);
+    });
     return () => {
+      unsubscribeFeed();
+      detachActivityBus();
       memoryAttachment.detach();
       system.screenObserver?.stop();
       system.keyboardControl?.releaseAll().catch(() => undefined);
@@ -861,6 +890,10 @@ export default function App() {
           if (memData.newMemories && memData.newMemories.length > 0) {
             getMemoryService().rememberMany(memData.newMemories, { source: 'conversation_extract' });
             setMemories(getMemoryService().displayMemories());
+            activityFeedRef.current?.push(
+              `Learned ${memData.newMemories.length} new ${memData.newMemories.length === 1 ? 'memory' : 'memories'}.`,
+              'success'
+            );
           }
         })
         .catch((err) => console.warn('Agent memory extraction error:', err));
@@ -1500,6 +1533,9 @@ export default function App() {
     setExpression(userEmotion.sentiment === 'teasing' ? 'playful_smirk' : 'listening_attentive');
 
     // Call server Gemini chat API
+    // Action Transparency: the request is a real running action — it stays
+    // visible until the reply actually arrives (chat often exceeds 5 s).
+    activityFeedRef.current?.push('Preparing the response…', 'running', { sticky: true, key: 'chat:reply' });
     try {
       const res = await fetch('/api/chat', {
         method: 'POST',
@@ -1528,7 +1564,9 @@ export default function App() {
 
       const data = await res.json();
       const botReply = data.reply || "I'm right here with you.";
-      
+      activityFeedRef.current?.resolve('chat:reply');
+      activityFeedRef.current?.push('Response ready.', 'success');
+
       // Compute best matched nuanced expression & micro-gesture
       const clientAnalyzedEmotion = analyzeSentimentAndKeywords(botReply);
       const serverExpression = data.expression ? normalizeExpression(data.expression) : clientAnalyzedEmotion.expression;
@@ -1634,11 +1672,17 @@ export default function App() {
           if (memData.newMemories && memData.newMemories.length > 0) {
             getMemoryService().rememberMany(memData.newMemories, { source: 'conversation_extract' });
             setMemories(getMemoryService().displayMemories());
+            activityFeedRef.current?.push(
+              `Learned ${memData.newMemories.length} new ${memData.newMemories.length === 1 ? 'memory' : 'memories'}.`,
+              'success'
+            );
           }
         })
         .catch((err) => console.warn('Background memory extraction error:', err));
     } catch (err) {
       console.warn('Chat request fallback triggered:', err);
+      activityFeedRef.current?.resolve('chat:reply');
+      activityFeedRef.current?.push('The response could not be prepared.', 'error', { sticky: true, key: 'chat:error' });
       const fallbackReply = `I'm right here with you, ${settings.userName || 'you'}. Tell me more.`;
       const fallbackEmotion = analyzeSentimentAndKeywords(fallbackReply);
 
@@ -2016,12 +2060,7 @@ export default function App() {
         </div>
 
         {/* Bottom Direct Chat Input Bar (Directly on screen with Web Action & File Action Preview) */}
-        <div
-          className={`pb-5 sm:pb-7 flex flex-col items-center justify-center z-20 w-full px-4 ${
-            isWhiteBackground ? '' : 'bg-[#02030f]'
-          }`}
-          style={{ backgroundColor: isWhiteBackground ? undefined : '#02030f' }}
-        >
+        <div className="pb-5 sm:pb-7 flex flex-col items-center justify-center z-20 w-full px-4">
           <WebActionCard
             action={activeWebAction}
             onDismiss={() => setActiveWebAction(null)}
@@ -2094,6 +2133,14 @@ export default function App() {
             isLightMode={isWhiteBackground}
           />
           <DirectChatInput
+            aboveInput={
+              <ActivityStream
+                entries={activityEntries}
+                history={activityArchive}
+                onDismiss={(id) => activityFeedRef.current?.dismiss(id)}
+                isLightMode={isWhiteBackground}
+              />
+            }
             onSendMessage={handleSendMessage}
             onTypingChange={handleTypingReaction}
             onOpenPdfOrFile={() => {

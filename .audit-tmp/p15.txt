@@ -1,0 +1,7 @@
+Send message
+Maps Grounding: Auto
+ask Krisha
+Transcribe Audio
+isTyping\|isLoading
+backdrop-blur
+rounded-full

@@ -853,7 +853,7 @@ export class AgentCore {
         step.error = undefined;
         step.finishedAt = Date.now();
         this.events.emit({ name: 'TOOL_VERIFIED', taskId: task.id, stepId: step.id, payload: { tool: tool.name, strategy: step.verification?.type ?? tool.verification?.strategy ?? 'tool_success', uncertain }, timestamp: Date.now() });
-        this.events.emit({ name: 'TASK_STEP_COMPLETED', taskId: task.id, stepId: step.id, payload: { result, uncertain, ui: result.ui ?? [] }, timestamp: Date.now() });
+        this.events.emit({ name: 'TASK_STEP_COMPLETED', taskId: task.id, stepId: step.id, payload: { description: step.description, result, uncertain, ui: result.ui ?? [] }, timestamp: Date.now() });
         return step;
       }
 

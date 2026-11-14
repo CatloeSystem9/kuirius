@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Volume2, Move, RotateCcw, Compass, ExternalLink } from 'lucide-react';
 import {
@@ -268,6 +268,66 @@ export default function App() {
   // keep the original inline flow below. UI components are untouched — the
   // agent surfaces its results through the same action cards / modals.
   const agentSystemRef = useRef<AgentSystem | null>(null);
+
+  // ---- E5: emergency-stop status surface (Phase 3 audit) ----
+  // The renderer holds NO deactivation authority (E5 M1c): this UI can show
+  // the stop state and ACTIVATE it; recovery stays with the operator CLI.
+  // The inline chat flow bypasses the Phase 18 gate, so model-initiated
+  // web actions check the stop here before opening external URLs.
+  const [emergencyStopState, setEmergencyStopState] = useState<{ active: boolean; kind?: string; generation?: number | null }>({ active: false });
+  const refreshEmergencyStop = useCallback(async (): Promise<void> => {
+    try {
+      const res = await fetch('/api/safety/stop');
+      if (!res.ok) return;
+      const body = await res.json();
+      const snapshot = body?.result;
+      setEmergencyStopState({
+        active: Boolean(snapshot && snapshot.kind !== 'INACTIVE'),
+        kind: snapshot?.kind,
+        generation: snapshot?.generation ?? null,
+      });
+    } catch {
+      // server unreachable — keep the last known state
+    }
+  }, []);
+  const activateEmergencyStop = useCallback(async (): Promise<void> => {
+    try {
+      await fetch('/api/safety/stop/activate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'operator requested emergency stop (UI)' }),
+      });
+    } catch {
+      // local gate activation below still applies
+    }
+    agentSystemRef.current?.safety?.emergencyStopNow('operator requested emergency stop (UI)');
+    await refreshEmergencyStop();
+  }, [refreshEmergencyStop]);
+  useEffect(() => {
+    void refreshEmergencyStop();
+  }, [refreshEmergencyStop]);
+  /** Phase 3 audit: MODEL-initiated web actions must not open external URLs
+   *  while an emergency stop is active — the inline chat path does not pass
+   *  the Phase 18 gate, so the stop state is checked here. An unreachable
+   *  server must not break ordinary chat; the authoritative agent-side gate
+   *  keeps enforcing the stop for every tool. */
+  const openExternalUrlIfNotStopped = useCallback(
+    async (url: string): Promise<void> => {
+      if (agentSystemRef.current?.safety?.emergencyStop?.isActive()) return;
+      try {
+        const res = await fetch('/api/safety/stop');
+        if (res.ok) {
+          const body = await res.json();
+          if (body?.result?.kind && body.result.kind !== 'INACTIVE') return;
+        }
+      } catch {
+        // server unreachable — fall back to the local gate verdict only
+      }
+      openExternalUrl(url);
+    },
+    []
+  );
+
   useEffect(() => {
     const system = createAgentSystem({
       applyWebAction: (action) => setActiveWebAction(action),
@@ -1485,7 +1545,7 @@ export default function App() {
       if (resolvedWebAction && !detectedWebAction) {
         detectedWebAction = resolvedWebAction;
         setActiveWebAction(resolvedWebAction);
-        openExternalUrl(resolvedWebAction.url);
+        await openExternalUrlIfNotStopped(resolvedWebAction.url);
       }
 
       // Handle Maps Grounding places returned by gemini-3.5-flash with googleMaps tool
@@ -1778,6 +1838,31 @@ export default function App() {
                 : 'Presence Active'}
             </span>
           </p>
+
+          {/* E5: emergency-stop status + activation (deactivation is operator-CLI only) */}
+          <div className="mt-2 pointer-events-auto">
+            {emergencyStopState.active ? (
+              <button
+                onClick={() => void refreshEmergencyStop()}
+                className="text-[10px] uppercase tracking-widest px-2 py-1 rounded bg-red-500/20 text-red-300 border border-red-400/40 animate-pulse"
+                title="Emergency stop is ACTIVE — tasks are cancelled and side effects are blocked. Recovery requires the operator recovery CLI."
+              >
+                ⏹ Emergency Stop Active{emergencyStopState.generation ? ` (gen ${emergencyStopState.generation})` : ''}
+              </button>
+            ) : (
+              <button
+                onClick={() => {
+                  if (window.confirm('Activate the emergency stop? This cancels running tasks and blocks side effects. Recovery requires the operator recovery CLI.')) {
+                    void activateEmergencyStop();
+                  }
+                }}
+                className="text-[10px] uppercase tracking-widest px-2 py-1 rounded bg-slate-500/10 text-blue-200/60 border border-blue-300/20 hover:bg-red-500/20 hover:text-red-200 hover:border-red-400/40 transition-colors"
+                title="Activate the emergency stop — cancels tasks and blocks side effects. Recovery requires the operator recovery CLI."
+              >
+                ⏹ Emergency Stop
+              </button>
+            )}
+          </div>
         </div>
 
         {/* White Mode Exit / Stop Pill when dancing or looking */}

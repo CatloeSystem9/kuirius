@@ -1,0 +1,11 @@
+const input = page.getByPlaceholder('Type in English, Hindi, or ask Krisha...');
+await input.click();
+await input.fill('hello krisha');
+await page.waitForTimeout(300);
+const sendEnabledBefore = await page.getByRole('button', { name: 'Send message' }).isEnabled();
+await page.screenshot({ path: 't2_greeting_typed.png' });
+await page.getByRole('button', { name: 'Send message' }).click();
+await page.waitForTimeout(2500);
+const body = await page.locator('body').innerText();
+await page.screenshot({ path: 't2_greeting_reply.png' });
+return { sendEnabledBefore, replyContainsGreeting: /hello|hi|hey|greet/i.test(body), bodySample: body.slice(0, 600) };

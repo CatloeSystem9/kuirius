@@ -178,13 +178,16 @@ export class RecoveryStrategyExecutor {
       };
     }
 
-    // Re-resolve against available context or fallback
+    // Re-resolve against available context or fallback. The retry input MUST
+    // stay schema-valid: ToolRegistry.validateInvocation rejects undeclared
+    // keys, so injecting a marker key here would sabotage every retry with
+    // "Unexpected input" and mask the original failure (Phase 3 audit).
     return {
       strategy: 'RE_RESOLVE_TARGET',
       success: true,
       verified: true,
       evidence: `Target re-resolution attempted for: ${JSON.stringify(rawTarget)}`,
-      modifiedInput: { ...context.step.input, _targetReResolved: true },
+      modifiedInput: { ...context.step.input },
     };
   }
 

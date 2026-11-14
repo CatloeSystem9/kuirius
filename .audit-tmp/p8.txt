@@ -1,0 +1,5 @@
+RECOVERY_PIPE_PATH
+pipePath
+PIPE_PATH
+krisha-e5-recovery
+KRISHA_RECOVERY_PIPE

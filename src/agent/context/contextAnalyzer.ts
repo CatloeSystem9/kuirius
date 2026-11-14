@@ -103,6 +103,10 @@ export function analyzeContext(request: ContextRequest): ContextRequirements {
 
   const needsMemory =
     intent === 'memory_query' ||
+    // Questions may reference stored facts by topic ("where is the deploy key
+    // kept?") without matching a MEMORY_PATTERN — the relevance ranker, not
+    // the intent gate, decides what is actually relevant (Phase 3 audit).
+    intent === 'question' ||
     intent === 'diagnose' ||
     intent === 'create_or_modify' ||
     MEMORY_PATTERNS.some((re) => re.test(text));

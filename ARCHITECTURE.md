@@ -2552,3 +2552,73 @@ be recognized (a valid empty OCR result is an allow; engine failures are
 never treated as "no text"); Google-key detection tolerates the engine's
 AIzaâ†’Alza reading; single-language OCR coverage; Windows-only (other
 platforms fail closed).
+
+## 35. SPF + LPV Integration Baseline (consolidated)
+
+**Reference document:** `SECURITY-INTEGRATION-BASELINE.md` (integration date
+2026-11-15). This section summarizes the two security subsystems' shared
+operating picture; §32/§33/§34 remain the authoritative per-subsystem
+documentation.
+
+**Boundaries.** SPF governs the TRANSMISSION of screen-derived information
+across the external boundary (detection, OCR pixel inspection, irreversible
+redaction, transport guard, metadata-only audit). LPV governs credential
+RETENTION and authorized LOCAL retrieval (DPAPI-wrapped encrypted local
+store, approval challenges, pinned origin-verified browser fills,
+metadata-only responses). Neither bypasses the other: LPV secrets leave the
+device only through SPF-gated channels (none do — fills ride a loopback CDP
+WebSocket to the local browser), and SPF never retains credentials
+(detection results are categories/counts, never values; LPV is the only
+retention authority and nothing auto-saves into it).
+
+**Credential lifecycle (LPV):** save (Category A requires operator approval;
+auto-save only for opted-in Category B, secret-shaped content refused) →
+DPAPI-wrapped master key + AES-256-GCM per-entry + HMAC over the full
+document → unlock (Windows account-bound) → retrieval/fill only via
+server-minted single-use grants bound to {entry, origin}, issued ONLY by
+operator-approved challenges (decision tokens; no model-callable approval —
+the model can request a challenge and nothing more) → lock/auto-lock zeroes
+key material; tamper is fail-closed. Route layer: `vault.manage` /
+`vault.retrieve` server permissions, stop-blocked, rate-limited; no vault
+tool exists in the agent ToolRegistry.
+
+**Screen-derived data lifecycle (SPF):** capture (on-demand, permission-
+gated) → local pixel inspection (Windows.Media.Ocr worker; every frame/page
+of a container; malformed/empty-transcript validation) → existing SPF
+detectors per recognized line → sensitive regions irreversibly blacked out
++ re-encode → MANDATORY second inspection → only the verified payload may
+continue to a model (metadata signals remain an additional fast-fail layer,
+never a fallback) → response text screened before re-entering Krisha →
+metadata-only audit (`spf_decision`/`spf_visual_decision` in the E5 chain
+plus the in-memory transparency ring).
+
+**Browser-fill destination verification (LPV):** probe walks ALL open CDP
+page targets, pins the one whose LIVE origin equals the approved origin,
+requires `readyState === 'complete'`, and the in-page expression re-verifies
+`location.origin` atomically with the typing; post-fill navigation check.
+A page that refuses or navigates → nothing typed.
+
+**Emergency stop:** one durable server-side stop governs both subsystems —
+SPF-enforced routes return 423 (including `/api/vision/analyze` and every
+vault mutation/fill route), LPV refuses vault operations while a stop is
+active (`assertStopInactive`), recovery remains operator CLI + credential
+only.
+
+**Audit & leakage protections:** both audit trails are metadata-only
+(categories, routes, decisions, counts, non-reversible hash prefixes —
+never values); fill responses return fill-state metadata only (asserted);
+no secrets enter chat history, memory, task summaries, the activity feed or
+Action Transparency (SPF gates the conversation/memory/tts/speech egress
+paths; LPV emits no bus events).
+
+**Test-isolation requirement (permanent):** every spawned test server sets
+`KRISHA_SANDBOX_DIR` + `KRISHA_FS_ROOTS` to temporary directories BEFORE
+module initialization; the real E5 protected store must remain byte-for-byte
+unchanged across test campaigns (verified by `scripts/spf-real-store-status.ts`
+before/after: audit entry count, stop kind and file hashes identical).
+
+**Integration regression results (2026-11-15):** SPF text 220/0, SPF visual
+113/0, LPV core 92/0, LPV security **5×55/0** (five consecutive runs), LPV
+perf 11/0, E5 M1/M2/M3/H4 86/74/72/70 all 0 failed, Phase 13/14/18
+91/150/62 all 0 failed, agent-core 49/0, goal-continuity 163/0,
+`tsc --noEmit` clean; real store unchanged (hash-verified).

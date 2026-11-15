@@ -13,6 +13,7 @@ import { ok, fail } from '../types';
 import type { ObserverErrorKind, ScreenState } from './visionTypes';
 import { ObserverError } from './visionTypes';
 import type { ScreenObserver } from './screenObserver';
+import { spfScreenItem } from '../spf/index';
 
 const SCREEN_VERIFICATION = {
   strategy: 'self_reported' as const,
@@ -37,23 +38,33 @@ function mapObserverError(err: unknown): ToolResult {
   return fail(`Screen observation failed: ${String((err as any)?.message || err)}`, { errorKind: 'execution_error', retryable: true });
 }
 
-/** Compact output for a state — summaries and bounded lists, never raw image data. */
+/**
+ * Compact output for a state — summaries and bounded lists, never raw image
+ * data. SPF EP-13 — every screen-derived item is screened by the Screen
+ * Privacy Firewall before it leaves the tool (outputs flow into task
+ * summaries, conversation reports and memory). Per-item policy: confident
+ * secrets are redacted, unseparable items are replaced by a content-free
+ * placeholder — the collection is never blocked as a whole, so observation
+ * of clean content keeps working.
+ */
 function stateOutput(state: ScreenState) {
-  const visibleTexts = state.analysis.texts.slice(0, 25);
+  const screenItem = (value: string): string =>
+    spfScreenItem(value, 'tool:screen.observe', state.id, 'tool-output').text;
+  const visibleTexts = state.analysis.texts.slice(0, 25).map((t) => ({ ...t, text: screenItem(t.text) }));
   const textSummary = visibleTexts.map((t) => t.text).filter(Boolean).join(' • ');
 
   return {
-    summary: state.analysis.summary,
-    application: state.analysis.application || state.activeWindow.title || 'Desktop / Browser Screen',
+    summary: screenItem(state.analysis.summary),
+    application: screenItem(state.analysis.application || state.activeWindow.title || 'Desktop / Browser Screen'),
     activeWindow: state.activeWindow.available
-      ? { title: state.activeWindow.title, surface: state.activeWindow.surface }
+      ? { title: screenItem(state.activeWindow.title), surface: state.activeWindow.surface }
       : { available: false },
     textSummary: textSummary || undefined,
     texts: visibleTexts,
-    elements: state.analysis.elements.slice(0, 20),
-    dialogs: state.analysis.dialogs.slice(0, 5),
-    errors: state.analysis.errors.slice(0, 5),
-    warnings: state.analysis.warnings.slice(0, 5),
+    elements: state.analysis.elements.slice(0, 20).map((e) => (e.text ? { ...e, text: screenItem(e.text) } : e)),
+    dialogs: state.analysis.dialogs.slice(0, 5).map((d) => (d.text ? { ...d, text: screenItem(d.text) } : d)),
+    errors: state.analysis.errors.slice(0, 5).map(screenItem),
+    warnings: state.analysis.warnings.slice(0, 5).map(screenItem),
     loading: state.analysis.loading,
     provider: state.analysis.provider,
     confidence: state.analysis.confidence,

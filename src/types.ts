@@ -254,6 +254,7 @@ export type ActiveModal =
   | null
   | 'conversations'
   | 'memory'
+  | 'vault'
   | 'settings'
   | 'files'
   | 'apps'

@@ -32,6 +32,11 @@ export const ALL_PERMISSIONS: ToolPermission[] = [
   'microphone.access',
   'location.access',
   'memory.access',
+  // LPV (Local Private Vault): the MODEL is default-deny on both domains.
+  // Management is the operator UI's own authority (server-side baseline);
+  // retrieval is only ever satisfied by approval-issued single-use grants.
+  'vault.manage',
+  'vault.retrieve',
 ];
 
 export type PermissionGrants = Partial<Record<ToolPermission, boolean>>;
@@ -50,6 +55,8 @@ function defaultGrants(): PermissionGrants {
     'terminal.execution': false,
     'camera.access': false,
     'microphone.access': false,
+    'vault.manage': false,
+    'vault.retrieve': false,
   };
 }
 

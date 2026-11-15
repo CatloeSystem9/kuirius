@@ -14,6 +14,7 @@ import {
   Eye,
   ChevronUp,
   ChevronDown,
+  Lock,
 } from 'lucide-react';
 import { WindowsLogo } from './WindowsLogo';
 import { ActiveModal, UserLocation } from '../types';
@@ -308,6 +309,28 @@ export const SidebarNav: React.FC<SidebarNavProps> = ({ activeModal, onSelectMod
           >
             <BrainCircuit className="w-5 h-5 transition-transform group-hover:scale-110" />
             {activeModal === 'memory' && (
+              <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
+            )}
+          </button>
+
+          {/* 2b. Local Private Vault (encrypted credential storage) */}
+          <button
+            type="button"
+            id="nav-vault"
+            title="Local Private Vault"
+            onPointerDown={(e) => e.stopPropagation()}
+            onClick={(e) => {
+              e.stopPropagation();
+              handleNavClick('vault');
+            }}
+            className={`relative p-3 rounded-2xl transition-all duration-200 ease-out cursor-pointer group hover:scale-105 active:scale-95 transform-gpu pointer-events-auto ${
+              activeModal === 'vault'
+                ? 'text-blue-200 bg-blue-600/20 border border-blue-500/50 shadow-[0_0_16px_rgba(59,130,246,0.35)] ring-1 ring-blue-400/30'
+                : 'text-slate-400 hover:text-blue-300 hover:bg-blue-950/40 border border-transparent hover:border-blue-500/30 hover:shadow-[0_0_12px_rgba(59,130,246,0.2)]'
+            }`}
+          >
+            <Lock className="w-5 h-5 transition-transform group-hover:scale-110" />
+            {activeModal === 'vault' && (
               <span className="absolute -right-1 top-1/2 -translate-y-1/2 w-1 h-3.5 rounded-full bg-blue-400 shadow-[0_0_8px_#38bdf8]" />
             )}
           </button>

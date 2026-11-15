@@ -60,11 +60,14 @@ import {
 } from './utils/fileSystemAccess';
 import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
 import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, type AgentSystem } from './agent/bridge';
+import { spfScreenItem } from './agent/spf/index';
 import { getMemoryService } from './agent/memory/memoryService';
 import { attachMemoryToSystem } from './agent/memory/memoryBridge';
 import { SidebarNav } from './components/SidebarNav';
 import { ConversationsModal } from './components/ConversationsModal';
 import { MemoryModal } from './components/MemoryModal';
+import { LocalVaultModal } from './components/LocalVaultModal';
+import { LpvApprovalCard } from './components/LpvApprovalCard';
 import { SettingsModal } from './components/SettingsModal';
 import { LocalFilesModal } from './components/LocalFilesModal';
 import { AppsModal } from './components/AppsModal';
@@ -715,21 +718,29 @@ export default function App() {
       });
 
       const snapshotUrl = state.snapshotRef ? observer.getSnapshot(state.snapshotRef) : undefined;
+      // SPF EP-12 — screen-derived content is sanitized BEFORE it becomes a
+      // chat message (which persists to localStorage and feeds the cloud chat
+      // request). Local display keeps working; secrets never persist.
+      const spfCleanScreenText = (value: string): string =>
+        spfScreenItem(value, 'local:screen-vision-message', state.id, 'summary').text;
       const actionData: ScreenVisionAction = {
         type: 'observe',
         question: customPrompt,
-        summary: state.analysis.summary,
+        summary: spfCleanScreenText(state.analysis.summary ?? ''),
         application: state.analysis.application || state.activeWindow?.title || 'Desktop / Browser Screen',
         activeWindowTitle: state.activeWindow?.title,
         textSummary: state.analysis.texts?.map((t) => t.text).filter(Boolean).join(' • '),
-        texts: state.analysis.texts || [],
+        texts: (state.analysis.texts || []).map((t) => ({ ...t, text: spfCleanScreenText(t.text) })),
         elements: state.analysis.elements || [],
-        dialogs: state.analysis.dialogs,
-        errors: state.analysis.errors,
-        warnings: state.analysis.warnings,
+        dialogs: state.analysis.dialogs?.map((d) => ({ ...d, text: d.text ? spfCleanScreenText(d.text) : d.text })),
+        errors: (state.analysis.errors || []).map(spfCleanScreenText),
+        warnings: (state.analysis.warnings || []).map(spfCleanScreenText),
         snapshotUrl,
         timestamp: state.timestamp,
       };
+      actionData.textSummary = actionData.textSummary
+        ? spfCleanScreenText(actionData.textSummary)
+        : undefined;
 
       setActiveScreenVisionAction(actionData);
       setExpression('happy_sparkle');
@@ -2099,6 +2110,8 @@ export default function App() {
           />
           {/* E5 M3 — the only operator approval surface for rollback challenges */}
           <RollbackApprovalCard isLightMode={isWhiteBackground} />
+          {/* LPV — the only operator approval surface for vault challenges (save/fill) */}
+          <LpvApprovalCard isLightMode={isWhiteBackground} />
           <HabitActionCard
             action={activeHabitAction}
             onDismiss={() => setActiveHabitAction(null)}
@@ -2209,6 +2222,10 @@ export default function App() {
         onUpdateMemory={handleUpdateMemory}
         onDeleteMemory={handleDeleteMemory}
       />
+
+      {/* LPV — Local Private Vault (self-contained: fetches its own server
+          state; secrets are never displayed or revealed in this panel) */}
+      <LocalVaultModal isOpen={activeModal === 'vault'} onClose={() => setActiveModal(null)} />
 
       <LocalFilesModal
         isOpen={activeModal === 'files'}

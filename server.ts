@@ -34,11 +34,53 @@ import {
 // refers to the Phase 10 task-context helper module context.ts.)
 import { ContextEngine, analyzeContext, rankItems, packWithinBudget } from "./src/agent/context/index";
 import type { ContextBudgetConfig, ContextItem, StorageAdapter } from "./src/agent/context/index";
+// Screen Privacy Firewall (SPF) — mandatory, fail-closed boundary between
+// screen observation and every external transmission (EP-1..EP-9 below).
+import { spfFirewall, spfAuditLog, spfScreenItem } from "./src/agent/spf/index";
+import type { SpfVerdict } from "./src/agent/spf/index";
+// SPF VISUAL — local OCR pixel inspection + irreversible region redaction
+// for every screenshot that can leave the device (Windows.Media.Ocr worker,
+// zero dependencies, fully offline; fail-closed).
+import { inspectImageForTransmission } from "./src/agent/spf/visualInspection";
+import type { VisualInspectionResult } from "./src/agent/spf/visualInspection";
+// SPF EP-16 — system-wide outbound transport guard: patches globalThis.fetch
+// and node:http/https so NO external request can bypass the firewall by using
+// another client or integration. Installed before anything can call out.
+import { installSpfOutboundGuard } from "./src/agent/spf/outboundGuard";
+import { appendAuditSyncSafe } from "./serverSafety";
+
+const spfOutboundGuard = installSpfOutboundGuard(spfFirewall);
+
+/**
+ * Persist one SPF decision to the existing tamper-evident E5 audit chain
+ * (reuse — no duplicate security system) alongside the in-memory
+ * SpfAuditLog ring (Action-Transparency integration point).
+ */
+function spfAuditDurable(route: string, destination: string, verdict: SpfVerdict): void {
+  try {
+    appendAuditSyncSafe({
+      kind: "spf_decision",
+      route,
+      destination,
+      decision: verdict.decision,
+      reason: verdict.reason,
+      categories: verdict.categories,
+      confidence: verdict.confidence,
+      spfAuditId: verdict.auditId,
+    });
+  } catch {
+    /* audit degradation must never break the gate */
+  }
+}
 
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+// Default port 3000 (unchanged). KRISHA_PORT exists ONLY as a test/CI
+// affordance so the SPF security suite (scripts/test-spf.ts) can spawn an
+// isolated live server for endpoint-gate verification while a dev instance
+// occupies the default port.
+const PORT = Number(process.env.KRISHA_PORT) || 3000;
 // E5 M1 (decision D1): loopback by default. LAN exposure requires an explicit
 // KRISHA_BIND override and is a separately designed feature (decision D6).
 const BIND = process.env.KRISHA_BIND || "127.0.0.1";
@@ -74,6 +116,12 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   "/api/browser/back": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
   "/api/browser/forward": { permission: "browser.interaction", stopBlock: true, rate: { group: "browser", limit: 30, windowMs: 60_000 } },
   "/api/memory/extract": { permission: "memory.access", stopBlock: true, rate: { group: "memory", limit: 10, windowMs: 60_000 } },
+  // SPF visual remediation: the screenshot-analysis route is the single
+  // external image boundary. It carries no permission (the UI ask/observe
+  // flows call it without a server-side grant), but cloud image egress must
+  // HALT while the emergency stop is active — OCR-backed transmission is an
+  // action, and stop-blocked here is fail-closed by construction (423).
+  "/api/vision/analyze": { stopBlock: true },
   // E5 M1 acceptance: the only disk write outside the fs/app/computer/browser
   // routes is the context-engine cache write in /api/research/search
   // (JsonFileStorage.flush → <cwd>/.krisha/context-cache-v1.json). While the
@@ -94,6 +142,36 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   "/api/rollback/pending": { stopBlock: false, rate: { group: "rollback", limit: 60, windowMs: 60_000 } },
   "/api/quarantine/list": { stopBlock: false, rate: { group: "rollback", limit: 30, windowMs: 60_000 } },
   "/api/quarantine/scan": { stopBlock: false, rate: { group: "rollback", limit: 10, windowMs: 60_000 } },
+  // LPV — Local Private Vault (post-roadmap capability). Every mutating or
+  // secret-adjacent route is stop-blocked and permission-gated; retrieval
+  // additionally requires an approval-issued single-use grant (see lpvCore).
+  // Read-only metadata routes (entries/policy/history/pending approvals) are
+  // audited + rate-limited but not stop-blocked, matching the E5 read-only
+  // convention; GET /api/vault/status stays ungated like /api/health.
+  "/api/vault/init": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 10, windowMs: 60_000 } },
+  "/api/vault/entries": { permission: "vault.manage", stopBlock: false, rate: { group: "vault-manage", limit: 60, windowMs: 60_000 } },
+  "/api/vault/entry": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  "/api/vault/entry/update": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  "/api/vault/entry/delete": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  "/api/vault/policy": { permission: "vault.manage", stopBlock: false, rate: { group: "vault-manage", limit: 60, windowMs: 60_000 } },
+  "/api/vault/policy/update": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 20, windowMs: 60_000 } },
+  "/api/vault/history": { permission: "vault.manage", stopBlock: false, rate: { group: "vault-manage", limit: 60, windowMs: 60_000 } },
+  "/api/vault/lock": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  "/api/vault/unlock": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 10, windowMs: 60_000 } },
+  "/api/vault/restore": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 5, windowMs: 60_000 } },
+  "/api/vault/fill": { permission: "vault.retrieve", stopBlock: true, rate: { group: "vault-retrieve", limit: 10, windowMs: 60_000 } },
+  "/api/vault/fill/request": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-retrieve", limit: 20, windowMs: 60_000 } },
+  // Challenge creation authorizes NOTHING (it only opens an operator card);
+  // approval happens exclusively through the operator UI affordance.
+  "/api/vault/challenge": { stopBlock: true, rate: { group: "vault-retrieve", limit: 10, windowMs: 60_000 } },
+  "/api/vault/approvals/pending": { permission: "vault.manage", stopBlock: false, rate: { group: "vault-manage", limit: 120, windowMs: 60_000 } },
+  "/api/vault/approvals/approve": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  "/api/vault/approvals/decline": { permission: "vault.manage", stopBlock: true, rate: { group: "vault-manage", limit: 30, windowMs: 60_000 } },
+  // Requester-side challenge status — METADATA ONLY (state + outcome of an
+  // approval-executed fill). It never exposes credentials or a retrieval
+  // grant: approval-executed fills run server-side and hand no capability
+  // to the requester.
+  "/api/vault/challenge/status": { stopBlock: false, rate: { group: "vault-retrieve", limit: 60, windowMs: 60_000 } },
 };
 
 app.use((req, res, next) => {
@@ -144,6 +222,22 @@ app.post("/api/location/geocode", async (req, res) => {
   try {
     let { lat, lng, address } = req.body;
     const apiKey = process.env.GOOGLE_MAPS_API_KEY;
+
+    // SPF EP-6 — address gate: the geocode request embeds the address in an
+    // external URL. Confident secrets are redacted; unredactable content
+    // blocks the lookup (same failure shape as other geocode errors).
+    if (typeof address === "string" && address.length > 0) {
+      const geoSpf = spfFirewall.inspectText(address, {
+        destination: "google-maps:geocode",
+        payloadKind: "text",
+        transport: "http-url",
+      });
+      spfAuditDurable("/api/location/geocode", "google-maps:geocode", geoSpf);
+      if (geoSpf.decision === "block") {
+        return res.status(400).json({ error: "Address blocked by the Screen Privacy Firewall" });
+      }
+      address = geoSpf.redactedText ?? address;
+    }
 
     let numLat: number | undefined = undefined;
     let numLng: number | undefined = undefined;
@@ -1010,6 +1104,56 @@ app.post("/api/chat", async (req, res) => {
   } = req.body;
 
   try {
+    // SPF EP-2 — outbound prompt gate. Conversation history can embed
+    // screen-derived text (vision summaries, legible screen text, task
+    // summaries). Transport policy: confident secrets are REDACTED from the
+    // prompt; unredactable content BLOCKS the model call with a graceful
+    // in-character reply — unrelated functionality is never disabled.
+    const chatFields: Record<string, string | undefined> = {};
+    const messageList: Array<{ content: string }> = Array.isArray(messages) ? messages : [];
+    messageList.forEach((m, i) => {
+      chatFields[`msg_${i}`] = typeof m?.content === "string" ? m.content : undefined;
+    });
+    if (Array.isArray(memories)) memories.forEach((mem: unknown, i: number) => {
+      if (typeof mem === "string") chatFields[`memory_${i}`] = mem;
+    });
+    if (typeof companionNotes === "string") chatFields.companionNotes = companionNotes;
+    if (typeof habitsContext === "string") chatFields.habitsContext = habitsContext;
+    const chatSpf = spfFirewall.inspectTextFields(chatFields, {
+      destination: "gemini:chat",
+      payloadKind: "text",
+      transport: "chat-history",
+    });
+    spfAuditDurable("/api/chat", "gemini:chat", chatSpf.verdict);
+    if (chatSpf.verdict.decision === "block") {
+      return res.json({
+        reply: "I can't send this conversation to my cloud model right now — it looks like it contains sensitive information such as a password, OTP, or account number, and I will never transmit those. Please remove the sensitive details and ask me again. 💙",
+        expression: "thoughtful_gaze",
+        emotionData: { expression: "thoughtful_gaze", intensity: 0.8, gesture: "none", blushLevel: 0.2 },
+        spfBlocked: true,
+        route: {
+          complexity: "blocked",
+          tier: "blocked",
+          preferred: "none",
+          used: "spf-blocked",
+          reason: "screen privacy firewall: sensitive content could not be safely redacted",
+          orderedModels: [],
+        },
+      });
+    }
+    // Sanitized prompt inputs (the raw values never leave this process).
+    const sanitizedMessages = messageList.map((m, i) => ({
+      ...m,
+      content: chatSpf.sanitized[`msg_${i}`] ?? m.content,
+    }));
+    const sanitizedMemories: string[] = Array.isArray(memories)
+      ? memories.map((mem: unknown, i: number) =>
+          typeof mem === "string" ? chatSpf.sanitized[`memory_${i}`] ?? mem : mem
+        ).filter((m): m is string => typeof m === "string")
+      : [];
+    const sanitizedCompanionNotes = typeof companionNotes === "string" ? chatSpf.sanitized.companionNotes ?? companionNotes : companionNotes;
+    const sanitizedHabitsContext = typeof habitsContext === "string" ? chatSpf.sanitized.habitsContext ?? habitsContext : habitsContext;
+
     const ai = getGenAI();
 
     const languageInstruction =
@@ -1022,17 +1166,19 @@ app.post("/api/chat", async (req, res) => {
     // Context Engine v1: budgeted memory injection — rank the recalled
     // memories against the current request and keep only the highest-value
     // ones within a bounded budget (no unconditional full-dump).
+    // SPF EP-2: sanitized prompt inputs are used everywhere below — the raw
+    // conversation text never reaches the model request.
     const memoryContext = buildMemoryContext(
-      (messages && messages.length > 0) ? messages[messages.length - 1]?.content || "" : "",
-      memories
+      (sanitizedMessages && sanitizedMessages.length > 0) ? sanitizedMessages[sanitizedMessages.length - 1]?.content || "" : "",
+      sanitizedMemories
     );
 
-    const userPreferenceContext = companionNotes.trim()
-      ? `\n\n[USER CUSTOM PREFERENCES/NOTES]:\n${companionNotes}`
+    const userPreferenceContext = sanitizedCompanionNotes.trim()
+      ? `\n\n[USER CUSTOM PREFERENCES/NOTES]:\n${sanitizedCompanionNotes}`
       : "";
 
-    const habitsInstruction = habitsContext && habitsContext.trim()
-      ? `\n\n[USER'S DAILY HABITS, GOALS & CALENDAR CONTEXT (TODAY'S SCHEDULE)]:\n${habitsContext.trim()}
+    const habitsInstruction = sanitizedHabitsContext && sanitizedHabitsContext.trim()
+      ? `\n\n[USER'S DAILY HABITS, GOALS & CALENDAR CONTEXT (TODAY'S SCHEDULE)]:\n${sanitizedHabitsContext.trim()}
 - HABIT COACHING & AFFECTIONATE MOTIVATION:
   * You actively follow and track ${userName}'s daily goals, habits, and schedule throughout the day.
   * When ${userName} asks about their goals, asks for a check-in, or reports completing a habit (e.g. drinking water, working out, deep work, reading, reflection), celebrate enthusiastically, cheer them on warmly, and encourage their streak!
@@ -1124,16 +1270,17 @@ Examples:
     const contents: any[] = [];
     
     // Add history (limit to last 16 turns to stay lightweight and fast)
-    const recentMessages = (messages || []).slice(-16);
+    // SPF EP-2: sanitizedMessages carry SPF-redacted content only.
+    const recentMessages = (sanitizedMessages || []).slice(-16);
     for (const msg of recentMessages) {
       contents.push({
-        role: msg.role === "user" ? "user" : "model",
+        role: (msg as any).role === "user" ? "user" : "model",
         parts: [{ text: msg.content }],
       });
     }
 
-    const lastUserMsg = (messages && messages.length > 0)
-      ? messages[messages.length - 1]?.content || ""
+    const lastUserMsg = (sanitizedMessages && sanitizedMessages.length > 0)
+      ? sanitizedMessages[sanitizedMessages.length - 1]?.content || ""
       : "";
 
     // Phase 17: deterministic task classification → route. The selected model
@@ -1293,6 +1440,19 @@ Examples:
   }
 });
 
+// SPF EP-9 — web-search queries become external URL parameters sent to
+// YouTube/Google/Earth. Screen-derived or pasted text with secrets is
+// redacted before URL construction; unredactable content returns blocked=true
+// and the caller falls back to opening the site homepage without a query.
+function spfSafeWebQuery(query: string): { text: string; blocked: boolean } {
+  const verdict = spfFirewall.inspectText(query, {
+    destination: "browser:web-search-url",
+    payloadKind: "text",
+    transport: "http-url",
+  });
+  return { text: verdict.redactedText ?? query, blocked: verdict.decision === "block" };
+}
+
 // Server-side web action detector for YouTube, Google, and popular web destinations
 function extractServerWebAction(text: string) {
   if (!text) return null;
@@ -1323,11 +1483,21 @@ function extractServerWebAction(text: string) {
       !queryPart.includes("website like") &&
       !queryPart.includes("any other")
     ) {
+      const spfQuery = spfSafeWebQuery(queryPart);
+      if (spfQuery.blocked) {
+        return {
+          type: 'open_website',
+          siteName: 'YouTube',
+          url: 'https://www.youtube.com',
+          icon: 'Youtube',
+          category: 'video',
+        };
+      }
       return {
         type: 'search_website',
         siteName: 'YouTube',
-        query: queryPart,
-        url: `https://www.youtube.com/results?search_query=${encodeURIComponent(queryPart)}`,
+        query: spfQuery.text,
+        url: `https://www.youtube.com/results?search_query=${encodeURIComponent(spfQuery.text)}`,
         icon: 'Youtube',
         category: 'video',
       };
@@ -1355,11 +1525,21 @@ function extractServerWebAction(text: string) {
       )
       .trim();
     if (queryPart && queryPart !== "it" && queryPart.length > 1) {
+      const spfQuery = spfSafeWebQuery(queryPart);
+      if (spfQuery.blocked) {
+        return {
+          type: 'open_website',
+          siteName: 'Google Earth',
+          url: 'https://earth.google.com/web/',
+          icon: 'Globe',
+          category: 'knowledge',
+        };
+      }
       return {
         type: 'search_website',
         siteName: 'Google Earth',
-        query: queryPart,
-        url: `https://earth.google.com/web/search/${encodeURIComponent(queryPart)}`,
+        query: spfQuery.text,
+        url: `https://earth.google.com/web/search/${encodeURIComponent(spfQuery.text)}`,
         icon: 'Globe',
         category: 'knowledge',
       };
@@ -1386,11 +1566,21 @@ function extractServerWebAction(text: string) {
   ) {
     const query = clean.replace(/^(?:can\s+you\s+|please\s+)?(?:google|search\s+google\s+for|look\s+up\s+on\s+google|search\s+for|search)?/i, "").trim();
     if (query && query !== "it" && query.length > 1) {
+      const spfQuery = spfSafeWebQuery(query);
+      if (spfQuery.blocked) {
+        return {
+          type: 'open_website',
+          siteName: 'Google',
+          url: 'https://www.google.com',
+          icon: 'Search',
+          category: 'search',
+        };
+      }
       return {
         type: 'search_website',
         siteName: 'Google',
-        query,
-        url: `https://www.google.com/search?q=${encodeURIComponent(query)}`,
+        query: spfQuery.text,
+        url: `https://www.google.com/search?q=${encodeURIComponent(spfQuery.text)}`,
         icon: 'Search',
         category: 'search',
       };
@@ -1511,22 +1701,40 @@ app.post("/api/memory/extract", async (req, res) => {
       return res.json({ newMemories: [] });
     }
 
-    // 1. First run fast heuristic extraction
-    const heuristicFacts = extractHeuristicFacts(userMessage);
+    // SPF EP-4 — gate the memory pipeline. Conversation content (including
+    // screen-derived summaries) must not reach the extraction model — or the
+    // memory store — carrying secrets. Confident secrets are redacted;
+    // unredactable content stops extraction entirely.
+    const memSpf = spfFirewall.inspectTextFields(
+      {
+        userMessage: typeof userMessage === "string" ? userMessage : undefined,
+        botMessage: typeof botMessage === "string" ? botMessage : undefined,
+      },
+      { destination: "gemini:memory-extract", payloadKind: "text", transport: "memory" }
+    );
+    spfAuditDurable("/api/memory/extract", "gemini:memory-extract", memSpf.verdict);
+    const safeUserMessage = memSpf.sanitized.userMessage ?? userMessage;
+    const safeBotMessage = memSpf.sanitized.botMessage ?? botMessage;
+    if (memSpf.verdict.decision === "block") {
+      return res.json({ newMemories: [], spfBlocked: true });
+    }
+
+    // 1. First run fast heuristic extraction (on SPF-sanitized text)
+    const heuristicFacts = extractHeuristicFacts(safeUserMessage);
     const filteredHeuristics = heuristicFacts.filter(
       (fact) => !existingMemories.some((ex: string) => ex.toLowerCase().includes(fact.toLowerCase()))
     );
 
     // If cooldown is active or message is short, return heuristic facts without hitting API
-    if (Date.now() < memoryExtractCooldownUntil || userMessage.length < 15) {
+    if (Date.now() < memoryExtractCooldownUntil || safeUserMessage.length < 15) {
       return res.json({ newMemories: filteredHeuristics });
     }
 
     const ai = getGenAI();
 
     const prompt = `Analyze this conversation snippet between a user and their companion Krisha:
-User: "${userMessage}"
-Krisha: "${botMessage}"
+User: "${safeUserMessage}"
+Krisha: "${safeBotMessage}"
 
 Existing Known Memories:
 ${existingMemories.length > 0 ? existingMemories.map((m: string) => `- ${m}`).join("\n") : "None yet."}
@@ -1604,13 +1812,29 @@ app.post("/api/tts", async (req, res) => {
       return res.json({ fallback: true, message: "No text provided" });
     }
 
+    // SPF EP-5 — speech-text gate. Spoken replies can quote screen-derived
+    // content ("read my screen aloud"); secrets are redacted from the text
+    // sent to the TTS model, and unredactable content stops the call (the
+    // client falls back to local speech synthesis).
+    const ttsSpf = spfFirewall.inspectText(text, {
+      destination: "gemini:tts",
+      payloadKind: "text",
+      transport: "speech",
+    });
+    spfAuditDurable("/api/tts", "gemini:tts", ttsSpf);
+    if (ttsSpf.decision === "block") {
+      return res.json({ fallback: true, reason: "spf_blocked:" + ttsSpf.reason, spfBlocked: true, cooldownMs: 0 });
+    }
+    const spfSafeText = ttsSpf.redactedText ?? text;
+
     // Map to valid Gemini prebuilt voices: Aoede, Zephyr, Leda, Kore, Puck, Fenrir, Charon
     const validGeminiVoices = ["Aoede", "Zephyr", "Leda", "Kore", "Puck", "Fenrir", "Charon"];
     const targetVoice = validGeminiVoices.includes(voice) ? voice : "Aoede";
 
     // Strictly clean speech text: remove bracketed emotion tags, asterisk/parentheses stage directions,
     // and written laughter/vocal bursts so the voice model speaks cleanly without laughing in between.
-    const cleanSpeechText = text
+    // SPF EP-5: starts from the SPF-redacted text, never the raw input.
+    const cleanSpeechText = spfSafeText
       .replace(/\[(?:emotion|expression):[^\]]+\]/gi, '')
       .replace(/\[[^\]]+\]/g, '')
       .replace(/\*[^*]+\*/g, '')
@@ -1704,6 +1928,22 @@ app.post("/api/audio/transcribe", async (req, res) => {
       return res.status(400).json({ error: "No audio data provided", transcript: "" });
     }
 
+    // SPF EP-5b — the transcribe prompt is client text reaching Gemini.
+    // Audio itself is out of screen scope; the prompt text is gated.
+    let spfSafePrompt = typeof prompt === "string" ? prompt : undefined;
+    if (spfSafePrompt) {
+      const promptSpf = spfFirewall.inspectText(spfSafePrompt, {
+        destination: "gemini:audio-transcribe",
+        payloadKind: "text",
+        transport: "prompt",
+      });
+      spfAuditDurable("/api/audio/transcribe", "gemini:audio-transcribe", promptSpf);
+      if (promptSpf.decision === "block") {
+        return res.status(400).json({ error: "Prompt blocked by the Screen Privacy Firewall", transcript: "", spfBlocked: true });
+      }
+      spfSafePrompt = promptSpf.redactedText ?? spfSafePrompt;
+    }
+
     const ai = getGenAI();
     // Strip data URL scheme if present (e.g. data:audio/webm;base64,...)
     const cleanBase64 = base64Input.replace(/^data:[^;]+;base64,/, "").trim();
@@ -1731,7 +1971,7 @@ app.post("/api/audio/transcribe", async (req, res) => {
             audioPart,
             {
               text:
-                prompt ||
+                spfSafePrompt ||
                 "Transcribe this audio recording accurately. Output only the verbatim transcription text without conversational preamble, quotes, or commentary.",
             },
           ],
@@ -1780,10 +2020,22 @@ app.post("/api/maps/grounding", async (req, res) => {
       return res.status(400).json({ error: "Query is required for Maps Grounding" });
     }
 
+    // SPF EP-3 — maps-grounding query gate (the query text reaches Gemini).
+    const mapsSpf = spfFirewall.inspectText(query, {
+      destination: "gemini:maps-grounding",
+      payloadKind: "text",
+      transport: "chat-history",
+    });
+    spfAuditDurable("/api/maps/grounding", "gemini:maps-grounding", mapsSpf);
+    if (mapsSpf.decision === "block") {
+      return res.status(400).json({ error: "Query blocked by the Screen Privacy Firewall", spfBlocked: true, spfReason: mapsSpf.reason });
+    }
+    const spfSafeQuery = mapsSpf.redactedText ?? query;
+
     const ai = getGenAI();
     const result = await executeMapsGroundingQuery(
       ai,
-      [{ role: "user", parts: [{ text: query }] }],
+      [{ role: "user", parts: [{ text: spfSafeQuery }] }],
       userLocation
     );
 
@@ -1809,6 +2061,9 @@ const VISION_MAX_PER_WINDOW = 8;
 let visionRequestTimestamps: number[] = [];
 
 app.post("/api/vision/analyze", async (req, res) => {
+  // Hoisted so even a model-layer failure (e.g. no API key) reports the SPF
+  // visual decision that already ran for this request.
+  let spfImageMeta: Record<string, unknown> | undefined;
   try {
     const { image, question, activeWindowTitle } = req.body || {};
     if (!image || typeof image !== "string") {
@@ -1827,6 +2082,92 @@ app.post("/api/vision/analyze", async (req, res) => {
     if (!base64 || base64.length < 100) {
       return res.json({ fallback: true, reason: "malformed_image" });
     }
+
+    // SPF EP-1 — Screen Privacy Firewall image-transfer gate (fail-closed).
+    // Metadata signals (question, active window title, credential-window /
+    // credential-question heuristics) are an ADDITIONAL fast-fail layer —
+    // never a fallback: the authoritative pixel inspection follows.
+    const imageVerdict = spfFirewall.inspectImageTransfer(
+      { question: typeof question === "string" ? question : undefined, activeWindowTitle: typeof activeWindowTitle === "string" ? activeWindowTitle : undefined },
+      { destination: "gemini:vision-analyze", payloadKind: "image", transport: "prompt" }
+    );
+    spfAuditDurable("/api/vision/analyze", "gemini:vision-analyze", imageVerdict);
+    if (imageVerdict.decision === "block") {
+      return res.json({ fallback: true, reason: `spf_blocked:${imageVerdict.reason}`, spfBlocked: true });
+    }
+
+    // SPF VISUAL — local OCR inspection of the ACTUAL screenshot pixels
+    // (Windows.Media.Ocr worker, zero dependencies, fully offline). Any
+    // detected sensitive region is irreversibly redacted (solid black) and
+    // the sanitized image must pass a SECOND inspection before it may
+    // continue to the model. Every failure mode (engine unavailable,
+    // timeout, malformed result, decode/encode failure, verification
+    // failure) is a BLOCK. Only the verified payload below ever reaches the
+    // model request — the original image is not forwarded when redaction
+    // happened.
+    let visual: VisualInspectionResult;
+    try {
+      visual = await inspectImageForTransmission(base64);
+    } catch {
+      visual = {
+        decision: "block",
+        reason: "visual_inspection_crashed",
+        categories: [],
+        regionsRedacted: 0,
+        ocrLineCount: 0,
+        payloadIsSanitized: false,
+      };
+    }
+    try {
+      appendAuditSyncSafe({
+        kind: "spf_visual_decision",
+        route: "/api/vision/analyze",
+        destination: "gemini:vision-analyze",
+        decision: visual.decision,
+        reason: visual.reason,
+        categories: visual.categories,
+        regionsRedacted: visual.regionsRedacted,
+        ocrLines: visual.ocrLineCount,
+        sanitized: visual.payloadIsSanitized,
+        timedOut: visual.timedOut === true,
+      });
+    } catch {
+      /* audit degradation must never break the gate */
+    }
+    try {
+      spfAuditLog.recordVerdict(
+        {
+          decision: visual.decision,
+          reason: visual.reason,
+          confidence: visual.decision === "allow" ? 1 : 0.8,
+          categories: visual.categories,
+          findings: [],
+        },
+        "gemini:vision-analyze:visual"
+      );
+    } catch {
+      /* transparency feed must never break the gate */
+    }
+    // Assigned to the hoisted variable so the outer catch can report the
+    // already-completed SPF visual decision.
+    spfImageMeta = {
+      decision: visual.decision,
+      reason: visual.reason,
+      regionsRedacted: visual.regionsRedacted,
+      ocrLines: visual.ocrLineCount,
+      sanitized: visual.payloadIsSanitized,
+    };
+    if (visual.decision === "block") {
+      return res.json({
+        fallback: true,
+        reason: `spf_blocked:${visual.reason}`,
+        spfBlocked: true,
+        spfImage: spfImageMeta,
+      });
+    }
+    // REDACT: the sanitized payload is what the model receives — the
+    // original pixels never leave the device.
+    const base64ForModel = visual.decision === "redact" && visual.payload ? visual.payload : base64;
 
     const ai = getGenAI();
     const prompt = `You are the vision backend of a screen-observation assistant. Analyze the attached screen capture and answer the user's question about it.
@@ -1849,14 +2190,15 @@ ${question ? `User question: "${question}"` : ""}`;
 
     // Phase 17: identical concurrent analyses are coalesced into ONE model
     // call (read-only, deterministic request → safe to share). Independent
-    // requests are never affected.
+    // requests are never affected. SPF VISUAL: the coalesced request carries
+    // the verified (possibly redacted) payload only.
     const visionStart = Date.now();
-    const analysis = await visionCoalescer.run(`${hashKey(base64)}|${question ?? ""}`, async () => {
+    const analysis = await visionCoalescer.run(`${hashKey(base64ForModel)}|${question ?? ""}`, async () => {
       const { text } = await generateContentWithFallback(ai, {
         contents: [
           {
             role: "user",
-            parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: base64 } }],
+            parts: [{ text: prompt }, { inlineData: { mimeType: "image/jpeg", data: base64ForModel } }],
           },
         ],
         responseMimeType: "application/json",
@@ -1880,12 +2222,39 @@ ${question ? `User question: "${question}"` : ""}`;
     });
 
     if (analysis?.fallback) {
-      return res.json({ fallback: true, reason: analysis.reason });
+      return res.json({ fallback: true, reason: analysis.reason, spfImage: spfImageMeta });
     }
 
-    return res.json({ analysis });
+    // SPF EP-1b — screen the cloud OCR result (a DERIVED representation of
+    // the screen) before it re-enters Krisha. Per-item policy: redact/strip
+    // offending items, keep the rest — analysis of clean content keeps
+    // working even when one transcribed line carries a secret.
+    if (analysis && typeof analysis === "object") {
+      const strip = (value: string): string =>
+        spfScreenItem(String(value), "gemini:vision-analyze:response", undefined, "prompt").text;
+      try {
+        if (typeof analysis.summary === "string") analysis.summary = strip(analysis.summary);
+        if (Array.isArray(analysis.texts)) {
+          analysis.texts = analysis.texts.map((t: any) =>
+            t && typeof t.text === "string" ? { ...t, text: strip(t.text) } : t
+          );
+        }
+        if (Array.isArray(analysis.dialogs)) {
+          analysis.dialogs = analysis.dialogs.map((d: any) =>
+            d && typeof d.text === "string" ? { ...d, text: strip(d.text) } : d
+          );
+        }
+        if (Array.isArray(analysis.errors)) analysis.errors = analysis.errors.map(strip);
+        if (Array.isArray(analysis.warnings)) analysis.warnings = analysis.warnings.map(strip);
+        if (typeof analysis.application === "string") analysis.application = strip(analysis.application);
+      } catch {
+        return res.json({ fallback: true, reason: "spf_blocked:response_screening_failed", spfBlocked: true });
+      }
+    }
+
+    return res.json({ analysis, spfImage: spfImageMeta });
   } catch (error: any) {
-    return res.json({ fallback: true, reason: error?.message || "vision_failed" });
+    return res.json({ fallback: true, reason: error?.message || "vision_failed", spfImage: spfImageMeta });
   }
 });
 
@@ -2325,9 +2694,25 @@ app.post("/api/browser/state", async (req, res) => {
 app.post("/api/browser/navigate", async (req, res) => {
   try {
     const url = assertSafeHttpUrl(String(req.body?.url ?? "")).toString();
+    // SPF EP-8 — navigation URL gate: query strings can carry screen-derived
+    // text to external sites (e.g. agent searching for screen content via a
+    // search-engine URL). Sensitive or uncertain content blocks navigation.
+    const navSpf = spfFirewall.inspectUrl(url, {
+      destination: "browser:navigate:" + (new URL(url).host),
+      payloadKind: "url",
+      transport: "prompt",
+    });
+    spfAuditDurable("/api/browser/navigate", "browser:navigate", navSpf);
+    if (navSpf.decision === "block") {
+      return res.json({ success: false, error: "Navigation blocked by the Screen Privacy Firewall", spfBlocked: true, spfReason: navSpf.reason });
+    }
     const result = await browserNavigate(url);
     res.json({ success: true, ...result });
   } catch (err: any) {
+    if (err?.name === "SpfBlockedError") {
+      res.json({ success: false, error: "Navigation blocked by the Screen Privacy Firewall", spfBlocked: true });
+      return;
+    }
     res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
   }
 });
@@ -2614,10 +2999,25 @@ app.post("/api/research/search", async (req, res) => {
   if (!query) {
     return res.json({ success: false, error: "Missing search query" });
   }
+  // SPF EP-7 — research-query gate. Research queries can embed screen-derived
+  // text (e.g. an agent researching an error visible on screen). Confident
+  // secrets are redacted from the query; unredactable or uncertain content
+  // blocks the search (strict screen-provenance transport).
+  const searchSpf = spfFirewall.inspectText(query, {
+    destination: "web-search:duckduckgo+bing",
+    payloadKind: "text",
+    transport: "prompt",
+  });
+  spfAuditDurable("/api/research/search", "web-search:duckduckgo+bing", searchSpf);
+  if (searchSpf.decision === "block") {
+    return res.json({ success: false, error: "Query blocked by the Screen Privacy Firewall", spfBlocked: true, spfReason: searchSpf.reason });
+  }
+  const spfSafeQuery = (searchSpf.redactedText ?? query).trim();
   // Context Engine v1: cache-first, network-last — a still-valid cached result
   // set for this exact query is served instead of re-hitting the public
   // engines (fresh-only: stale entries are never served for research).
-  const cached = getContextEngine().lookupKnowledge(`research_search:${query}`);
+  // SPF EP-7: the cache key and every engine call use the SPF-redacted query.
+  const cached = getContextEngine().lookupKnowledge(`research_search:${spfSafeQuery}`);
   if (cached.hit && Array.isArray(cached.value) && cached.value.length > 0) {
     return res.json({ success: true, engine: "cache", cached: true, results: cached.value });
   }
@@ -2625,16 +3025,16 @@ app.post("/api/research/search", async (req, res) => {
     // Engine waterfall: DuckDuckGo (html → lite) then Bing RSS. The public
     // engines rate-limit by IP, so a fallback keeps research working.
     const engines: { name: string; run: () => Promise<{ url: string; title: string; snippet: string }[]> }[] = [
-      { name: "duckduckgo-html", run: () => duckDuckGoSearch(query, "html") },
-      { name: "duckduckgo-lite", run: () => duckDuckGoSearch(query, "lite") },
-      { name: "bing", run: () => bingSearch(query) },
+      { name: "duckduckgo-html", run: () => duckDuckGoSearch(spfSafeQuery, "html") },
+      { name: "duckduckgo-lite", run: () => duckDuckGoSearch(spfSafeQuery, "lite") },
+      { name: "bing", run: () => bingSearch(spfSafeQuery) },
     ];
     for (const engine of engines) {
       const results = await engine.run();
       if (results.length > 0) {
         // Post-result caching (spec §13): bounded TTL; oversized result sets
         // are silently skipped by the cache's size cap — never truncated.
-        getContextEngine().cacheKnowledge(`research_search:${query}`, results, {
+        getContextEngine().cacheKnowledge(`research_search:${spfSafeQuery}`, results, {
           ttlMs: 6 * 60 * 60_000,
           source: "research_search",
         });
@@ -2653,6 +3053,17 @@ app.post("/api/research/fetch", async (req, res) => {
     parsed = assertSafeHttpUrl(String(req.body?.url ?? ""));
   } catch (err: any) {
     return res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+  // SPF EP-7b — the fetch URL itself is an outbound string: a URL carrying
+  // credentials/keys/OTP-shaped data is blocked before the request is made.
+  const fetchUrlSpf = spfFirewall.inspectUrl(parsed.toString(), {
+    destination: "research-fetch:" + parsed.host,
+    payloadKind: "url",
+    transport: "http-url",
+  });
+  spfAuditDurable("/api/research/fetch", "research-fetch:" + parsed.host, fetchUrlSpf);
+  if (fetchUrlSpf.decision === "block") {
+    return res.json({ success: false, error: "URL blocked by the Screen Privacy Firewall", spfBlocked: true, spfReason: fetchUrlSpf.reason });
   }
   if (isPrivateResearchHost(parsed.hostname)) {
     return res.json({ success: false, error: "Refusing to fetch private network addresses" });
@@ -2788,6 +3199,158 @@ app.post('/api/app/launch', (req, res) =>
 app.post('/api/app/status', (req, res) => fsResult(res, () => sys.appStatus(String(req.body?.name ?? ''))));
 app.post('/api/app/close', (req, res) => fsResult(res, () => sys.appClose(Number(req.body?.pid), req.body?.force === true)));
 app.post('/api/app/focus', (req, res) => fsResult(res, () => sys.appFocus(Number(req.body?.pid))));
+
+// ---- LPV — Local Private Vault (post-roadmap capability) ----
+// Encrypted local credential storage, retention policy, controlled retrieval.
+// Security design lives in lpvCore.ts / lpvDpapi.ts; integration seams for
+// SPF, Action Transparency and the agent architecture are documented in
+// ARCHITECTURE.md §32. The import resolves the vault boot state
+// synchronously (no async work at module load — same convention as E5).
+import * as lpv from './lpvCore';
+
+function lpvErrorKindOf(err: unknown): string {
+  if (err instanceof lpv.LpvError) return err.kind;
+  return 'internal_error';
+}
+
+function lpvResult(res: import("express").Response, fn: () => unknown): void {
+  try {
+    res.json({ success: true, result: fn() });
+  } catch (err) {
+    res.json({ success: false, errorKind: lpvErrorKindOf(err), error: String((err as Error)?.message || err).slice(0, 300) });
+  }
+}
+
+function lpvResultAsync(res: import("express").Response, fn: () => Promise<unknown>): void {
+  fn()
+    .then((result) => res.json({ success: true, result }))
+    .catch((err) => res.json({ success: false, errorKind: lpvErrorKindOf(err), error: String((err as Error)?.message || err).slice(0, 300) }));
+}
+
+function lpvRequester(req: any): string {
+  return String(req.body?.requester ?? 'ui').slice(0, 60);
+}
+
+// Status is ungated (like /api/health) — it carries state flags only, never
+// secrets or entry metadata.
+app.get("/api/vault/status", (req, res) => {
+  res.json({ success: true, result: lpv.getVaultStatus() });
+});
+
+app.get("/api/vault/entries", (req, res) => lpvResult(res, () => lpv.listEntries()));
+app.post("/api/vault/init", (req, res) => lpvResultAsync(res, () => lpv.initializeVault()));
+app.post("/api/vault/unlock", (req, res) => lpvResultAsync(res, () => lpv.unlockVault()));
+app.post("/api/vault/lock", (req, res) => lpvResult(res, () => lpv.lockVault(String(req.body?.reason ?? 'operator requested'))));
+app.post("/api/vault/restore", (req, res) => lpvResultAsync(res, () => lpv.restoreFromBackup()));
+
+app.post("/api/vault/entry", (req, res) =>
+  lpvResult(res, () =>
+    lpv.addEntry(
+      {
+        categoryKey: String(req.body?.categoryKey ?? ''),
+        title: String(req.body?.title ?? ''),
+        username: req.body?.username === undefined ? undefined : String(req.body.username),
+        password: String(req.body?.password ?? ''),
+        notes: req.body?.notes === undefined ? undefined : String(req.body.notes),
+        url: req.body?.url === undefined || req.body?.url === '' ? undefined : String(req.body.url),
+      },
+      req.body?.approval && typeof req.body.approval === 'object' ? req.body.approval : { kind: 'user-direct' },
+      lpvRequester(req)
+    )
+  )
+);
+
+app.post("/api/vault/entry/update", (req, res) =>
+  lpvResult(res, () =>
+    lpv.updateEntry(
+      String(req.body?.id ?? ''),
+      {
+        categoryKey: req.body?.categoryKey === undefined ? undefined : String(req.body.categoryKey),
+        title: req.body?.title === undefined ? undefined : String(req.body.title),
+        username: req.body?.username === undefined ? undefined : String(req.body.username),
+        password: req.body?.password === undefined ? undefined : String(req.body.password),
+        notes: req.body?.notes === undefined ? undefined : String(req.body.notes),
+        url: req.body?.url === undefined ? undefined : String(req.body.url),
+      },
+      req.body?.approval && typeof req.body.approval === 'object' ? req.body.approval : { kind: 'user-direct' },
+      lpvRequester(req)
+    )
+  )
+);
+
+app.post("/api/vault/entry/delete", (req, res) =>
+  lpvResult(res, () => lpv.deleteEntry(String(req.body?.id ?? ''), lpvRequester(req)))
+);
+
+app.get("/api/vault/policy", (req, res) => lpvResult(res, () => lpv.getPolicy()));
+app.post("/api/vault/policy/update", (req, res) =>
+  lpvResult(res, () =>
+    lpv.setPolicy(
+      {
+        autoSaveEnabled: req.body?.autoSaveEnabled === undefined ? undefined : req.body.autoSaveEnabled === true,
+        autoSaveCategories: req.body?.autoSaveCategories,
+        autoLockMs: req.body?.autoLockMs === undefined ? undefined : Number(req.body.autoLockMs),
+      },
+      lpvRequester(req)
+    )
+  )
+);
+
+app.get("/api/vault/history", (req, res) =>
+  lpvResult(res, () => lpv.getHistory(Number.isFinite(Number(req.query?.limit)) ? Number(req.query.limit) : undefined))
+);
+
+app.post("/api/vault/fill", (req, res) =>
+  lpvResultAsync(res, () =>
+    lpv.fillEntry(
+      {
+        grantId: String(req.body?.grantId ?? ''),
+        fields: Array.isArray(req.body?.fields) ? req.body.fields : [],
+      },
+      lpvRequester(req)
+    )
+  )
+);
+
+app.post("/api/vault/fill/request", (req, res) =>
+  lpvResult(res, () => lpv.requestUiFill(String(req.body?.entryId ?? '')))
+);
+
+app.post("/api/vault/challenge", (req, res) =>
+  lpvResult(res, () =>
+    lpv.createChallenge(
+      req.body?.purpose === 'save' ? 'save' : 'fill',
+      {
+        entryId: req.body?.entryId === undefined ? undefined : String(req.body.entryId),
+        origin: req.body?.origin === undefined ? undefined : String(req.body.origin),
+        entryDraft: req.body?.entryDraft && typeof req.body.entryDraft === 'object'
+          ? {
+              categoryKey: String(req.body.entryDraft.categoryKey ?? ''),
+              title: String(req.body.entryDraft.title ?? ''),
+              url: req.body.entryDraft.url === undefined ? undefined : String(req.body.entryDraft.url),
+            }
+          : undefined,
+        // Fill challenges carry the exact operation approval will execute
+        // (field specs only — no values; values come from the vault).
+        fields: Array.isArray(req.body?.fields) ? req.body.fields : undefined,
+      },
+      lpvRequester(req)
+    )
+  )
+);
+
+app.get("/api/vault/approvals/pending", (req, res) => lpvResult(res, () => lpv.listPendingChallenges()));
+app.post("/api/vault/approvals/approve", (req, res) =>
+  lpvResultAsync(res, () =>
+    lpv.approveChallenge(String(req.body?.challengeId ?? ''), req.body?.decisionToken)
+  )
+);
+app.post("/api/vault/approvals/decline", (req, res) =>
+  lpvResult(res, () => lpv.declineChallenge(String(req.body?.challengeId ?? ''), req.body?.decisionToken))
+);
+app.post("/api/vault/challenge/status", (req, res) =>
+  lpvResult(res, () => lpv.getChallengeStatus(String(req.body?.challengeId ?? '')))
+);
 
 // Vite middleware & Static serving
 async function startServer() {

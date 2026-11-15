@@ -999,6 +999,12 @@ const SERVER_SESSION_SEED: Record<string, boolean> = {
   'terminal.execution': false,
   'camera.access': false,
   'microphone.access': false,
+  // LPV (Local Private Vault): the operator's own UI manages the vault
+  // (baseline true, matching the operator-baseline doctrine); RETRIEVAL is
+  // never baseline — it is satisfied only by approval-issued `once` grants
+  // (see lpvCore.issueFillGrant).
+  'vault.manage': true,
+  'vault.retrieve': false,
 };
 
 const MAX_LIVE_TASKS = 16;

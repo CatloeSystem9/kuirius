@@ -186,7 +186,9 @@ export type ToolPermission =
   | 'camera.access'
   | 'microphone.access'
   | 'location.access'
-  | 'memory.access';
+  | 'memory.access'
+  | 'vault.manage'
+  | 'vault.retrieve';
 
 /** Logical tool categories; computer/vision/voice are extension points for Phases 4+. */
 export type ToolCategory =

@@ -20,6 +20,7 @@ import type {
 import { DEFAULT_MULTIMODAL_LIMITS } from './multimodalTypes';
 import { normalizeModalityInput } from './modalityNormalizer';
 import { describeModality, effectivePriority } from './modalityRegistry';
+import { spfScreenItem } from '../spf/index';
 
 /** Approximate stored size of an observation (chars) for the char budget. */
 function observationChars(obs: ModalityObservation): number {
@@ -174,13 +175,19 @@ export class MultimodalContext {
   /**
    * Bounded provider-safe serialization (spec §13, §15): strips sensitive and
    * highly-sensitive payloads, caps total size, includes no pixel data.
+   * SPF EP-15 — every line additionally passes the Screen Privacy Firewall:
+   * the sensitivity classification is a provenance judgment, SPF is a
+   * content-level backstop. Lines whose sensitive content cannot be safely
+   * redacted are dropped entirely (a digest is always safe to shrink).
    */
   providerSafeDigest(now: number = Date.now(), charCap = this.limits.providerInputCharCap): string {
     const lines: string[] = [];
     let chars = 0;
     for (const obs of this.live(now)) {
       if (obs.sensitivity === 'sensitive' || obs.sensitivity === 'highly_sensitive') continue;
-      const line = digestLine(obs);
+      const screened = spfScreenItem(digestLine(obs), 'provider:multimodal-digest', obs.id, 'digest');
+      if (screened.decision === 'strip') continue; // unseparable line → omitted
+      const line = screened.text;
       if (chars + line.length > charCap) break;
       lines.push(line);
       chars += line.length;

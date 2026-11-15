@@ -21,6 +21,7 @@ import {
   Info,
 } from 'lucide-react';
 import { ScreenVisionAction, DetectedScreenText } from '../types';
+import { spfFirewall } from '../agent/spf/index';
 
 interface ScreenVisionModalProps {
   isOpen: boolean;
@@ -75,6 +76,20 @@ export const ScreenVisionModal: React.FC<ScreenVisionModalProps> = ({
     setAnswer(null);
     try {
       if (action?.snapshotUrl) {
+        // SPF EP-11 — pre-send gate: a sensitive signal in the question or
+        // window title blocks the snapshot upload before any bytes leave the
+        // tab. The server independently re-runs the same gate.
+        const preSend = spfFirewall.inspectImageTransfer(
+          { question: q, activeWindowTitle: action.activeWindowTitle },
+          { destination: 'gemini:vision-analyze', payloadKind: 'image', transport: 'prompt' }
+        );
+        if (preSend.decision === 'block') {
+          setAnswer(
+            `🔒 Screen Privacy Firewall: I did not send this screen to the cloud (${preSend.reason.replace(/_/g, ' ')}). ` +
+            'Screen content that may include credentials must stay on your device.'
+          );
+          return;
+        }
         // Query server vision endpoint directly with the custom question
         const base64 = action.snapshotUrl.includes(',')
           ? action.snapshotUrl.split(',')[1]
@@ -85,12 +100,18 @@ export const ScreenVisionModal: React.FC<ScreenVisionModalProps> = ({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             image: base64,
-            question: q,
+            question: preSend.decision === 'redact' && preSend.redactedText ? preSend.redactedText : q,
             activeWindowTitle: action.activeWindowTitle,
           }),
         });
 
         const data = await res.json();
+        if (data?.spfBlocked) {
+          setAnswer(
+            `🔒 Screen Privacy Firewall: the server blocked this transmission (${String(data.spfReason ?? 'policy').replace(/^spf_blocked:/, '').replace(/_/g, ' ')}).`
+          );
+          return;
+        }
         if (data?.analysis?.summary) {
           const ans = data.analysis.summary;
           setAnswer(ans);

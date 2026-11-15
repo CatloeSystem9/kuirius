@@ -25,6 +25,7 @@ import { RecoveryManager } from './recovery';
 import type { PlanEngine } from './planning';
 import type { ContextPackage } from './context/contextTypes';
 import { CycleTraceStore } from './loop/cycleTrace';
+import { spfScreenItem } from './spf/index';
 
 export interface AgentCoreOptions {
   registry: ToolRegistry;
@@ -952,9 +953,13 @@ export class AgentCore {
         : 'Pending';
       let line = `${i + 1}. ${step.description} — ${icon}`;
       // Surface tool findings (e.g. a screen-analysis summary) in the report.
+      // SPF EP-14 — the report feeds conversation and memory, so each
+      // surfaced finding passes the Screen Privacy Firewall (per-line
+      // redact/strip; clean findings are untouched).
       const outputSummary = (step.result?.output as any)?.summary;
       if ((step.status === 'completed' || step.status === 'uncertain') && typeof outputSummary === 'string' && outputSummary.trim()) {
-        line += `\n   → ${outputSummary.length > 220 ? outputSummary.slice(0, 217) + '...' : outputSummary}`;
+        const spfSummary = spfScreenItem(outputSummary, 'agent:task-summary', task.id, 'summary').text;
+        line += `\n   → ${spfSummary.length > 220 ? spfSummary.slice(0, 217) + '...' : spfSummary}`;
       }
       return line;
     });

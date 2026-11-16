@@ -2622,3 +2622,127 @@ before/after: audit entry count, stop kind and file hashes identical).
 perf 11/0, E5 M1/M2/M3/H4 86/74/72/70 all 0 failed, Phase 13/14/18
 91/150/62 all 0 failed, agent-core 49/0, goal-continuity 163/0,
 `tsc --noEmit` clean; real store unchanged (hash-verified).
+
+## 36. Security System Phase A — Independent Process Monitoring
+
+**Status:** implemented and verified (report: `SECURITY-SYSTEM-PHASE-A-REPORT.md`).
+**Boundary:** visibility ONLY — no process control exists anywhere in the
+subsystem (no terminate/suspend/quarantine tool, route, or capability).
+
+**Mechanism (all non-admin, MEASURED):** a persistent PowerShell worker
+(`PowerShellWorker` pattern) registers **temporary, session-owned WMI event
+subscriptions** — `__InstanceCreationEvent` / `__InstanceDeletionEvent
+WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'` — and streams events to
+the parent as JSON lines. No permanent WMI consumers; subscriptions die with
+the worker; the worker self-exits when the parent PID disappears and Node
+kills it on shutdown. Health model: STARTING → ACTIVE (both subscriptions
+confirmed) → DEGRADED (partial subscriptions, stale heartbeat, re-arming) →
+FAILED (retry budget exhausted) / STOPPED (intentional) — never silently
+"fully monitored". Bounded re-arm backoff (1→16 s, 5 attempts).
+
+**Inventory:** bounded PID-keyed map (≤2000, terminated-first eviction):
+startup snapshot marks pre-existing processes, creation/deletion events
+track lifecycle, parent-child links resolve through the inventory, PID
+reuse replaces entries (counted), out-of-order deletions recorded honestly
+(`unobservedTerminations`), on-demand bounded reconcile. Enrichment is
+honest: a missing ExecutablePath is `unavailable`, never invented.
+**No command lines are collected** (secret risk).
+
+**Audit:** lifecycle/health events only (kinds + counts) into the E5 chain
+via the injected sink; individual process events stay in the bounded
+in-memory ring (≤500, drop-oldest, overflow audited). Names/paths never
+enter audit records (suite-asserted).
+
+**Surface:** `GET /api/processmonitor/status` (read-only; optional
+`reconcile=1`) + ONE agent tool `processMonitor.status` (SAFE, read-only,
+fetch-backed). No control tool or route exists (suite-asserted 404).
+
+**Tests:** `scripts/test-process-monitor.ts` — 66 assertions, 0 failed,
+two consecutive green runs: event semantics (creation/termination/lineage/
+enrichment/PID reuse/out-of-order/overflow), boot failure → bounded retries
+→ FAILED, worker crash → re-arm (mechanism-level recovery 61-64 ms),
+stale-heartbeat re-arm, graceful shutdown, no-control-surface assertions,
+emergency-stop compatibility, metadata-only audit (fake + real worker),
+real-WMI performance (idle CPU 0-63 ms per 8 s window; detection latency
+321-2703 ms for 11/12 long-lived spawned children; whole-process RSS delta
+negative/neutral — monitor state is a ≤2000-entry map + ≤500-event ring),
+isolated-server restart with subscription re-init.
+
+**Known limitations (honest):** WMI `WITHIN 1` polling cannot observe
+processes born and dead between polls (fast-exit coverage requires elevated
+ETW — an operator decision, Phase 1 §20); ~1 s event granularity; inventory
+is honest-not-complete (gaps counted and labeled); same-user ceiling (the
+monitor is non-admin and cannot be defended against same-user malware
+non-admin — only re-armed and evidenced); Windows-only.
+
+**Performance note (constrained hardware):** the monitor adds no measurable
+resident memory to the server process beyond the bounded structures above,
+no idle CPU beyond the WMI/kernel eventing (0-63 ms per 8 s idle window
+including test harness), and no periodic disk writes (lifecycle audit lines
+only, on state transitions).
+
+## 37. Security System Phase B — Malware Detection and Classification
+
+**Status:** implemented and verified (report: `SECURITY-SYSTEM-PHASE-B-REPORT.md`).
+**Boundary:** detection and classification ONLY — no process termination, no
+file quarantine, no execution blocking, no Defender configuration changes,
+no external reputation lookups. Control surfaces are deliberately absent.
+
+**Architecture (modular evidence sources, deterministic rules):**
+- **Microsoft Defender integration** (`defenderSource.ts`): read-only
+  `Get-MpComputerStatus` + `Get-MpThreatDetection` via cached PowerShell
+  (60 s TTL). No settings/exclusion/policy changes. Unavailable means
+  honest `available:false`.
+- **File reputation** (`fileReputation.ts`): local SHA-256 (Node crypto),
+  Authenticode signature (read-only PowerShell), location classification
+  (windows/program-files/user-apps/temp/roaming/downloads/other). Bounded
+  LRU cache (500) keyed by `(path|mtime|size)` — unchanged files are never
+  re-hashed; changed files invalidate automatically. External reputation
+  lookups disabled by design (`EXTERNAL_REPUTATION_ENABLED = false`).
+- **Phase A monitor integration**: subscribes through the monitor's
+  `onEvent()` internal interface (no second monitor). Ancestry correlation
+  through the inventory's parent-child links. Monitor DEGRADED/FAILED is
+  reflected in engine health and recorded as missing evidence.
+- **Detection engine** (`engine.ts`): deterministic rules — Defender match
+  → CONFIRMED_MALWARE; dual-use guard caps known security tools (Hydra,
+  Nmap, Wireshark, etc.) at UNKNOWN; indicator counting (invalid signature
+  [strong], unusual location, suspicious ancestry, repeated pattern [weak])
+  → HIGH_CONFIDENCE_THREAT (strong+1 or >=3) / SUSPICIOUS (1-2) / UNKNOWN /
+  CLEAN (valid signature). Every record carries classification, confidence
+  level, evidence sources, timestamp, process/file reference, explanation,
+  and missing evidence.
+
+**Dual-use classification (Hydra et al.):** known legitimate security tools
+are capped at UNKNOWN by Krisha-side indicators — never classified as
+malicious from name or presence alone. Only a trusted Defender detection can
+escalate them to CONFIRMED_MALWARE.
+
+**Audit:** classifications at SUSPICIOUS and above flow to the E5 chain
+(metadata only: classification, confidence level, pid, path, evidence
+kinds, engine version). No command lines, file contents, or hash values
+appear in audit records (suite-asserted).
+
+**Surface:** `GET /api/malwaredetect/status` (engine health, Defender
+availability, recent classifications) + `POST /api/malwaredetect/assess`
+(on-demand file assessment, `filesystem.read` permission-gated via
+ENFORCED_ROUTES) + TWO agent tools (`malwareDetect.status`,
+`malwareDetect.assessFile`). No control routes or tools exist.
+
+**Tests:** `scripts/test-malware-detect.ts` — 54 assertions, 0 failed: 23
+scenarios covering Defender integration (active/unavailable/confirmed
+detection), signature assessments (unsigned/valid/invalid), missing path,
+unknown executable, suspicious ancestry, corroborating indicators,
+false-positive resistance, Hydra dual-use classification (UNKNOWN capped,
+Defender override to CONFIRMED), PID reuse, missing events, Phase A
+DEGRADED/FAILED, hash caching + invalidation, permission boundaries,
+emergency-stop compatibility, audit privacy, queue/cache bounds, and
+performance bursts (real Defender + real file source).
+
+**Known limitations (honest):** no external reputation lookups (unsigned
+unknown = UNKNOWN, not malicious); pattern-based detection cannot catch
+novel threats (no AI/ML model loaded); classification confidence is
+level-based (LOW/MEDIUM/HIGH), not calibrated percentages; Defender is the
+real-time AV authority (Krisha does not duplicate it); same-user ceiling
+from Phase 1 applies; file-hashing a large executable takes time on SMR HDD
+(cached after first assessment); short-lived processes limited by Phase A
+WMI WITHIN-1 window.

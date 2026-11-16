@@ -59,6 +59,8 @@ import { FilesystemService, ApplicationService } from './system/systemServices';
 import { HttpFsBackend, HttpAppBackend } from './system/httpSystem';
 import { createSystemTools } from './system/systemTools';
 import { DiagnosticsService, createDiagnosticTools } from './diagnostics';
+import { createProcessMonitorTools } from './processmonitor/tools';
+import { createMalwareDetectTools } from './malwaredetect/tools';
 import { createGlobeTools } from './globeTools';
 
 export interface AgentHost {
@@ -523,6 +525,13 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     emergencyStop,
   });
   registry.registerAll(createDiagnosticTools(diagnostics));
+  // Phase A process monitor: ONE read-only visibility tool (health/inventory
+  // metadata via the server route). No process-control tool exists — Phase A
+  // is monitoring only.
+  registry.registerAll(createProcessMonitorTools());
+  // Phase B malware detection: read-only status + on-demand file assessment
+  // tools. No process-control capability exists (detection/classification only).
+  registry.registerAll(createMalwareDetectTools());
 
   // Learned Skills v1 tools: read-only discovery + learned-data management
   // (disable/forget). There is deliberately no "create skill from text" tool —

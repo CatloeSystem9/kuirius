@@ -48,8 +48,60 @@ import type { VisualInspectionResult } from "./src/agent/spf/visualInspection";
 // another client or integration. Installed before anything can call out.
 import { installSpfOutboundGuard } from "./src/agent/spf/outboundGuard";
 import { appendAuditSyncSafe } from "./serverSafety";
+// Process Monitor (Phase A) — independent, event-driven host process
+// visibility. Temporary session-owned WMI subscriptions (no admin, no
+// permanent consumers, clean disposal on shutdown/restart), bounded
+// inventory, metadata-only lifecycle audit. Visibility ONLY: no process
+// control surface exists anywhere in this subsystem.
+import { ProcessMonitor } from "./src/agent/processmonitor/processMonitor";
+// Malware detection & classification (Phase B) — evidence correlation over
+// Phase A telemetry, local file reputation, and read-only Defender data.
+// Detection and classification ONLY: no process control, no quarantine, no
+// blocking, no Defender configuration changes, no external reputation lookups.
+import { DetectionEngine } from "./src/agent/malwaredetect/engine";
+import { createDefenderSource } from "./src/agent/malwaredetect/defenderSource";
 
 const spfOutboundGuard = installSpfOutboundGuard(spfFirewall);
+
+// Phase A — process monitor singleton: lifecycle/health events flow into the
+// existing E5 audit chain (metadata only: kinds + counts, never process
+// names/paths; individual process events stay in the bounded in-memory ring).
+const processMonitor = new ProcessMonitor({
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe({ kind: event.kind, ...event });
+    } catch {
+      /* audit degradation must never break monitoring */
+    }
+  },
+});
+
+// Phase B — malware detection & classification engine: correlates Phase A
+// telemetry with local file reputation and read-only Defender data.
+// Detection/classification ONLY; SUSPICIOUS+ classifications are audited
+// (metadata only). No control actions exist in this subsystem.
+const defenderSource = createDefenderSource({});
+const malwareEngine = new DetectionEngine({
+  monitor: {
+    onEvent: (cb) => processMonitor.onEvent(cb),
+    lookup: (pid) => {
+      const e = processMonitor.lookup(pid);
+      return e ? { state: e.state, name: e.name, ppid: e.ppid } : undefined;
+    },
+    health: () => {
+      const s = processMonitor.status();
+      return { health: s.health, healthReason: s.healthReason };
+    },
+  },
+  defender: defenderSource,
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe({ kind: event.kind, ...event });
+    } catch {
+      /* audit degradation must never break detection */
+    }
+  },
+});
 
 /**
  * Persist one SPF decision to the existing tamper-evident E5 audit chain
@@ -172,6 +224,9 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   // grant: approval-executed fills run server-side and hand no capability
   // to the requester.
   "/api/vault/challenge/status": { stopBlock: false, rate: { group: "vault-retrieve", limit: 60, windowMs: 60_000 } },
+  // Phase B — on-demand malware assessment reads one file (hash + signature):
+  // gated by the existing filesystem.read permission convention.
+  "/api/malwaredetect/assess": { permission: "filesystem.read", stopBlock: false, rate: { group: "malware-assess", limit: 30, windowMs: 60_000 } },
 };
 
 app.use((req, res, next) => {
@@ -3152,6 +3207,63 @@ app.get("/api/integrity/status", (req, res) => {
   res.json({ success: true, result: report, intervalMs: configuredIntervalMs() });
 });
 
+// ---- Phase A: process monitor read-only visibility (NO control surface) ----
+// Health, counters, and a bounded recent-event view. `reconcile=1` triggers a
+// bounded inventory drift correction against a live snapshot.
+app.get("/api/processmonitor/status", async (req, res) => {
+  try {
+    const recent = Math.max(1, Math.min(200, Number(req.query.recent) || 50));
+    let reconciled: { corrected: number; snapshotSize: number } | null = null;
+    if (req.query.reconcile === "1") {
+      reconciled = await processMonitor.reconcile();
+    }
+    res.json({
+      status: processMonitor.status(),
+      recentEvents: processMonitor.recentEvents(recent),
+      reconciled,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "process monitor status failed" });
+  }
+});
+
+// ---- Phase B: malware detection read-only visibility + on-demand assessment ----
+// Detection/classification ONLY — no control endpoints exist for this subsystem.
+app.get("/api/malwaredetect/status", async (req, res) => {
+  try {
+    const recent = Math.max(1, Math.min(200, Number(req.query.recent) || 50));
+    const defender = await defenderSource.status();
+    res.json({
+      health: malwareEngine.health(),
+      defender: {
+        available: defender.available,
+        amServiceEnabled: defender.amServiceEnabled,
+        realTimeProtectionEnabled: defender.realTimeProtectionEnabled,
+        behaviorMonitorEnabled: defender.behaviorMonitorEnabled,
+        antivirusSignatureAgeDays: defender.antivirusSignatureAgeDays,
+        quickScanAgeDays: defender.quickScanAgeDays,
+        engineVersion: defender.engineVersion,
+      },
+      recentDetections: malwareEngine.recentDetections(recent),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "malware detection status failed" });
+  }
+});
+
+app.post("/api/malwaredetect/assess", async (req, res) => {
+  try {
+    const p = String(req.body?.path ?? "").trim();
+    if (!p || p.length > 500) {
+      return res.status(400).json({ error: "path is required (max 500 chars)" });
+    }
+    const record = await malwareEngine.assessFile(p);
+    return res.json({ record });
+  } catch (err: any) {
+    return res.status(500).json({ error: err?.message || "assessment failed" });
+  }
+});
+
 // ---- E5 M3: rollback planning + operator-bound challenge lifecycle ----
 // The model may REQUEST a plan; approval happens ONLY through the Krisha UI
 // affordance (operator click → /api/rollback/approve). Plans and challenge
@@ -3377,6 +3489,21 @@ async function startServer() {
   // never repairs, releases, or changes the stop state.
   startIntegrityMonitor();
   console.log(`[E5] integrity monitoring active (interval ${configuredIntervalMs()} ms)`);
+  // Phase A — independent process monitoring: event-driven WMI subscriptions
+  // owned by this process (temporary, session-scoped, no admin, no permanent
+  // consumers). Visibility only; lifecycle/health events land in the E5
+  // audit chain as metadata. Clean disposal on exit; the worker also self-
+  // exits when this process dies (parent-PID probe each idle cycle).
+  process.on("exit", () => {
+    processMonitor.stop();
+    malwareEngine.stop();
+  });
+  void processMonitor.start().then((health) => {
+    console.log(`[KPM] process monitor active (health ${health})`);
+    // Phase B: detection engine consumes Phase A telemetry (started after the
+    // monitor so no creation event is missed before the subscription).
+    malwareEngine.start();
+  });
   // E5 M1d — bounded request lifetimes.
   httpServer.requestTimeout = 60_000;
   httpServer.headersTimeout = 65_000;

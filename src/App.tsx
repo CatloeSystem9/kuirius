@@ -59,6 +59,7 @@ import {
   LocalIndexedFile,
 } from './utils/fileSystemAccess';
 import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
+import { KrixAvatar, startKrixAudioAnalysis, stopKrixAudioAnalysis } from './components/KrixAvatar3D';
 import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, type AgentSystem } from './agent/bridge';
 import { spfScreenItem } from './agent/spf/index';
 import { getMemoryService } from './agent/memory/memoryService';
@@ -1956,7 +1957,7 @@ export default function App() {
           </div>
         )}
 
-        {/* Central Full-Body 2D Character Figure (Movable & Draggable) */}
+        {/* Central Avatar Area — Krix 3D VRM + 2D Fallback */}
         <div
           className={`flex-1 flex items-center justify-center relative px-4 pt-10 sm:pt-4 overflow-hidden transition-colors duration-700 ${
             isWhiteBackground ? 'bg-white' : 'bg-[#02030f]'
@@ -1982,9 +1983,9 @@ export default function App() {
               scale: { type: 'spring', stiffness: 260, damping: 20 },
               opacity: { duration: 0.6, ease: 'easeOut' },
             }}
-            className="relative z-10 w-full max-w-[420px] h-[580px] flex flex-col items-center justify-end cursor-grab active:cursor-grabbing"
+            className="relative z-10 w-full max-w-[520px] h-[620px] flex flex-col items-center justify-end cursor-grab active:cursor-grabbing"
           >
-            {/* Spoken / Dialogue Speech Bubble above Krisha */}
+            {/* Spoken / Dialogue Speech Bubble above Krix */}
             {lastSpokenText && (
               <motion.div
                 key={lastSpokenText}
@@ -2050,22 +2051,36 @@ export default function App() {
               </motion.div>
             )}
 
-            {/* Dynamic Full-Body 2D Character Figure with Parallax & Micro-Movements */}
-            <KrishaAvatar
-              expression={expression}
-              emotionData={emotionData}
-              isSpeaking={isSpeaking}
-              isListening={isLoading}
-              isDancing={isDancing}
-              isGreeting={isGreeting}
-              isThanked={isThanked}
-              lookDirection={lookDirection}
-              pointerPos={pointerPos}
-              forcedPose={forcedPose}
-              onPoseChange={setForcedPose}
-              onReact={handleAvatarReaction}
-              onGreetingComplete={handleGreetingComplete}
-              onThankComplete={handleThankComplete}
+            {/* ★ Krix 3D VRM Avatar — primary display */}
+            <div className="absolute inset-0 z-10">
+              <KrixAvatar
+                expression={expression}
+                emotionData={emotionData}
+                isSpeaking={isSpeaking}
+                isListening={isLoading}
+                isDancing={isDancing}
+                isGreeting={isGreeting}
+                isThanked={isThanked}
+                lookDirection={lookDirection}
+                pointerPos={pointerPos}
+              />
+            </div>
+
+            {/* Interactive touch hotspots (still work on top of 3D) */}
+            <div
+              onClick={() => handleAvatarReaction('head')}
+              title="Pat Krix's head ✨"
+              className="absolute top-[8%] left-1/2 -translate-x-1/2 w-48 h-36 cursor-pointer z-30 rounded-full hover:bg-cyan-400/10 transition-colors"
+            />
+            <div
+              onClick={() => handleAvatarReaction('heart')}
+              title="Touch Krix's heart 💖"
+              className="absolute top-[34%] left-1/2 -translate-x-1/2 w-44 h-28 cursor-pointer z-30 rounded-full hover:bg-rose-400/10 transition-colors"
+            />
+            <div
+              onClick={() => handleAvatarReaction('wave')}
+              title="Greet Krix 👋"
+              className="absolute top-[52%] left-1/2 -translate-x-1/2 w-52 h-64 cursor-pointer z-30 rounded-3xl hover:bg-blue-400/10 transition-colors"
             />
           </motion.div>
         </div>

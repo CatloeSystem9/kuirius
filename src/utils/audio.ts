@@ -1,5 +1,23 @@
 // Audio handling utility with TTS & Web Speech fallback + Lip Sync triggers
 
+// ── Krix 3D lip-sync integration ──────────────────────────────────────────────
+// The KrixAvatar3D module registers a callback that receives real audio volume
+// samples. We import the bridge functions directly – the module tree-shakes
+// cleanly and has no side effects at import time.
+import {
+  startKrixAudioAnalysis as _startKrixAudio,
+  stopKrixAudioAnalysis as _stopKrixAudio,
+  pushKrixLipSyncVolume as _pushKrixVolume,
+} from '../components/KrixAvatar3D';
+
+function getKrixBridge() {
+  return {
+    startKrixAudioAnalysis: _startKrixAudio,
+    stopKrixAudioAnalysis: _stopKrixAudio,
+    pushKrixLipSyncVolume: _pushKrixVolume,
+  };
+}
+
 let currentAudio: HTMLAudioElement | null = null;
 let currentUtterance: SpeechSynthesisUtterance | null = null;
 let serverTtsCooldownUntil = 0;
@@ -121,7 +139,10 @@ export async function speakKrishaText(
 
         audio.onplay = () => {
           onStart?.();
-          // Simulate rhythmic mouth lip sync
+          // Connect to Krix 3D lip-sync analyser (real audio frequency analysis)
+          const bridge = getKrixBridge();
+          bridge?.startKrixAudioAnalysis(audio);
+          // Simulate rhythmic mouth lip sync (2D avatar fallback)
           let open = false;
           mouthInterval = setInterval(() => {
             open = !open;
@@ -132,6 +153,7 @@ export async function speakKrishaText(
         audio.onended = () => {
           if (mouthInterval) clearInterval(mouthInterval);
           onSpeakingChunk?.(false);
+          getKrixBridge()?.stopKrixAudioAnalysis();
           onEnd?.();
           currentAudio = null;
         };
@@ -139,6 +161,7 @@ export async function speakKrishaText(
         audio.onerror = () => {
           if (mouthInterval) clearInterval(mouthInterval);
           onSpeakingChunk?.(false);
+          getKrixBridge()?.stopKrixAudioAnalysis();
           playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
         };
 
@@ -309,15 +332,19 @@ function playWebSpeechFallback(
   utterance.onstart = () => {
     onStart?.();
     let open = false;
+    // Push synthetic lip-sync volume for the 3D avatar (Web Speech API
+    // doesn't expose raw audio so we simulate with the mouth-open toggle)
     mouthInterval = setInterval(() => {
       open = !open;
       onSpeakingChunk?.(open);
+      getKrixBridge()?.pushKrixLipSyncVolume(open ? 0.45 : 0.1);
     }, 150);
   };
 
   utterance.onend = () => {
     if (mouthInterval) clearInterval(mouthInterval);
     onSpeakingChunk?.(false);
+    getKrixBridge()?.pushKrixLipSyncVolume(0);
     onEnd?.();
     currentUtterance = null;
   };
@@ -325,6 +352,7 @@ function playWebSpeechFallback(
   utterance.onerror = () => {
     if (mouthInterval) clearInterval(mouthInterval);
     onSpeakingChunk?.(false);
+    getKrixBridge()?.pushKrixLipSyncVolume(0);
     onEnd?.();
     currentUtterance = null;
   };
@@ -334,6 +362,10 @@ function playWebSpeechFallback(
 }
 
 export function stopKrishaSpeech(): void {
+  // Stop Krix 3D lip-sync analysis
+  getKrixBridge()?.stopKrixAudioAnalysis();
+  getKrixBridge()?.pushKrixLipSyncVolume(0);
+
   if (currentAudio) {
     try {
       currentAudio.pause();

@@ -2066,21 +2066,21 @@ export default function App() {
               />
             </div>
 
-            {/* Interactive touch hotspots (still work on top of 3D) */}
+            {/* Interactive touch hotspots (calibrated for full-body avatar) */}
             <div
               onClick={() => handleAvatarReaction('head')}
               title="Pat Krix's head ✨"
-              className="absolute top-[8%] left-1/2 -translate-x-1/2 w-48 h-36 cursor-pointer z-30 rounded-full hover:bg-cyan-400/10 transition-colors"
+              className="absolute top-[10%] left-1/2 -translate-x-1/2 w-32 h-24 cursor-pointer z-30 rounded-full hover:bg-cyan-400/10 transition-colors"
             />
             <div
               onClick={() => handleAvatarReaction('heart')}
               title="Touch Krix's heart 💖"
-              className="absolute top-[34%] left-1/2 -translate-x-1/2 w-44 h-28 cursor-pointer z-30 rounded-full hover:bg-rose-400/10 transition-colors"
+              className="absolute top-[28%] left-1/2 -translate-x-1/2 w-28 h-20 cursor-pointer z-30 rounded-full hover:bg-rose-400/10 transition-colors"
             />
             <div
               onClick={() => handleAvatarReaction('wave')}
               title="Greet Krix 👋"
-              className="absolute top-[52%] left-1/2 -translate-x-1/2 w-52 h-64 cursor-pointer z-30 rounded-3xl hover:bg-blue-400/10 transition-colors"
+              className="absolute top-[44%] left-1/2 -translate-x-1/2 w-44 h-44 cursor-pointer z-30 rounded-3xl hover:bg-blue-400/10 transition-colors"
             />
           </motion.div>
         </div>

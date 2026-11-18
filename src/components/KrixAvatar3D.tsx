@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback } from 'react';
+import React, { useRef, useEffect, useState } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRM, VRMUtils, VRMHumanBoneName } from '@pixiv/three-vrm';
@@ -125,6 +125,7 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const vrmRef = useRef<VRM | null>(null);
+  const lookAtTargetRef = useRef<THREE.Object3D | null>(null);
   const clockRef = useRef(new THREE.Clock());
   const rafRef = useRef<number>(0);
   const lipVolumeRef = useRef(0);
@@ -186,14 +187,15 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
     const scene = new THREE.Scene();
     sceneRef.current = scene;
 
-    // 2. Camera: Frame upper body portrait (chest, neck, face, hair)
+    // 2. Camera: Full body framing so the whole character fits comfortably into view
+    // Model total height is 1.72m, centered around y = 0.86m.
+    // Placing camera at y = 0.88m, distance z = 3.85m with fov = 28° gives a vertical
+    // span of 1.92m (from y = -0.08m below feet to y = 1.84m above top of hair).
     const initialWidth = container.clientWidth || 400;
     const initialHeight = container.clientHeight || 580;
     const camera = new THREE.PerspectiveCamera(28, initialWidth / initialHeight, 0.1, 50);
-    // Krix head is at y=1.50, eyes at y=1.52, chest at y=1.30.
-    // Placing camera at y=1.40, z=1.45 looking at y=1.38 frames her upper-body portrait.
-    camera.position.set(0, 1.40, 1.45);
-    camera.lookAt(0, 1.38, 0);
+    camera.position.set(0, 0.88, 3.85);
+    camera.lookAt(0, 0.86, 0);
     cameraRef.current = camera;
 
     // 3. Renderer with transparent background and clamped pixel ratio
@@ -216,25 +218,37 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
     rendererRef.current = renderer;
     container.appendChild(renderer.domElement);
 
-    // 4. Lighting: Crisp, flattering anime character lighting matching Krisha palette
-    // Soft cool ambient light so MToon surfaces are never pitch dark
-    const ambientLight = new THREE.AmbientLight(0xc8d8f8, 0.95);
+    // 4. Lighting: Flattering full-body lighting matching Krisha palette
+    // Soft cool ambient light for even coverage from head to toe
+    const ambientLight = new THREE.AmbientLight(0xc8d8f8, 1.0);
     scene.add(ambientLight);
 
-    // Key front-right directional light illuminating face & eyes
+    // Key front-right directional light illuminating face & body
     const keyLight = new THREE.DirectionalLight(0xffffff, 1.5);
-    keyLight.position.set(0.6, 2.0, 1.8);
+    keyLight.position.set(0.8, 2.2, 2.5);
     scene.add(keyLight);
 
-    // Electric-cyan fill light on the left (Krisha brand cyan)
-    const cyanFillLight = new THREE.DirectionalLight(0x38bdf8, 0.75);
-    cyanFillLight.position.set(-1.4, 1.3, 1.5);
+    // Electric-cyan fill light on the left
+    const cyanFillLight = new THREE.DirectionalLight(0x38bdf8, 0.85);
+    cyanFillLight.position.set(-1.6, 1.4, 2.2);
     scene.add(cyanFillLight);
 
-    // Subtle back rim light to highlight hair strands and silhouette
-    const rimLight = new THREE.DirectionalLight(0x00d4ff, 0.8);
-    rimLight.position.set(0, 1.9, -1.8);
+    // Lower fill light for dress, legs and shoes
+    const lowerFillLight = new THREE.DirectionalLight(0x88b0f8, 0.5);
+    lowerFillLight.position.set(0, 0.4, 2.0);
+    scene.add(lowerFillLight);
+
+    // Back rim light to outline hair and silhouette
+    const rimLight = new THREE.DirectionalLight(0x00d4ff, 0.85);
+    rimLight.position.set(0, 1.8, -2.0);
     scene.add(rimLight);
+
+    // Dedicated LookAt Target for Cursor Eye-Tracking
+    // Only eyes follow this target; neck does NOT follow.
+    const lookAtTarget = new THREE.Object3D();
+    lookAtTarget.position.set(0, 1.52, 2.0);
+    scene.add(lookAtTarget);
+    lookAtTargetRef.current = lookAtTarget;
 
     // 5. Load VRM model locally from /model/Krix3.vrm
     const loader = new GLTFLoader();
@@ -250,19 +264,24 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
           return;
         }
 
-        // ── Orientation Fix ─────────────────────────────────────────────────
+        // ── Orientation ─────────────────────────────────────────────────────
         // In VRM 1.0 (VRMC_vrm), model face coordinates naturally face +Z.
-        // Calling VRMUtils.rotateVRM0(vrm) rotates by Math.PI ONLY if VRM 0.0.
+        // VRMUtils.rotateVRM0(vrm) rotates by Math.PI ONLY if VRM 0.0.
         // For VRM 1.0, rotation.y remains 0, directly facing our camera at +Z.
         VRMUtils.rotateVRM0(vrm);
-        vrm.scene.rotation.y = 0; // Explicitly ensure 0 rotation to face camera directly
+        vrm.scene.rotation.y = 0;
         scene.add(vrm.scene);
         vrmRef.current = vrm;
 
-        // Check humanoid bones
+        // Setup VRMLookAt eye tracking target
+        if (vrm.lookAt) {
+          vrm.lookAt.target = lookAtTarget;
+          vrm.lookAt.autoUpdate = true;
+        }
+
+        // Initialize natural relaxed standing pose (T-pose fix)
         const humanoid = vrm.humanoid;
         if (humanoid) {
-          // Immediately initialize natural relaxed standing pose (T-pose fix)
           const leftUpperArm = humanoid.getNormalizedBoneNode(VRMHumanBoneName.LeftUpperArm);
           const rightUpperArm = humanoid.getNormalizedBoneNode(VRMHumanBoneName.RightUpperArm);
           const leftLowerArm = humanoid.getNormalizedBoneNode(VRMHumanBoneName.LeftLowerArm);
@@ -314,7 +333,7 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
     let blinkPhase: 'idle' | 'closing' | 'opening' = 'idle';
     let blinkProgress = 0;
 
-    // Head movement smoothing state
+    // Head movement smoothing state (autonomous idle ONLY - no cursor tracking on neck)
     let currentYaw = 0;
     let currentPitch = 0;
     let currentRoll = 0;
@@ -351,7 +370,7 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
         // Chest expands and gently tilts
         if (chest) {
           chest.rotation.x = breath * 0.8;
-          chest.rotation.z = Math.sin(time * 0.7) * 0.006; // subtle sideways sway
+          chest.rotation.z = Math.sin(time * 0.7) * 0.006;
         }
         if (spine) {
           spine.rotation.x = breath * 0.5;
@@ -373,14 +392,14 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
           leftUpperArm.rotation.set(
             0.08 + breath * 0.2,
             -0.05,
-            -1.25 + breath * 0.12 // rests down at side
+            -1.25 + breath * 0.12
           );
         }
         if (rightUpperArm) {
           rightUpperArm.rotation.set(
             0.08 + breath * 0.2,
             0.05,
-            1.25 - breath * 0.12 // rests down at side
+            1.25 - breath * 0.12
           );
         }
         if (leftLowerArm) {
@@ -396,26 +415,27 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
           rightHand.rotation.set(-0.05, 0, 0.05);
         }
 
-        // ── 3. Gentle Head & Neck Movement + Pointer Tracking ────────────────
-        const idleYaw = Math.sin(time * 0.5) * 0.04 + Math.sin(time * 0.27) * 0.02;
-        const idlePitch = Math.sin(time * 0.7 + 1.0) * 0.025 + Math.sin(time * 0.35) * 0.015;
-        const idleRoll = Math.sin(time * 0.45 + 2.0) * 0.018;
+        // ── 3. Gentle Autonomous Head & Neck Sway (DOES NOT follow cursor) ────
+        // Per user requirement: Neck does NOT follow the cursor.
+        // It maintains pure, subtle life-like autonomous breathing and micro-movement.
+        const idleYaw = Math.sin(time * 0.5) * 0.035 + Math.sin(time * 0.27) * 0.015;
+        const idlePitch = Math.sin(time * 0.7 + 1.0) * 0.02 + Math.sin(time * 0.35) * 0.01;
+        const idleRoll = Math.sin(time * 0.45 + 2.0) * 0.012;
 
-        const ptr = pointerRef.current;
+        let targetYaw = idleYaw;
+        let targetPitch = idlePitch;
+        let targetRoll = idleRoll;
+
+        // Only explicit chat commands (e.g. "look left") alter head direction
         const lookDir = lookDirectionRef.current;
+        if (lookDir === 'left') targetYaw += -0.22;
+        else if (lookDir === 'right') targetYaw += 0.22;
+        else if (lookDir === 'up') targetPitch += -0.15;
+        else if (lookDir === 'down') targetPitch += 0.15;
 
-        let targetYaw = idleYaw + ptr.x * 0.18;
-        let targetPitch = idlePitch + ptr.y * -0.12;
-        let targetRoll = idleRoll + ptr.x * 0.04;
-
-        if (lookDir === 'left') targetYaw += -0.25;
-        else if (lookDir === 'right') targetYaw += 0.25;
-        else if (lookDir === 'up') targetPitch += -0.18;
-        else if (lookDir === 'down') targetPitch += 0.18;
-
-        currentYaw = THREE.MathUtils.lerp(currentYaw, targetYaw, delta * 4.0);
-        currentPitch = THREE.MathUtils.lerp(currentPitch, targetPitch, delta * 4.0);
-        currentRoll = THREE.MathUtils.lerp(currentRoll, targetRoll, delta * 4.0);
+        currentYaw = THREE.MathUtils.lerp(currentYaw, targetYaw, delta * 3.5);
+        currentPitch = THREE.MathUtils.lerp(currentPitch, targetPitch, delta * 3.5);
+        currentRoll = THREE.MathUtils.lerp(currentRoll, targetRoll, delta * 3.5);
 
         if (neck) {
           neck.rotation.set(currentPitch * 0.35, currentYaw * 0.35, currentRoll * 0.35);
@@ -425,38 +445,62 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
         }
       }
 
-      // ── 4. Natural Periodic Blinking ──────────────────────────────────────
+      // ── 4. Cursor Tracking: ONLY EYES Follow the Cursor ───────────────────
+      // Per user requirement: ONLY eyes follow the cursor via VRMLookAt.
+      if (lookAtTargetRef.current && vrm.lookAt) {
+        const ptr = pointerRef.current;
+        // Pointer x and y are -1 to +1 relative to container center
+        // Target is placed in 3D space in front of eyes (eye level is ~y=1.52)
+        const targetX = ptr.x * 1.6;
+        const targetY = 1.52 + ptr.y * -0.9;
+        const targetZ = 2.0;
+
+        lookAtTargetRef.current.position.x = THREE.MathUtils.lerp(
+          lookAtTargetRef.current.position.x,
+          targetX,
+          delta * 6.0
+        );
+        lookAtTargetRef.current.position.y = THREE.MathUtils.lerp(
+          lookAtTargetRef.current.position.y,
+          targetY,
+          delta * 6.0
+        );
+        lookAtTargetRef.current.position.z = targetZ;
+
+        vrm.lookAt.target = lookAtTargetRef.current;
+        vrm.lookAt.autoUpdate = true;
+      }
+
+      // ── 5. Natural Periodic Blinking ──────────────────────────────────────
       blinkTimer += delta;
       if (blinkPhase === 'idle' && blinkTimer >= nextBlinkAt) {
         blinkPhase = 'closing';
         blinkProgress = 0;
       }
       if (blinkPhase === 'closing') {
-        blinkProgress += delta * 14.0; // ~70ms to close
+        blinkProgress += delta * 14.0;
         if (blinkProgress >= 1.0) {
           blinkProgress = 1.0;
           blinkPhase = 'opening';
         }
       } else if (blinkPhase === 'opening') {
-        blinkProgress -= delta * 9.0; // ~110ms to open
+        blinkProgress -= delta * 9.0;
         if (blinkProgress <= 0.0) {
           blinkProgress = 0.0;
           blinkPhase = 'idle';
           blinkTimer = 0;
           nextBlinkAt = 2.5 + Math.random() * 3.5;
           if (Math.random() < 0.15) {
-            nextBlinkAt = 0.12; // occasional organic double blink
+            nextBlinkAt = 0.12;
           }
         }
       }
 
-      // ── 5. Facial Expressions & Lip Synchronization ───────────────────────
+      // ── 6. Facial Expressions & Lip Synchronization ───────────────────────
       if (em) {
-        // Reset non-blink, non-mouth expressions each frame
         const allMorphs = ['happy', 'angry', 'sad', 'relaxed', 'surprised', 'neutral', 'aa', 'oh'];
         allMorphs.forEach((m) => em.setValue(m, 0));
 
-        // Check if manual test expression override is active
         const testExpr = activeTestExprRef.current;
 
         if (testExpr) {
@@ -519,7 +563,7 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
         }
       }
 
-      // ── 6. Update VRM (including 134 spring bones for hair physics) & Render
+      // ── 7. Update VRM (including 134 spring bones for hair physics) & Render
       vrm.update(delta);
       renderer.render(scene, camera);
     };
@@ -548,6 +592,11 @@ export const KrixAvatar: React.FC<KrixAvatarProps> = ({
           }
         });
         vrmRef.current = null;
+      }
+
+      if (lookAtTargetRef.current) {
+        scene.remove(lookAtTargetRef.current);
+        lookAtTargetRef.current = null;
       }
 
       renderer.dispose();

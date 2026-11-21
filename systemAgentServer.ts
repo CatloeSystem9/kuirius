@@ -307,13 +307,36 @@ export function appSearch(apps: DiscoveredApp[], query: string): DiscoveredApp[]
   return apps.filter((a) => a.name.toLowerCase().includes(q)).slice(0, 30);
 }
 
-/** Launch by discovered-app name (allowlist) — never an arbitrary command string. */
-export async function appLaunchByName(name: string): Promise<{ launched: string; target: string }> {
+/** Launch by discovered-app name (allowlist) — never an arbitrary command string.
+ *  Phase C: the execution gate decides BEFORE spawn (confirmed malware is
+ *  non-overridably blocked; suspicious requires approval; unknown denied). */
+export interface ExecGate {
+  decide(input: { path: string; name?: string; approvalToken?: string }): Promise<{
+    decision: 'ALLOW' | 'BLOCK_CONFIRMED_MALWARE' | 'REQUIRE_USER_APPROVAL' | 'DENY_UNVERIFIED' | 'BLOCK_SYSTEM_UNAVAILABLE';
+    reason: string;
+    classification?: string;
+  }>;
+  issueApproval(path: string, identity: { path: string; mtimeMs: number; size: number }, classification: string): { token: string } | null;
+}
+
+let execGate: ExecGate | null = null;
+export function setExecGate(gate: ExecGate | null): void { execGate = gate; }
+
+export async function appLaunchByName(name: string, approvalToken?: string): Promise<{ launched: string; target: string }> {
   const apps = await appDiscover();
   const match =
     apps.find((a) => a.name.toLowerCase() === name.toLowerCase()) ??
     apps.find((a) => a.name.toLowerCase().startsWith(name.toLowerCase()));
   if (!match) throw new Error(`No discovered application matches "${name.slice(0, 40)}"`);
+  // Phase C execution gate: single authoritative decision before spawn.
+  if (execGate) {
+    const decision = await execGate.decide({ path: match.target, name: match.name, approvalToken });
+    if (decision.decision !== 'ALLOW') {
+      const err = new Error(`Execution gate: ${decision.decision} — ${decision.reason}`);
+      (err as any).execGateDecision = decision;
+      throw err;
+    }
+  }
   const { spawn } = await import('child_process');
   if (match.source === 'start_menu') {
     // .lnk shortcuts resolve via ShellExecute through cmd start.
@@ -326,11 +349,21 @@ export async function appLaunchByName(name: string): Promise<{ launched: string;
   return { launched: match.name, target: match.target };
 }
 
-/** Launch a validated executable path from inside the allowed roots. */
-export async function appLaunchByPath(executablePath: string): Promise<{ launched: string; target: string }> {
+/** Launch a validated executable path from inside the allowed roots.
+ *  Phase C: the execution gate decides BEFORE spawn. */
+export async function appLaunchByPath(executablePath: string, approvalToken?: string): Promise<{ launched: string; target: string }> {
   const full = resolveSafePath(executablePath, 'read');
   if (!full.toLowerCase().endsWith('.exe')) throw new Error('Only .exe files can be launched by path');
   if (!fs.existsSync(full)) throw new Error(`"${full}" does not exist`);
+  // Phase C execution gate: single authoritative decision before spawn.
+  if (execGate) {
+    const decision = await execGate.decide({ path: full, approvalToken });
+    if (decision.decision !== 'ALLOW') {
+      const err = new Error(`Execution gate: ${decision.decision} — ${decision.reason}`);
+      (err as any).execGateDecision = decision;
+      throw err;
+    }
+  }
   const { spawn } = await import('child_process');
   const child = spawn(full, [], { detached: true, stdio: 'ignore', windowsHide: true });
   child.unref();

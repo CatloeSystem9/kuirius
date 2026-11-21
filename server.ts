@@ -14,6 +14,7 @@ import {
   stopSnapshot,
   activateStop,
   rateLimit,
+  stopKind,
 } from "./serverSafety";
 // E5 M3 — rollback planning/challenges + E7 quarantine (imported for their
 // synchronous init side effects: none — they are pure consumers of the M1/M2
@@ -60,6 +61,13 @@ import { ProcessMonitor } from "./src/agent/processmonitor/processMonitor";
 // blocking, no Defender configuration changes, no external reputation lookups.
 import { DetectionEngine } from "./src/agent/malwaredetect/engine";
 import { createDefenderSource } from "./src/agent/malwaredetect/defenderSource";
+// Phase C — execution gate: centralized Krisha-managed launch decision.
+// Blocks confirmed malware non-overridably; requires approval for suspicious.
+import { ExecutionGate } from "./src/agent/execgate/execGate";
+// Phase D — threat containment: identity-verified, operator-approved
+// termination of a single confirmed-malicious process instance.
+import { ThreatContainment, defaultVerifyProcess, defaultTerminate } from "./src/agent/containment/containment";
+import type { ContainmentRequest } from "./src/agent/containment/containmentTypes";
 
 const spfOutboundGuard = installSpfOutboundGuard(spfFirewall);
 
@@ -100,6 +108,43 @@ const malwareEngine = new DetectionEngine({
     } catch {
       /* audit degradation must never break detection */
     }
+  },
+});
+
+// Phase C — execution gate singleton: centralized Krisha-managed launch
+// decision. Blocks confirmed malware non-overridably; requires approval for
+// suspicious/unknown software; fail-closed when the detection engine is
+// unavailable. Injected into systemAgentServer for launch-pathway enforcement.
+const executionGate = new ExecutionGate({
+  classify: async (p) => {
+    const record = await malwareEngine.assessFile(p);
+    return { classification: record.classification, confidence: record.confidence };
+  },
+  isStopActive: () => stopKind() !== "INACTIVE",
+  statFile: async (p) => {
+    try {
+      const s = await fs.promises.stat(p);
+      return { path: p, mtimeMs: s.mtimeMs, size: s.size };
+    } catch { return null; }
+  },
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe({ kind: event.kind, ...event });
+    } catch { /* audit must never break the gate */ }
+  },
+});
+sys.setExecGate(executionGate);
+
+// Phase D — threat containment singleton: identity-verified, operator-approved
+// termination of a single confirmed-malicious process instance.
+const threatContainment = new ThreatContainment({
+  verifyProcess: defaultVerifyProcess(),
+  isStopActive: () => stopKind() !== "INACTIVE",
+  terminate: defaultTerminate(),
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe({ kind: event.kind, ...event });
+    } catch { /* audit must never break containment */ }
   },
 });
 
@@ -227,6 +272,14 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   // Phase B — on-demand malware assessment reads one file (hash + signature):
   // gated by the existing filesystem.read permission convention.
   "/api/malwaredetect/assess": { permission: "filesystem.read", stopBlock: false, rate: { group: "malware-assess", limit: 30, windowMs: 60_000 } },
+  // Phase C — execution gate approval: issues a single-use launch approval
+  // token after operator review. Requires application.launch permission
+  // (operator action). CONFIRMED_MALWARE returns null (non-overridable).
+  "/api/execgate/approve": { permission: "application.launch", stopBlock: true, rate: { group: "exec-gate", limit: 10, windowMs: 60_000 } },
+  // Phase D — threat containment: identity-verified, operator-approved
+  // termination of a single confirmed-malicious process. Non-overridable by
+  // agents; requires fresh CONFIRMED_MALWARE evidence and operator approval.
+  "/api/containment/contain": { stopBlock: true, rate: { group: "containment", limit: 5, windowMs: 60_000 } },
 };
 
 app.use((req, res, next) => {
@@ -3247,7 +3300,30 @@ app.get("/api/malwaredetect/status", async (req, res) => {
       recentDetections: malwareEngine.recentDetections(recent),
     });
   } catch (err: any) {
-    res.status(500).json({ error: err?.message || "malware detection status failed" });
+    return res.status(500).json({ error: err?.message || "malware detection status failed" });
+  }
+});
+
+// ---- Phase C: execution gate approval route ----
+// Issues a single-use launch approval token after operator review.
+// CONFIRMED_MALWARE returns null (non-overridable block).
+app.post("/api/execgate/approve", async (req, res) => {
+  try {
+    const p = String(req.body?.path ?? "").trim();
+    if (!p || p.length > 500) return res.status(400).json({ error: "path is required" });
+    const identity = await fs.promises.stat(p).then(
+      (s) => ({ path: p, mtimeMs: s.mtimeMs, size: s.size }),
+      () => null
+    );
+    if (!identity) return res.status(400).json({ error: "executable not found" });
+    const classification = await malwareEngine.assessFile(p);
+    const token = executionGate.issueApproval(p, identity, classification.classification);
+    if (!token) {
+      return res.json({ approved: false, reason: "CONFIRMED_MALWARE cannot be approved — non-overridable", classification: classification.classification });
+    }
+    res.json({ approved: true, token: token.token, expiresAt: token.expiresAt, classification: classification.classification });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "exec-gate approval failed" });
   }
 });
 
@@ -3261,6 +3337,47 @@ app.post("/api/malwaredetect/assess", async (req, res) => {
     return res.json({ record });
   } catch (err: any) {
     return res.status(500).json({ error: err?.message || "assessment failed" });
+  }
+});
+
+// ---- Phase D: threat containment (operator-approved, identity-verified) ----
+// Requires: CONFIRMED_MALWARE classification, operator approval token,
+// identity revalidation via WMI, and an inactive emergency stop.
+// The containment module verifies every step before and after termination.
+app.post("/api/containment/contain", async (req, res) => {
+  try {
+    const body = req.body || {};
+    const request: ContainmentRequest = {
+      target: {
+        pid: Number(body.target?.pid),
+        name: String(body.target?.name ?? ''),
+        creationTime: String(body.target?.creationTime ?? ''),
+        executablePath: String(body.target?.executablePath ?? ''),
+      },
+      evidence: {
+        classification: body.evidence?.classification,
+        confidence: body.evidence?.confidence,
+        fileHash: body.evidence?.fileHash,
+        defenderThreatId: body.evidence?.defenderThreatId,
+        assessedAt: Number(body.evidence?.assessedAt),
+        evidenceSources: Array.isArray(body.evidence?.evidenceSources) ? body.evidence.evidenceSources : [],
+      },
+      approvalToken: String(body.approvalToken ?? ''),
+    };
+    // Validate required fields server-side (never trust client input).
+    if (!Number.isInteger(request.target.pid) || request.target.pid <= 0) {
+      return res.status(400).json({ error: "target.pid is required (positive integer)" });
+    }
+    if (!request.target.name || !request.target.creationTime || !request.target.executablePath) {
+      return res.status(400).json({ error: "target.name, target.creationTime, and target.executablePath are required" });
+    }
+    if (!request.evidence.classification || !Number.isFinite(request.evidence.assessedAt)) {
+      return res.status(400).json({ error: "evidence.classification and evidence.assessedAt are required" });
+    }
+    const result = await threatContainment.contain(request);
+    res.json({ outcome: result.outcome, reason: result.reason, targetPid: result.targetPid, targetName: result.targetName });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "containment failed" });
   }
 });
 
@@ -3306,7 +3423,7 @@ app.post('/api/app/discover', (req, res) =>
   fsResult(res, () => sys.appDiscover(req.body?.force === true).then((apps) => sys.appSearch(apps, String(req.body?.query ?? ''))))
 );
 app.post('/api/app/launch', (req, res) =>
-  fsResult(res, () => (req.body?.path ? sys.appLaunchByPath(String(req.body.path)) : sys.appLaunchByName(String(req.body?.name ?? ''))))
+  fsResult(res, () => (req.body?.path ? sys.appLaunchByPath(String(req.body.path), req.body?.approvalToken) : sys.appLaunchByName(String(req.body?.name ?? ''), req.body?.approvalToken)))
 );
 app.post('/api/app/status', (req, res) => fsResult(res, () => sys.appStatus(String(req.body?.name ?? ''))));
 app.post('/api/app/close', (req, res) => fsResult(res, () => sys.appClose(Number(req.body?.pid), req.body?.force === true)));

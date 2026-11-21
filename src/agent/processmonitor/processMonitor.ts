@@ -441,9 +441,12 @@ export class ProcessMonitor {
 
   private watchdogTick(): void {
     if (this.health === 'ACTIVE') {
-      const stale = this.lastHeartbeatAt === undefined || Date.now() - this.lastHeartbeatAt > this.options.heartbeatTimeoutMs;
+      // During event bursts the worker processes events continuously and
+      // never reaches the Wait-Event timeout (no heartbeat). Recent events
+      // prove the worker is alive even without heartbeats — check BOTH.
+      const lastActivity = Math.max(this.lastHeartbeatAt ?? 0, this.lastEventAt ?? 0);
+      const stale = Date.now() - lastActivity > this.options.heartbeatTimeoutMs;
       if (stale) {
-        // Telemetry interrupted: re-arm.
         this.transport?.kill();
         this.scheduleRearm('heartbeat stale');
       }

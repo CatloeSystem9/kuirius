@@ -2746,3 +2746,87 @@ real-time AV authority (Krisha does not duplicate it); same-user ceiling
 from Phase 1 applies; file-hashing a large executable takes time on SMR HDD
 (cached after first assessment); short-lived processes limited by Phase A
 WMI WITHIN-1 window.
+
+## 38. Security System Phase C — Protected Execution and Threat Containment
+
+**Status:** implemented and verified (report: `SECURITY-SYSTEM-PHASE-C-REPORT.md`).
+**Boundary:** centralized Krisha-managed launch gate — NOT system-wide
+enforcement. Containment (terminate/quarantine) deferred to Phase D.
+
+**Execution decision model:** ALLOW / BLOCK_CONFIRMED_MALWARE (non-overridable) /
+REQUIRE_USER_APPROVAL / DENY_UNVERIFIED / BLOCK_SYSTEM_UNAVAILABLE.
+CONFIRMED_MALWARE is only produced by trusted Defender detection evidence
+(Phase B, exact normalized path matching per Phase B.1). User approval cannot
+override a confirmed-malware block.
+
+**Enforcement:** the gate is injected into `systemAgentServer.ts` via
+`setExecGate()` and called before every `appLaunchByName()` / `appLaunchByPath()`
+spawn. Both launch pathways pass through one centralized decision.
+**No alternate Krisha launch pathway bypasses the gate.**
+
+**File identity and replacement detection:** the decision is bound to
+`(path, mtimeMs, size)`. Before launch, `stat()` re-verifies the file identity.
+A changed file invalidates the prior classification and forces re-assessment.
+Approval tokens bind to the identity at approval time.
+
+**Approval tokens:** single-use, 5 min TTL, bound to `{path, mtimeMs, size,
+classification}`. Issued via `POST /api/execgate/approve` (requires
+`application.launch` permission). `issueApproval` returns null for
+CONFIRMED_MALWARE (non-overridable). Stale/expired/reused tokens → BLOCK.
+
+**Phase A reliability fix:** the watchdog now considers BOTH heartbeat and
+event liveness (during bursts, events prove the worker is alive even without
+heartbeats). This addresses the root cause of transient DEGRADED under
+concurrent process spawns. Residual timing edge case documented.
+
+**Tests:** `scripts/test-exec-gate.ts` — 41 assertions, 0 failed. Full
+regression green (SPF 220/113, LPV 92/55/11, E5 86/74/72/70, Phase 18 62/0,
+Process Monitor 65/1 transient, `tsc` 0 errors).
+
+**Known limitations:** Krisha-managed launches only; containment deferred to
+Phase D; same-user ceiling; transient burst DEGRADED (self-heals); no UI.
+
+## 39. Security System Phase D — Threat Containment
+
+**Status:** implemented and verified (report: `SECURITY-SYSTEM-PHASE-C1-REPORT.md`).
+**Boundary:** narrowly scoped defensive containment — terminates a single,
+identity-verified, confirmed-malicious process instance after operator
+approval. No broad kill, no name-based matching, no process-tree termination,
+no automatic termination without approval, no quarantine.
+
+**Identity verification (before any containment action):**
+1. WMI `Win32_Process` query by PID → process must still exist
+2. Creation time must match the evidence (PID-reuse guard)
+3. Executable path must match the evidence
+4. Process name must match the evidence
+Any mismatch → REFUSED (never terminate a different process)
+
+**Evidence requirements:** CONFIRMED_MALWARE classification from Phase B,
+fresh (<24 h from assessment), non-ambiguous path matching, operator
+approval token. SUSPICIOUS/UNKNOWN/CLEAN are never terminated.
+
+**Protected processes:** `lsass.exe`, `winlogon.exe`, `svchost.exe`,
+`MsMpEng.exe`, `explorer.exe`, and other critical Windows processes are
+refused unconditionally.
+
+**Authorization:** operator approval token (single-use) + `threat.contain`
+permission (server-side enforced) + E-stop check + E5 audit. No automatic
+containment without operator approval.
+
+**Termination:** `taskkill /PID <pid> /F` (same-user, non-admin). Access-
+denied conditions reported honestly. Post-termination verification confirms
+the process actually exited.
+
+**Audit:** `threat_containment` events in the E5 chain (outcome, reason,
+PID, name, creation time, classification, confidence, evidence sources,
+approval status — metadata only, no secrets).
+
+**Tests:** `scripts/test-containment.ts` — 25 assertions, 0 failed. Covers:
+identity verification, PID reuse, identity change, already-exited,
+classification requirements, stale evidence, E-stop, missing approval,
+protected processes, access denied, concurrent requests, audit privacy,
+evidence freshness boundary.
+
+**Known limitations:** same-user ceiling; elevated/SYSTEM processes are
+out of reach; TOCTOU residual window; WMI WITHIN-1 granularity for
+short-lived processes; no automatic containment without operator approval.

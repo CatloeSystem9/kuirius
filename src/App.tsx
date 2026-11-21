@@ -1959,7 +1959,7 @@ export default function App() {
 
         {/* Central Avatar Area — Krix 3D VRM + 2D Fallback */}
         <div
-          className={`flex-1 flex items-center justify-center relative px-4 pt-10 sm:pt-4 overflow-hidden transition-colors duration-700 ${
+          className={`flex-1 flex items-center justify-center sm:justify-end sm:pr-8 md:pr-16 lg:pr-24 xl:pr-28 relative px-4 pt-10 sm:pt-4 overflow-hidden transition-colors duration-700 ${
             isWhiteBackground ? 'bg-white' : 'bg-[#02030f]'
           }`}
           style={{ backgroundColor: isWhiteBackground ? undefined : '#02030f' }}
@@ -1985,27 +1985,27 @@ export default function App() {
             }}
             className="relative z-10 w-full max-w-[520px] h-[620px] flex flex-col items-center justify-end cursor-grab active:cursor-grabbing"
           >
-            {/* Spoken / Dialogue Speech Bubble above Krix */}
+            {/* Spoken / Dialogue Speech Bubble on Krix's right-hand side (viewer's left) */}
             {lastSpokenText && (
               <motion.div
                 key={lastSpokenText}
-                initial={{ opacity: 0, y: 8, scale: 0.95 }}
-                animate={{ opacity: 1, y: 0, scale: 1 }}
+                initial={{ opacity: 0, x: -12, scale: 0.95 }}
+                animate={{ opacity: 1, x: 0, scale: 1 }}
                 transition={{ duration: 0.35 }}
-                className={`absolute top-2 sm:top-4 z-30 px-4 py-2.5 max-w-[280px] sm:max-w-xs rounded-2xl backdrop-blur-md flex flex-col items-center gap-1.5 pointer-events-auto transition-all duration-500 ${
+                className={`absolute top-6 sm:top-10 md:top-12 left-2 sm:left-auto sm:right-[56%] md:right-[60%] lg:right-[64%] z-30 px-3.5 py-2.5 sm:px-4 sm:py-3 max-w-[210px] sm:max-w-[280px] md:max-w-[320px] rounded-2xl backdrop-blur-md flex flex-col items-start gap-1.5 pointer-events-auto transition-all duration-500 ${
                   isWhiteBackground
                     ? 'bg-white/95 border border-slate-200/90 shadow-[0_12px_32px_rgba(0,0,0,0.12)]'
                     : 'bg-[#0b1022]/90 border border-blue-500/30 shadow-[0_8px_32px_rgba(0,0,0,0.8)]'
                 }`}
               >
                 <p
-                  className={`text-xs font-normal italic leading-relaxed text-center transition-colors ${
+                  className={`text-xs font-normal italic leading-relaxed text-left transition-colors ${
                     isWhiteBackground ? 'text-slate-800' : 'text-blue-100'
                   }`}
                 >
                   "{lastSpokenText}"
                 </p>
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 mt-0.5">
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
@@ -2040,12 +2040,12 @@ export default function App() {
                     </a>
                   )}
                 </div>
-                {/* Speech Bubble Pointer Arrow */}
+                {/* Speech Bubble Pointer Arrow pointing towards Krix (to the right) */}
                 <div
-                  className={`absolute -bottom-1.5 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45 transition-colors ${
+                  className={`absolute top-5 -right-1.5 w-3 h-3 rotate-45 transition-colors hidden sm:block ${
                     isWhiteBackground
-                      ? 'bg-white border-r border-b border-slate-200/90'
-                      : 'bg-[#0b1022] border-r border-b border-blue-500/30'
+                      ? 'bg-white border-r border-t border-slate-200/90'
+                      : 'bg-[#0b1022] border-r border-t border-blue-500/30'
                   }`}
                 />
               </motion.div>
@@ -2058,6 +2058,7 @@ export default function App() {
                 emotionData={emotionData}
                 isSpeaking={isSpeaking}
                 isListening={isLoading}
+                isVoiceListening={wakeWordStatus === 'listening' || wakeWordStatus === 'detected'}
                 isDancing={isDancing}
                 isGreeting={isGreeting}
                 isThanked={isThanked}

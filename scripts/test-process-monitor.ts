@@ -9,6 +9,7 @@
  * store is never touched. Live WMI tests use the REAL worker (temporary,
  * session-owned subscriptions, no admin, cleaned up on exit).
  */
+import './test-isolation';
 import * as http from 'node:http';
 import * as fs from 'node:fs';
 import * as os from 'node:os';

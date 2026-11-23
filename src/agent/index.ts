@@ -13,6 +13,9 @@ export * from './browserTools';
 export * from './vision/visionTypes';
 export * from './vision/screenObserver';
 export * from './vision/screenTools';
+export * from './vision/liveWatcher';
+export * from './vision/screenUnderstanding';
+export * from './vision/liveTools';
 export * from './computer/mouseTypes';
 export * from './computer/computerControl';
 export * from './computer/mouseTools';
@@ -37,6 +40,10 @@ export * from './learning/learningService';
 export * from './learning/workflowPlanner';
 export * from './goals';
 export * from './diagnostics';
+// Persistent Identity Foundation (Step 1): who Krisha is — stable across
+// restarts, sessions, models and providers. Independent of memory/memory v2,
+// model routing, voice and avatar systems.
+export * from './identity';
 // bridge re-exports planner names (isMultiStepRequest/isScreenIntent/isMouseIntent) —
 // export its own API explicitly to avoid ambiguous star-export collisions.
 export { createAgentSystem, runAgentTask, type AgentHost, type AgentSystem, type AgentRunResult } from './bridge';

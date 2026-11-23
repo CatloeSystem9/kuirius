@@ -1,0 +1,52 @@
+
+1. Voice characteristics preserved (cleaning/language/profile)
+
+2. Stale TTS fetch cannot start playback (overlap prevention)
+[KrixAvatar] Audio analysis setup failed: ReferenceError: window is not defined
+    at ensureAudioContext (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:23:18)
+    at Object.startKrixAudioAnalysis (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:34:17)
+    at FakeAudio.audio.onplay (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:311:19)
+    at FakeAudio.play (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:73:12)
+    at speakKrishaText (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:352:35)
+    at async Promise.all (index 1)
+    at async <anonymous> (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:158:3)
+
+3. Explicit stop cancels pending sessions
+
+4. Stuck audio watchdog (wedged play())
+
+5. Device disconnect → bounded single recovery
+[KrixAvatar] Audio analysis setup failed: TypeError: Ctor is not a constructor
+    at ensureAudioContext (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:24:17)
+    at Object.startKrixAudioAnalysis (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:34:17)
+    at FakeAudio.audio.onplay (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:311:19)
+    at FakeAudio.play (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:73:12)
+    at speakKrishaText (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:352:35)
+[KrixAvatar] Audio analysis setup failed: TypeError: Ctor is not a constructor
+    at ensureAudioContext (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:24:17)
+    at Object.startKrixAudioAnalysis (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:34:17)
+    at FakeAudio.audio.onplay (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:311:19)
+    at FakeAudio.play (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:73:12)
+    at Timeout._onTimeout (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:148:20)
+    at listOnTimeout (node:internal/timers:635:17)
+    at process.processTimers (node:internal/timers:571:7)
+
+6. Play failure → Web Speech fallback, honest completion
+
+7. Repeated speak replaces current speech (no stacking)
+[KrixAvatar] Audio analysis setup failed: TypeError: Ctor is not a constructor
+    at ensureAudioContext (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:24:17)
+    at Object.startKrixAudioAnalysis (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:34:17)
+    at FakeAudio.audio.onplay (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:311:19)
+    at FakeAudio.play (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:73:12)
+    at speakKrishaText (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:352:35)
+[KrixAvatar] Audio analysis setup failed: TypeError: Ctor is not a constructor
+    at ensureAudioContext (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:24:17)
+    at Object.startKrixAudioAnalysis (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\components\KrixAvatar3D.tsx:34:17)
+    at FakeAudio.audio.onplay (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:311:19)
+    at FakeAudio.play (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\scripts\test-background-voice.ts:73:12)
+    at speakKrishaText (C:\Users\Expert\OneDrive\Documents\GitHub\Krisha-AI\src\utils\audio.ts:352:35)
+
+8. Empty text completes without playback
+
+26 passed, 0 failed

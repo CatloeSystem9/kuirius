@@ -1,4 +1,5 @@
 import { CompanionSettings, Conversation } from '../types';
+import { getIdentityService } from '../agent/identity';
 
 const STORAGE_KEYS = {
   CONVERSATIONS: 'krisha_conversations_v1',
@@ -16,6 +17,16 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   voicePitch: 1.0,
   languagePreference: 'auto',
   companionNotes: 'Speaks sweetly and warmly in English & Hindi with an affectionate, natural charm.',
+  // Offline vision: ON by default — computer use and agent screen observation
+  // never upload a screenshot; the read-screen button uses local OCR.
+  offlineVision: true,
+  // Step 4 — Proactive Conversations: conservative, respectful defaults.
+  proactiveConversations: true,
+  proactiveInactivityMinutes: 30,
+  proactiveMinIntervalHours: 3,
+  proactiveQuietHoursEnabled: true,
+  proactiveQuietHoursStart: 23,
+  proactiveQuietHoursEnd: 8,
 };
 
 export const DEFAULT_MEMORIES: string[] = [
@@ -119,6 +130,9 @@ export interface KrishaBackupBundle {
   memoriesV2?: unknown;
   settings?: CompanionSettings;
   location?: unknown;
+  /** Step 1: Krisha's persistent identity (validated envelope; restore is
+   *  identityId-guarded — a backup can never replace Krix with a different one). */
+  identity?: unknown;
 }
 
 export function createKrishaBackupBundle(): KrishaBackupBundle {
@@ -157,6 +171,13 @@ export function createKrishaBackupBundle(): KrishaBackupBundle {
     if (raw) location = JSON.parse(raw);
   } catch {}
 
+  // Step 1: include the persistent identity envelope in backups.
+  let identity: unknown = undefined;
+  try {
+    const raw = localStorage.getItem('krisha_identity_v1');
+    if (raw) identity = JSON.parse(raw);
+  } catch {}
+
   return {
     version: 1,
     exportedAt: new Date().toISOString(),
@@ -167,6 +188,7 @@ export function createKrishaBackupBundle(): KrishaBackupBundle {
     memories,
     memoriesV2,
     location,
+    identity,
   };
 }
 
@@ -175,6 +197,8 @@ export function restoreKrishaBackupBundle(bundle: KrishaBackupBundle): {
   restoredMemoriesCount: number;
   restoredConversationsCount: number;
   message?: string;
+  /** Step 1: whether Krix's persistent identity was restored from the backup. */
+  identityRestored?: boolean;
 } {
   try {
     if (!bundle || typeof bundle !== 'object') {
@@ -209,10 +233,22 @@ export function restoreKrishaBackupBundle(bundle: KrishaBackupBundle): {
       localStorage.setItem('krisha_cached_location', JSON.stringify(bundle.location));
     }
 
+    // Step 1: restore Krisha's identity through the validated, identityId-
+    // guarded adoption path (a backup can never swap in a different identity).
+    let identityRestored = false;
+    if (bundle.identity) {
+      try {
+        identityRestored = getIdentityService().adoptFromBackup(bundle.identity).ok;
+      } catch {
+        identityRestored = false;
+      }
+    }
+
     return {
       success: true,
       restoredMemoriesCount: memCount,
       restoredConversationsCount: convoCount,
+      identityRestored,
     };
   } catch (err) {
     return {

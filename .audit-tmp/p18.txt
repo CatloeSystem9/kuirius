@@ -1,0 +1,2 @@
+class ScreenPrivacyFirewall|screenPrivacy|EP-14|EP-15|redactSensitiveLines|filterScreen
+execPowerShell|powershell|spawnChild|spawn\(;child_process

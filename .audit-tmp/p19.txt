@@ -1,0 +1,3 @@
+VisualInspection|OcrWorker|visualInspection
+screenPrivacyFirewall|ScreenPrivacyFirewall|new ScreenPrivacyFirewall
+/api/vision/analyze

@@ -84,6 +84,14 @@ async function main() {
   await waitForHealth();
   console.log('server healthy');
 
+  // E5 M1b enforcement reads server-side permission state — mirror this
+  // script's mouse-control grant (the explicit run IS the operator action).
+  await fetch(`${BASE}/api/permissions/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant: ['mouse.control'] }),
+  });
+
   const pos = await post({ action: 'position' });
   if (!pos.success) throw new Error('could not read cursor position');
   const original = pos.position as { x: number; y: number };

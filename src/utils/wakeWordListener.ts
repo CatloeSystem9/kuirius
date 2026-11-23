@@ -14,6 +14,16 @@ export interface WakeWordResult {
 
 export type WakeWordStatus = 'listening' | 'idle' | 'detected' | 'paused_speaking' | 'paused_hidden' | 'error' | 'unsupported';
 
+/**
+ * Detectable microphone/service failures surfaced by the recognition engine
+ * (Step 3 — conversational silence detection). These distinguish microphone
+ * failures from ordinary conversational silence; they carry no content.
+ */
+export type WakeWordDiagnosticKind =
+  | 'microphone_permission_denied'  // 'not-allowed' / 'service-not-allowed'
+  | 'microphone_unavailable'        // 'audio-capture' — device missing/disconnected
+  | 'audio_service_unavailable';    // 'network' — recognition backend unreachable
+
 const WAKE_WORD_PATTERNS = [
   /\b(?:hey|hi|hello|ok|okay|wake\s+up|yo)?\s*krisha\b/i,
   /\bkrisha\s*(?:wake\s+up|listen|are\s+you\s+there|suno|kya\s+kar\s+rahi\s+ho)?\b/i,
@@ -44,6 +54,16 @@ export class WakeWordManager {
   private onWakeWordCallback: ((result: WakeWordResult) => void) | null = null;
   private onStatusChangeCallback: ((status: WakeWordStatus) => void) | null = null;
   private onTranscriptUpdateCallback: ((transcript: string) => void) | null = null;
+  private onDiagnosticCallback: ((kind: WakeWordDiagnosticKind) => void) | null = null;
+  // Step 5 — live conversation continuity:
+  /** FINAL-only transcripts (never interim) for live follow-up turns. */
+  private onFinalTranscriptCallback: ((finalTranscript: string) => void) | null = null;
+  /** When enabled, recognition stays ALIVE while Krix speaks so a MATCHED
+   *  wake word can barge in. Echo risk is bounded: only the specific wake
+   *  pattern triggers, and raw noise never interrupts (documented limitation:
+   *  full no-wake-word barge-in is NOT implemented — laptop speakers + mic
+   *  echo make it unreliable). */
+  private bargeInEnabled = false;
 
   constructor() {
     if (typeof document !== 'undefined') {
@@ -84,13 +104,17 @@ export class WakeWordManager {
       rec.maxAlternatives = 1; // Lower alternatives to save RAM and CPU
 
       rec.onstart = () => {
-        if (!this.isKrishaSpeaking && !this.isTabHidden) {
+        if ((!this.isKrishaSpeaking || this.bargeInEnabled) && !this.isTabHidden) {
           this.setStatus('listening');
         }
       };
 
       rec.onresult = (event: any) => {
-        if (this.isKrishaSpeaking || this.isTabHidden || this.isProcessing) return;
+        // Step 5: with barge-in enabled, results are still processed while
+        // Krix speaks — only a MATCHED wake word can interrupt (noise alone
+        // never does). Without barge-in, playback pauses recognition as before.
+        if (this.isKrishaSpeaking && !this.bargeInEnabled) return;
+        if (this.isTabHidden) return;
 
         let interimTranscript = '';
         let finalTranscript = '';
@@ -104,8 +128,15 @@ export class WakeWordManager {
           }
         }
 
+        // Step 5: final-only transcript for live follow-up turns.
+        const finalOnly = finalTranscript.trim();
+        if (finalOnly) {
+          this.onFinalTranscriptCallback?.(finalOnly);
+        }
+
         const candidateText = (finalTranscript || interimTranscript).trim();
         if (candidateText) {
+          if (this.isKrishaSpeaking && this.isProcessing) return;
           this.onTranscriptUpdateCallback?.(candidateText);
           this.checkAndProcessWakeWord(candidateText);
         }
@@ -115,10 +146,14 @@ export class WakeWordManager {
         if (e.error !== 'no-speech' && e.error !== 'aborted') {
           console.debug('Recognition notice:', e.error);
         }
+        // Step 3: classify detectable failures (never 'no-speech' — silence is
+        // the inactivity tracker's domain, not a failure).
+        const diag = this.mapRecognitionError(e.error);
+        if (diag) this.onDiagnosticCallback?.(diag);
       };
 
       rec.onend = () => {
-        if (this.isListeningDesired && !this.isKrishaSpeaking && !this.isTabHidden) {
+        if (this.isListeningDesired && !this.isTabHidden && (!this.isKrishaSpeaking || this.bargeInEnabled)) {
           this.scheduleRestart(500); // 500ms debounce prevents CPU spin
         } else if (this.isKrishaSpeaking) {
           this.setStatus('paused_speaking');
@@ -187,6 +222,29 @@ export class WakeWordManager {
     this.onStatusChangeCallback?.(newStatus);
   }
 
+  /** Map a SpeechRecognition error code to a content-free diagnostic kind. */
+  private mapRecognitionError(code: unknown): WakeWordDiagnosticKind | null {
+    switch (code) {
+      case 'not-allowed':
+      case 'service-not-allowed':
+        return 'microphone_permission_denied';
+      case 'audio-capture':
+        return 'microphone_unavailable';
+      case 'network':
+        return 'audio_service_unavailable';
+      default:
+        return null;
+    }
+  }
+
+  /**
+   * Subscribe to detectable microphone/service failures (Step 3). Optional
+   * and additive — existing status/behavior is unchanged.
+   */
+  public setDiagnosticListener(cb: ((kind: WakeWordDiagnosticKind) => void) | null): void {
+    this.onDiagnosticCallback = cb;
+  }
+
   private scheduleRestart(delayMs: number = 500) {
     if (this.restartTimeout) clearTimeout(this.restartTimeout);
     this.restartTimeout = setTimeout(() => {
@@ -252,13 +310,42 @@ export class WakeWordManager {
   public setKrishaSpeaking(isSpeaking: boolean) {
     this.isKrishaSpeaking = isSpeaking;
     if (isSpeaking) {
-      this.setStatus('paused_speaking');
-      this.pauseRecognition();
+      // Step 5: with barge-in enabled, recognition STAYS ALIVE during playback
+      // so a matched wake word can interrupt (noise alone never can).
+      if (!this.bargeInEnabled) {
+        this.setStatus('paused_speaking');
+        this.pauseRecognition();
+      }
     } else {
       if (this.isListeningDesired && !this.isTabHidden) {
         this.scheduleRestart(600);
       }
     }
+  }
+
+  /**
+   * Step 5: enable/disable wake-word barge-in during Krix's playback.
+   * Disabled by default (existing behavior preserved when unset).
+   */
+  public setBargeInEnabled(enabled: boolean): void {
+    this.bargeInEnabled = enabled;
+    // Enabling mid-playback: make sure recognition is actually running.
+    if (enabled && this.isKrishaSpeaking && this.isListeningDesired && this.recognition) {
+      this.scheduleRestart(300);
+    }
+    // Disabling mid-playback: restore the conservative pause.
+    if (!enabled && this.isKrishaSpeaking) {
+      this.pauseRecognition();
+    }
+  }
+
+  /**
+   * Step 5: subscribe to FINAL-only transcripts (never interim) — the live
+   * follow-up pathway. Raw interim chatter never reaches this callback, so
+   * background noise cannot fabricate a turn.
+   */
+  public setFinalTranscriptListener(cb: ((finalTranscript: string) => void) | null): void {
+    this.onFinalTranscriptCallback = cb;
   }
 
   public getStatus(): WakeWordStatus {

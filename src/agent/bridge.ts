@@ -16,7 +16,11 @@ import { createBrowserTools } from './browserTools';
 import { createScreenTools } from './vision/screenTools';
 import { ScreenObserver } from './vision/screenObserver';
 import { BrowserCaptureSource } from './vision/browserCapture';
-import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, HeuristicPlanner } from './planner';
+import { LiveScreenWatcher } from './vision/liveWatcher';
+import { ScreenUnderstandingService } from './vision/screenUnderstanding';
+import { createLivePerceptionTools } from './vision/liveTools';
+import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, isSpreadsheetIntent, isPresentationIntent, splitIntoClauses, classifyStep, HeuristicPlanner } from './planner';
+import { createOfficeTools } from './office/officeTools';
 import { LearningService } from './learning/learningService';
 import { WorkflowAwarePlanner } from './learning/workflowPlanner';
 import { SkillEngine, SkillAwarePlanner, createSkillTools } from './skills';
@@ -61,6 +65,7 @@ import { createSystemTools } from './system/systemTools';
 import { DiagnosticsService, createDiagnosticTools } from './diagnostics';
 import { createProcessMonitorTools } from './processmonitor/tools';
 import { createMalwareDetectTools } from './malwaredetect/tools';
+import { createSecurityIntelTools } from './securityintel/tools';
 import { createGlobeTools } from './globeTools';
 
 export interface AgentHost {
@@ -83,6 +88,9 @@ export interface AgentSystem {
   permissions?: PermissionManager;
   /** Screen observation service (Phase 4). */
   screenObserver?: ScreenObserver;
+  /** Live Screen Perception — adaptive watcher + local SPF-screened understanding. */
+  liveWatcher?: LiveScreenWatcher;
+  screenUnderstanding?: ScreenUnderstandingService;
   /** Adaptive observation layer (Phase 13). */
   adaptiveObserver?: AdaptiveObserver;
   /** Keyboard control service (Phase 6). */
@@ -238,12 +246,28 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // Screen vision (Phase 4): native Screen Capture API, gated by the
   // 'screen.observation' permission (default-deny).
+  const captureSource = new BrowserCaptureSource();
   const screenObserver = new ScreenObserver({
-    captureSource: new BrowserCaptureSource(),
+    captureSource,
     events: bus,
     permissions,
   });
   registry.registerAll(createScreenTools(screenObserver));
+
+  // Live Screen Perception: adaptive lightweight watching over the SAME
+  // capture stream (signature-only probes, no continuous AI) + local WinRT
+  // OCR understanding via the SPF-screened /api/screen/understand route.
+  // Both require 'screen.observation' (default-deny); the watcher stops with
+  // an emergency stop; understanding lines are screened again on this side.
+  const liveWatcher = new LiveScreenWatcher({ captureSource, events: bus, permissions });
+  const screenUnderstanding = new ScreenUnderstandingService({
+    watcher: liveWatcher,
+    observer: screenObserver,
+    events: bus,
+    permissions,
+  });
+  screenUnderstanding.attach();
+  registry.registerAll(createLivePerceptionTools(liveWatcher, screenUnderstanding));
 
   // Adaptive observation (Phase 13): event/task-driven scheduling ON TOP of
   // the Phase 4 observer — decides when/how/whether to look at the screen.
@@ -308,6 +332,13 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   const filesystemService = new FilesystemService({ fs: new HttpFsBackend(), events: bus });
   const applicationService = new ApplicationService({ fs: new HttpFsBackend(), apps: new HttpAppBackend(), events: bus });
   registry.registerAll(createSystemTools(filesystemService, applicationService));
+
+  // Office tools (spreadsheet + presentation): local xlsx/pptx generation and
+  // bounded reading via the local server — pure-JS, no Office/COM, capped for
+  // the 8 GB target. Reads ride the granted filesystem.read; writes are
+  // default-deny and granted session-scoped when the user explicitly asks for
+  // spreadsheet/presentation work (same doctrine as mouse/keyboard).
+  registry.registerAll(createOfficeTools());
 
   // Multimodal intelligence (Phase 14): a task-scoped, bounded evidence
   // context fed by text, Phase 4/13 screen evidence, Phase 8 browser state,
@@ -384,6 +415,12 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       core.cancelAll();
     } catch {
       // cancellation is best-effort; the gate still blocks side effects
+    }
+    // Live perception stops immediately with an emergency stop.
+    try {
+      liveWatcher.stop();
+    } catch {
+      /* the gate still blocks side effects */
     }
     scopedPermissions.revokeAllTemporary();
     // E5 M1a: persist the stop server-side — the server state is the
@@ -532,6 +569,10 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   // Phase B malware detection: read-only status + on-demand file assessment
   // tools. No process-control capability exists (detection/classification only).
   registry.registerAll(createMalwareDetectTools());
+  // Phase E security intelligence: read-only situation + assessment tools.
+  // No control surface — recommendations are non-actionable through the
+  // intelligence layer (Phase D.4 keeps termination unreachable).
+  registry.registerAll(createSecurityIntelTools());
 
   // Learned Skills v1 tools: read-only discovery + learned-data management
   // (disable/forget). There is deliberately no "create skill from text" tool —
@@ -562,6 +603,19 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // Learned workflows may require fresh screen state for specific steps.
   core.setAdaptiveObserver(adaptiveObserver);
+
+  // Live perception cadence follows computer-use activity (burst while a
+  // closed-loop task is running, normal cadence afterwards).
+  const detachLiveHints = (() => {
+    const unsubs = [
+      bus.on('COMPUTER_USE_STARTED', () => liveWatcher.setComputerUseActive(true)),
+      bus.on('COMPUTER_USE_COMPLETED', () => liveWatcher.setComputerUseActive(false)),
+      bus.on('COMPUTER_USE_CANCELLED', () => liveWatcher.setComputerUseActive(false)),
+    ];
+    return () => {
+      for (const u of unsubs) u();
+    };
+  })();
 
   // Apply declarative UI effects from completed steps onto the existing app state.
   const detachStepListener = bus.on('TASK_STEP_COMPLETED', (event: AgentEvent) => {
@@ -657,6 +711,8 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     registry,
     permissions,
     screenObserver,
+    liveWatcher,
+    screenUnderstanding,
     adaptiveObserver,
     keyboardControl,
     learning,
@@ -678,6 +734,9 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     diagnostics,
     detach: () => {
       detachStepListener();
+      detachLiveHints();
+      liveWatcher.dispose();
+      screenUnderstanding.detach();
       detachLearning();
       detachSkills();
       detachGoals();
@@ -734,10 +793,68 @@ export interface AgentRunResult {
   summary: string;
 }
 
+/**
+ * Explicit interactive-control intents are operator grants by doctrine — the
+ * same rule the UI already applies to screen observation (an explicit user
+ * request IS the grant, session-scoped). Classify every clause of the request
+ * and grant exactly the domains the plan needs. The grant is mirrored to the
+ * server (/api/permissions/session) because the E5 HTTP enforcement reads
+ * server state; mirroring failure is non-fatal (the tool then reports an
+ * honest permission failure instead of pretending).
+ */
+const MOUSE_TOOL_NAMES = new Set([
+  'computer.move_cursor', 'computer.click', 'computer.double_click', 'computer.right_click',
+  'computer.scroll', 'computer.drag', 'computer.use',
+]);
+const KEYBOARD_TOOL_NAMES = new Set([
+  'computer.type', 'computer.press_key', 'computer.hotkey', 'computer.key_down', 'computer.key_up',
+  'computer.copy', 'computer.paste', 'computer.select_all', 'computer.use',
+]);
+// Office tools write local files — they ride filesystem.write (default-deny
+// browser-side) exactly like the other fs mutations, granted session-scoped
+// when the user's request explicitly asks for spreadsheet/presentation work.
+const FS_WRITE_TOOL_NAMES = new Set([
+  'spreadsheet.create', 'spreadsheet.generate', 'spreadsheet.edit', 'presentation.create', 'presentation.generate',
+]);
+const FS_READ_TOOL_NAMES = new Set(['spreadsheet.read']);
+
+async function ensureInteractivePermissions(system: AgentSystem, text: string): Promise<void> {
+  const needed = new Set<'mouse.control' | 'keyboard.control' | 'filesystem.write' | 'filesystem.read'>();
+  for (const clause of splitIntoClauses(text)) {
+    const cls = classifyStep(clause);
+    if (!cls) continue;
+    if (MOUSE_TOOL_NAMES.has(cls.toolName)) needed.add('mouse.control');
+    if (KEYBOARD_TOOL_NAMES.has(cls.toolName)) needed.add('keyboard.control');
+    if (FS_WRITE_TOOL_NAMES.has(cls.toolName)) needed.add('filesystem.write');
+    if (FS_READ_TOOL_NAMES.has(cls.toolName)) needed.add('filesystem.read');
+  }
+  if (needed.size === 0) return;
+  const permissions = system.permissions;
+  if (permissions) {
+    for (const p of needed) permissions.grant(p);
+  }
+  // Mirror server-side; best-effort — an unreachable server surfaces as an
+  // honest tool failure at execution time, never as a fake success here. The
+  // mirrorable whitelist only covers the interactive-control domains: the
+  // filesystem domains are already the server-side operator baseline.
+  const mirrorable = [...needed].filter((p) => p === 'mouse.control' || p === 'keyboard.control');
+  if (mirrorable.length === 0) return;
+  try {
+    await fetch('/api/permissions/session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ grant: mirrorable }),
+    });
+  } catch {
+    /* server unreachable — enforcement will fail honestly downstream */
+  }
+}
+
 /** Run a delegated multi-step task and resolve with its honest summary. */
 export async function runAgentTask(system: AgentSystem, text: string): Promise<AgentRunResult> {
+  await ensureInteractivePermissions(system, text);
   const task = await system.core.submit(text);
   return { task, summary: task.summary || '' };
 }
 
-export { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent };
+export { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, isSpreadsheetIntent, isPresentationIntent };

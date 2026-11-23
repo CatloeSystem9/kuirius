@@ -211,8 +211,9 @@ export class ComputerControlService {
     let reidentified = false;
     if (stateIsStale) {
       // Stale-screen protection: capture a fresh observation before clicking.
+      // analyze:'local' — computer use must never send a screenshot online.
       try {
-        searchState = await this.observer.getCurrentState({ maxAgeMs: 0 });
+        searchState = await this.observer.getCurrentState({ maxAgeMs: 0, analyze: 'local' });
         reidentified = true;
       } catch (err) {
         throw mapObserverError(err);
@@ -226,7 +227,7 @@ export class ComputerControlService {
     if (!found && !stateIsStale) {
       // One fresh attempt before giving up.
       try {
-        searchState = await this.observer.getCurrentState({ maxAgeMs: 0 });
+        searchState = await this.observer.getCurrentState({ maxAgeMs: 0, analyze: 'local' });
         reidentified = true;
         found = this.findTargetInState(searchState, input.target ?? {});
       } catch (err) {

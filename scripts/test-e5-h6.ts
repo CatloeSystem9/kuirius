@@ -415,6 +415,7 @@ section('F/G. Crash-restart cross-domain + final bypass sweep');
     '/api/rollback/plan', '/api/rollback/approve', '/api/rollback/decline', '/api/rollback/pending',
     '/api/quarantine/list', '/api/quarantine/scan', '/api/chat', '/api/tts',
     '/api/audio/transcribe', '/api/maps/grounding', '/api/vision/analyze',
+    '/api/screen/understand', // live perception: local WinRT OCR only, per-line SPF screening, rate-capped, no side effects
     '/api/safety/stop/activate', '/api/integrity/status',
   ]);
   const unaccounted = postRoutes.filter((r) => !enforced.includes(r) && !readOnlyAllowed.has(r));

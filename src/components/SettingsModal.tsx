@@ -17,6 +17,7 @@ import {
   Copy,
   CheckCircle2,
   Database,
+  WifiOff,
 } from 'lucide-react';
 import { CompanionSettings, VoiceModel, LanguagePreference } from '../types';
 import { speakKrishaText, stopKrishaSpeech } from '../utils/audio';
@@ -93,6 +94,15 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
     settings.languagePreference || 'auto'
   );
   const [companionNotes, setCompanionNotes] = useState(settings.companionNotes || '');
+  // Offline vision: computer use + agent screen observation stay on-device.
+  const [offlineVision, setOfflineVision] = useState(settings.offlineVision !== false);
+  // Step 4 — Proactive Conversations controls.
+  const [proactiveConversations, setProactiveConversations] = useState(settings.proactiveConversations ?? true);
+  const [proactiveInactivityMinutes, setProactiveInactivityMinutes] = useState(settings.proactiveInactivityMinutes ?? 30);
+  const [proactiveMinIntervalHours, setProactiveMinIntervalHours] = useState(settings.proactiveMinIntervalHours ?? 3);
+  const [proactiveQuietHoursEnabled, setProactiveQuietHoursEnabled] = useState(settings.proactiveQuietHoursEnabled ?? true);
+  const [proactiveQuietHoursStart, setProactiveQuietHoursStart] = useState(settings.proactiveQuietHoursStart ?? 23);
+  const [proactiveQuietHoursEnd, setProactiveQuietHoursEnd] = useState(settings.proactiveQuietHoursEnd ?? 8);
   const [confirmReset, setConfirmReset] = useState(false);
   const [savedSuccess, setSavedSuccess] = useState(false);
   const [isPreviewSpeaking, setIsPreviewSpeaking] = useState(false);
@@ -200,6 +210,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       voiceEngine,
       languagePreference,
       companionNotes: companionNotes.trim(),
+      offlineVision,
+      proactiveConversations,
+      proactiveInactivityMinutes,
+      proactiveMinIntervalHours,
+      proactiveQuietHoursEnabled,
+      proactiveQuietHoursStart,
+      proactiveQuietHoursEnd,
     });
     setSavedSuccess(true);
     setTimeout(() => {
@@ -515,6 +532,123 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
                 </label>
               </div>
+            </div>
+
+            {/* 3a2. Offline Vision — computer use & screen observation stay on-device */}
+            <div className="flex items-center justify-between pt-2 border-t border-blue-900/20">
+              <div>
+                <label className="text-xs font-medium text-blue-200 uppercase tracking-wider flex items-center gap-1.5">
+                  <WifiOff className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Offline Computer Use</span>
+                </label>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  Mouse, keyboard and screen targeting run 100% on your laptop — screenshots are never uploaded while Krix works or investigates. The "look at screen" button reads text with local OCR instead of cloud vision.
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer flex-shrink-0 ml-3">
+                <input
+                  type="checkbox"
+                  checked={offlineVision}
+                  onChange={(e) => setOfflineVision(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+
+            {/* 3b. Proactive Conversations (Step 4) */}
+            <div className="space-y-3 pt-2 border-t border-blue-900/20">
+              <div className="flex items-center justify-between">
+                <div>
+                  <label className="text-xs font-medium text-blue-200 uppercase tracking-wider flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-blue-400" />
+                    <span>Proactive Conversations</span>
+                  </label>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    After long quiet stretches, Krix may occasionally start a short conversation on her own — only when she genuinely has something to say. She stays silent otherwise.
+                  </p>
+                </div>
+                <label className="relative inline-flex items-center cursor-pointer flex-shrink-0 ml-3">
+                  <input
+                    type="checkbox"
+                    checked={proactiveConversations}
+                    onChange={(e) => setProactiveConversations(e.target.checked)}
+                    className="sr-only peer"
+                  />
+                  <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                </label>
+              </div>
+
+              {proactiveConversations && (
+                <div className="space-y-3 pl-1">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                    <label className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-blue-300/70">After silent for</span>
+                      <select
+                        value={proactiveInactivityMinutes}
+                        onChange={(e) => setProactiveInactivityMinutes(Number(e.target.value))}
+                        className="w-full bg-[#070b16] border border-blue-900/30 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500/40 cursor-pointer"
+                      >
+                        {[10, 20, 30, 45, 60, 90, 120].map((m) => (
+                          <option key={m} value={m}>{m} minutes</option>
+                        ))}
+                      </select>
+                    </label>
+                    <label className="space-y-1">
+                      <span className="text-[10px] uppercase tracking-wider text-blue-300/70">At most once every</span>
+                      <select
+                        value={proactiveMinIntervalHours}
+                        onChange={(e) => setProactiveMinIntervalHours(Number(e.target.value))}
+                        className="w-full bg-[#070b16] border border-blue-900/30 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500/40 cursor-pointer"
+                      >
+                        {[1, 2, 3, 6, 12, 24].map((h) => (
+                          <option key={h} value={h}>{h} hour{h > 1 ? 's' : ''}</option>
+                        ))}
+                      </select>
+                    </label>
+                  </div>
+                  <div className="flex items-center justify-between pt-1">
+                    <span className="text-[11px] text-slate-400">Quiet hours (never speaks)</span>
+                    <label className="relative inline-flex items-center cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={proactiveQuietHoursEnabled}
+                        onChange={(e) => setProactiveQuietHoursEnabled(e.target.checked)}
+                        className="sr-only peer"
+                      />
+                      <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+                    </label>
+                  </div>
+                  {proactiveQuietHoursEnabled && (
+                    <div className="grid grid-cols-2 gap-2">
+                      <label className="space-y-1">
+                        <span className="text-[10px] uppercase tracking-wider text-blue-300/70">From (hour)</span>
+                        <select
+                          value={proactiveQuietHoursStart}
+                          onChange={(e) => setProactiveQuietHoursStart(Number(e.target.value))}
+                          className="w-full bg-[#070b16] border border-blue-900/30 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500/40 cursor-pointer"
+                        >
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label className="space-y-1">
+                        <span className="text-[10px] uppercase tracking-wider text-blue-300/70">Until (hour)</span>
+                        <select
+                          value={proactiveQuietHoursEnd}
+                          onChange={(e) => setProactiveQuietHoursEnd(Number(e.target.value))}
+                          className="w-full bg-[#070b16] border border-blue-900/30 rounded-xl px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-blue-500/40 cursor-pointer"
+                        >
+                          {Array.from({ length: 24 }, (_, h) => (
+                            <option key={h} value={h}>{String(h).padStart(2, '0')}:00</option>
+                          ))}
+                        </select>
+                      </label>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
 
             {/* 4. Companion Context Notes */}

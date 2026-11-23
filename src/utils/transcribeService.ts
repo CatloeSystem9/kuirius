@@ -1,5 +1,7 @@
 // Audio Recording and Gemini Transcription Service
 
+import { MUTE_ZERO_LEVEL_FRAMES } from './conversationInactivity';
+
 export interface TranscriptionResult {
   transcript: string;
   model?: string;
@@ -17,9 +19,18 @@ export class AudioRecordingSession {
   private animFrameId: number | null = null;
   private startTime: number = 0;
   private mimeType: string = 'audio/webm';
+  private zeroLevelFrames = 0;
+  private mutedReported = false;
 
   public isRecording: boolean = false;
   public onVolumeChange?: (volume: number) => void;
+  /**
+   * Step 3 — conversational silence detection: detectable microphone mute.
+   * Fires when the capture track reports muted at start or stays at zero
+   * level for ~2.5 s (reuses the existing metering loop — no new timers).
+   * Content-free: carries a reason code only, never audio.
+   */
+  public onMutedDetected?: (reason: 'muted_at_start' | 'zero_level') => void;
 
   async start(): Promise<void> {
     if (typeof window === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
@@ -40,6 +51,14 @@ export class AudioRecordingSession {
     this.audioStream = stream;
     this.audioChunks = [];
     this.startTime = Date.now();
+    this.zeroLevelFrames = 0;
+    this.mutedReported = false;
+
+    // Detectable mute at start (Windows privacy switch / hardware mute).
+    const firstTrack = stream.getAudioTracks()[0];
+    if (firstTrack && firstTrack.muted) {
+      this.onMutedDetected?.('muted_at_start');
+    }
 
     // Determine supported mimeType
     const mimeTypes = [
@@ -94,6 +113,17 @@ export class AudioRecordingSession {
           const avg = sum / dataArray.length;
           const normalized = Math.min(1, avg / 128);
           this.onVolumeChange?.(normalized);
+          // Step 3: sustained zero level while recording ⇒ detectable mute
+          // (once per session; reuses this existing loop — no new timers).
+          if (normalized <= 0.001) {
+            this.zeroLevelFrames += 1;
+            if (!this.mutedReported && this.zeroLevelFrames >= MUTE_ZERO_LEVEL_FRAMES) {
+              this.mutedReported = true;
+              this.onMutedDetected?.('zero_level');
+            }
+          } else {
+            this.zeroLevelFrames = 0;
+          }
           this.animFrameId = requestAnimationFrame(checkVolume);
         };
         checkVolume();

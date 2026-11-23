@@ -2788,45 +2788,118 @@ Phase D; same-user ceiling; transient burst DEGRADED (self-heals); no UI.
 
 ## 39. Security System Phase D — Threat Containment
 
-**Status:** implemented and verified (report: `SECURITY-SYSTEM-PHASE-C1-REPORT.md`).
+**Status:** implemented, PID-reuse-corrected (Phase D.3), and verified
+(reports: `SECURITY-SYSTEM-PHASE-D-REPORT.md`, `-D1-`, `-D2-`, `-D3-`).
 **Boundary:** narrowly scoped defensive containment — terminates a single,
 identity-verified, confirmed-malicious process instance after operator
 approval. No broad kill, no name-based matching, no process-tree termination,
 no automatic termination without approval, no quarantine.
 
-**Identity verification (before any containment action):**
-1. WMI `Win32_Process` query by PID → process must still exist
-2. Creation time must match the evidence (PID-reuse guard)
-3. Executable path must match the evidence
-4. Process name must match the evidence
-Any mismatch → REFUSED (never terminate a different process)
+**Process-instance pinning (Phase D.3 — PID-reuse correction):**
+termination binds to a process-INSTANCE reference, never to a PID.
+`OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION)` is
+acquired once at verification time; identity (creation time via
+`GetProcessTimes`, image path via `QueryFullProcessImageName`) is read
+THROUGH the retained handle; `TerminateProcess` acts on the same handle.
+A handle refers to the kernel process OBJECT — if the process exits and
+Windows reuses its PID, the handle still refers to the original object, so
+the termination signal can never follow PID reuse. Documented Win32 APIs
+under the same non-admin, same-user envelope taskkill required; no driver,
+no security-setting changes, no `taskkill` fallback anywhere. Where a
+terminate-capable reference cannot be opened (elevated/protected processes)
+the outcome is `IDENTITY_NOT_GUARANTEED` — fail-closed, never PID-based.
+Transport: one PowerShell worker per pin (`-EncodedCommand`; the
+`-Command -` stdin REPL is unusable for stdin-reading workers — its host
+reader competes with `[Console]::In.ReadLine()`), bounded timeouts on every
+wait, release guaranteed on every path (`finally`).
 
-**Evidence requirements:** CONFIRMED_MALWARE classification from Phase B,
-fresh (<24 h from assessment), non-ambiguous path matching, operator
-approval token. SUSPICIOUS/UNKNOWN/CLEAN are never terminated.
+**Identity verification (all through the pin):**
+1. Pin acquisition → process must still exist (`ALREADY_EXITED` otherwise)
+2. Creation time must match the approved instance (`REFUSED_PID_REUSED`)
+3. Executable path must match the approved identity (`REFUSED_IDENTITY_CHANGED`)
+4. Process name must match the approved identity (`REFUSED_IDENTITY_CHANGED`)
+5. Metadata must be readable through the pin — empty path/creation time is
+   ambiguous and fails closed (`REFUSED_IDENTITY_CHANGED`)
+6. Pinned name checked against the protected-process set (authoritative)
+
+**Authorization (Phase D.3 — server-side only):**
+- Approval tokens are minted ONLY by `ThreatContainment.issueApproval(pid)`:
+  the server reads the process identity through an OS reference, classifies
+  the executable via the Phase B engine, and issues a single-use,
+  5-minute-TTL, 24-byte-random token bound to the exact process identity
+  `{pid, creationTime, executablePath, name}`. Only CONFIRMED_MALWARE is
+  approvable (SUSPICIOUS/UNKNOWN/CLEAN/HIGH_CONFIDENCE_THREAT never).
+- `contain()` validates the token against the PINNED identity (never against
+  client data) and consumes it single-use; binding mismatches consume the
+  token. Registry pre-checks reject unknown/expired tokens BEFORE any process
+  probing (no existence oracle for unauthorized callers).
+- The HTTP request shape carries ONLY `{pid, approvalToken}` — classification
+  and identity are established server-side; the Phase D.2 client-supplied
+  shape is rejected (400).
+- Routes: `POST /api/containment/approve` and `POST /api/containment/contain`
+  — both require the `application.launch` server permission, both are
+  stop-blocked (423) and rate-limited (10/min each, separate groups). No
+  agent tool reaches containment; no alternate route exists (suite-asserted
+  404).
+- The containment module classifies via an injected Phase B dependency — the
+  classifier has no containment capability and cannot approve its own action.
+
+**Approval authority (Phase D.4 + Phase D completion — permission is NOT an
+operator decision; the credential IS):**
+Source inspection established that this architecture has NO authenticated
+operator identity, and approval surfaces are separated from the model only by
+the browser-side gate and architectural discipline (disclosed as unenforceable
+against a raw same-user caller). Correction in two stages:
+
+1. **Phase D.4**: containment gained an independent `verifyApprovalAuthority`
+   dependency and termination was DISABLED (`APPROVAL_AUTHORITY_UNAVAILABLE`)
+   until a genuine authority existed.
+2. **Phase D completion**: the authority became REAL — the operator enrolls a
+   dedicated **containment approval credential** through the recovery pipe
+   (`set-containment-credential` / `clear-containment-credential`; a channel
+   with no model/tool path). The credential is a dedicated operator secret
+   stored in the protected E5 store (`containment-approval.json`, scrypt +
+   timing-safe compare + integrity self-hash — the same primitives as the
+   stop state), deliberately SEPARATE from the episode-scoped recovery
+   credential (which exists only during an active stop episode and is cleared
+   on activation/recovery). Approval requires the credential to verify
+   server-side — THE human decision moment; a server-generated token is never
+   mistaken for it because a token can only be minted AFTER verification.
+   Tokens remain single-use, 5-minute TTL, bound to the exact pinned process
+   identity, and carry the **authority epoch** (bumped on every enrollment
+   change): termination re-checks the epoch immediately before terminating,
+   so a credential cleared or re-enrolled mid-operation refuses the
+   termination. Failed approval verifications share an exponential backoff
+   (no brute-force oracle); clearing the enrollment resets pacing and restores
+   the D.4 disabled posture. `application.launch` remains a capability grant,
+   never proof of an operator decision. The disclosed same-user OS boundary
+   applies to the enrollment channel exactly as it applies to the recovery
+   credential itself; the defended threat is agent self-authorization, not
+   same-user malware (which can terminate processes directly without Krisha).
+   Related finding (documented, unchanged — Phase C scope): the exec-gate
+   launch approval shares the self-service property; its durable value is the
+   non-overridable CONFIRMED_MALWARE block.
+
+**Evidence requirements:** server-side Phase B classification of the pinned
+executable, re-verified at containment time (fail-closed on assessment
+failure; a downgrade between approval and containment refuses), fresh
+(<24 h from the server's own assessment).
 
 **Protected processes:** `lsass.exe`, `winlogon.exe`, `svchost.exe`,
-`MsMpEng.exe`, `explorer.exe`, and other critical Windows processes are
-refused unconditionally.
+`MsMpEng.exe`, `explorer.exe`, `node.exe`, `powershell.exe`, and other
+critical processes are refused unconditionally (checked at approval AND at
+containment against the pinned name).
 
-**Authorization:** operator approval token (single-use) + `threat.contain`
-permission (server-side enforced) + E-stop check + E5 audit. No automatic
-containment without operator approval.
+**Termination:** `TerminateProcess` on the pinned handle (same-user,
+non-admin). Access-denied / still-running reported honestly (`ACCESS_DENIED`);
+uncertain outcomes are `VERIFICATION_UNAVAILABLE` — never reported as
+success; post-termination verification runs through the SAME pin (exited →
+`TERMINATED`; exited without successful termination → `ALREADY_EXITED`).
 
-**Termination:** `taskkill /PID <pid> /F` (same-user, non-admin). Access-
-denied conditions reported honestly. Post-termination verification confirms
-the process actually exited.
+**Audit:** `threat_containment` events in the E5 chain — requestId, outcome,
+reason, PID/name/creation time, classification, confidence, evidence
+sources, evidence age, E-stop state, authorization result, termination
+eligibility/attempt/result, post-verification result, token presence.
+Metadata only: no token values, no executable paths, no secrets.
 
-**Audit:** `threat_containment` events in the E5 chain (outcome, reason,
-PID, name, creation time, classification, confidence, evidence sources,
-approval status — metadata only, no secrets).
-
-**Tests:** `scripts/test-containment.ts` — 25 assertions, 0 failed. Covers:
-identity verification, PID reuse, identity change, already-exited,
-classification requirements, stale evidence, E-stop, missing approval,
-protected processes, access denied, concurrent requests, audit privacy,
-evidence freshness boundary.
-
-**Known limitations:** same-user ceiling; elevated/SYSTEM processes are
-out of reach; TOCTOU residual window; WMI WITHIN-1 granularity for
-short-lived processes; no automatic containment without operator approval.
+**Tests:** `scripts/test-containment.ts` - 142 assertions, 0 failed (Phase D completion). Covers: the credential-backed production authority end-to-end (enrollment gating, wrong-credential denial, epoch-staleness mid-operation refusal, cleared-authority fail-closed, re-enrollment restore), the E5 credential machinery (set/verify/clear/backoff/epoch on an isolated store), the full D.3 machinery (pinning, PID-reuse refusal, identity changes, ambiguous identity, IDENTITY_NOT_GUARANTEED, pin infrastructure failures, client-label injection ignored, classification downgrade, stale evidence, E-stop at entry/after-approval/pre-termination/concurrent, honest termination outcomes, single-use under concurrency, bounded token registry, audit correctness + metadata privacy), a real pin-worker smoke test (self-pin, read-only), and production-route runtime tests on an isolated store including credential enrollment through the spawned server's own recovery pipe (wrong credential denied; correct credential proceeds to identity read; benign-process approval refused by server-side classification; clearing restores the disabled posture).**Known limitations:** same-user ceiling (elevated/SYSTEM processes cannot be pinned -> IDENTITY_NOT_GUARANTEED); the approval credential defends against AGENT self-authorization - a same-user process can reach the enrollment pipe exactly as it can reach the recovery credential (the disclosed OS boundary; such a process can terminate processes directly without Krisha); containment approval requires operator enrollment - before `set-containment-credential` the D.4 disabled posture holds; permission-based (not identity-based) authorization throughout the Phase 18 doctrine; a malicious process could exit naturally before termination (reported honestly); tokens are consumed on any post-validation refusal (a refused containment requires fresh approval - deliberate fail-closed posture); WMI WITHIN-1 detection granularity for short-lived processes (Phase A); the E5 M1 recovery-pipe tests cannot run concurrently with the live app unless each process binds its own transport (fixed for all suites via KRISHA_RECOVERY_PIPE_PATH isolation).

@@ -1,2 +1,8 @@
 export * from './containmentTypes';
-export { ThreatContainment, defaultVerifyProcess, defaultTerminate, type ContainmentDependencies } from './containment';
+export {
+  ThreatContainment,
+  defaultPinProcess,
+  defaultReadProcessIdentity,
+  createCredentialApprovalAuthority,
+  type CredentialAuthoritySources,
+} from './containment';

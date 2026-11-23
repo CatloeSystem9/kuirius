@@ -60,7 +60,24 @@ import {
 } from './utils/fileSystemAccess';
 import { KrishaAvatar, VideoAnimationPose } from './components/KrishaAvatar';
 import { KrixAvatar, startKrixAudioAnalysis, stopKrixAudioAnalysis } from './components/KrixAvatar3D';
-import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, type AgentSystem } from './agent/bridge';
+import { createAgentSystem, runAgentTask, isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, isSpreadsheetIntent, isPresentationIntent, type AgentSystem } from './agent/bridge';
+import { getIdentityService } from './agent/identity';
+import { getRuntimeWatchdog } from './utils/runtimeWatchdog';
+import {
+  applyWatchdogEventToInactivity,
+  getConversationInactivityTracker,
+  type InactivityTransition,
+} from './utils/conversationInactivity';
+import { setVoiceOutputActivityListener } from './utils/audio';
+import { getConversationTurnManager } from './utils/conversationTurnManager';
+import { getCameraVisionService, deliverWhenNotSpeaking, type CameraStatus } from './utils/cameraVision';
+import { CameraVisionPanel } from './components/CameraVisionPanel';
+import type { WakeWordDiagnosticKind } from './utils/wakeWordListener';
+import {
+  getProactiveConversationService,
+  proactiveSettingsFromCompanion,
+  type ProactiveMessage,
+} from './utils/proactiveConversation';
 import { spfScreenItem } from './agent/spf/index';
 import { getMemoryService } from './agent/memory/memoryService';
 import { attachMemoryToSystem } from './agent/memory/memoryBridge';
@@ -274,6 +291,23 @@ export default function App() {
   // keep the original inline flow below. UI components are untouched — the
   // agent surfaces its results through the same action cards / modals.
   const agentSystemRef = useRef<AgentSystem | null>(null);
+  // Step 4: always-current values for the proactive service (created once in
+  // the boot effect; callbacks read these refs so nothing goes stale).
+  const settingsRef = useRef(settings);
+  settingsRef.current = settings;
+  const isSpeakingRef = useRef(false);
+  isSpeakingRef.current = isSpeaking;
+  const activeConvoIdRef = useRef<string | null>(activeConvoId);
+  activeConvoIdRef.current = activeConvoId;
+  const conversationsRef = useRef(conversations);
+  conversationsRef.current = conversations;
+  const proactiveServiceRef = useRef<ReturnType<typeof getProactiveConversationService> | null>(null);
+  // Step 6 — Camera Vision state (explicit user control only; the service
+  // never starts the camera on its own).
+  const [cameraStatus, setCameraStatus] = useState<CameraStatus>('inactive');
+  const [cameraAsking, setCameraAsking] = useState(false);
+  const cameraVisionUnsubsRef = useRef<Array<() => void>>([]);
+  const cameraVideoRef = useRef<HTMLVideoElement | null>(null);
 
   // ---- Action Transparency: live activity stream above the composer ----
   // One feed instance for the session; sentences come from REAL events only
@@ -353,6 +387,14 @@ export default function App() {
   );
 
   useEffect(() => {
+    // Persistent Identity Foundation (Step 1): restore Krix's identity during
+    // application startup — validated load from storage (create-once if
+    // missing, corruption-safe recovery otherwise). The identity is then sent
+    // with every /api/chat request so any model/provider serves the SAME Krix.
+    const identityService = getIdentityService();
+    if (identityService.lastLoad.status !== 'stored') {
+      console.info(`[identity] ${identityService.lastLoad.status} (${identityService.getIdentityId()})`);
+    }
     const system = createAgentSystem({
       applyWebAction: (action) => setActiveWebAction(action),
       applyAppAction: (action) => setActiveAppAction(action),
@@ -371,6 +413,212 @@ export default function App() {
     });
     const memoryAttachment = attachMemoryToSystem(system, getMemoryService());
     agentSystemRef.current = system;
+    // Offline vision (user setting, default ON): the observer downgrades any
+    // cloud analysis request to the local provider, so computer use, screen
+    // targeting and agent observation never upload a screenshot. The observer
+    // already starts offline; this syncs explicit user changes immediately.
+    system.screenObserver?.setOfflineVision(settings.offlineVision !== false);
+    // Background Runtime (Step 1 — lid-closed operation): a bounded,
+    // visibility-aware watchdog keeps the runtime observable while the window
+    // is hidden or the lid is closed (Windows "Do nothing"). It only DETECTS
+    // server loss, restore, and system sleep/wake — recovery is delegated
+    // here: honest activity-feed notes, and a fail-closed E5 stop-state
+    // re-check when the server comes back (a restarted server process may
+    // carry a different stop state than the page assumed at boot).
+    const watchdog = getRuntimeWatchdog();
+    // Conversational silence detection (Step 3): a content-free inactivity
+    // tracker fed by real conversational signals — matched wake words, sent
+    // messages/transcriptions, Krix's replies. Failures (mic loss, permission,
+    // audio service) and system suspension are classified separately from
+    // ordinary silence; sleep time is excluded from the inactivity duration.
+    const inactivityTracker = getConversationInactivityTracker();
+    const detachInactivity = inactivityTracker.subscribe((transition: InactivityTransition) => {
+      // Step 5: the live-continuity window follows Step 3 exactly — while the
+      // conversation is active, voice follow-ups need no wake word; the moment
+      // the tracker leaves active_conversation, the window closes.
+      if (transition.to !== 'active_conversation') {
+        turnManager.setLiveContinuity(false);
+      }
+      // Only failure/suspension transitions surface in the feed — ordinary
+      // silence transitions stay observable via the tracker's diagnostics.
+      if (transition.to === 'microphone_unavailable') {
+        activityFeedRef.current?.push('Microphone unavailable — voice detection paused.', 'error', { sticky: true, key: 'voice:mic' });
+      } else if (transition.to === 'microphone_permission_denied') {
+        activityFeedRef.current?.push('Microphone muted or permission denied — voice detection paused.', 'error', { sticky: true, key: 'voice:mic' });
+      } else if (transition.to === 'audio_service_unavailable') {
+        activityFeedRef.current?.push('Voice recognition service unavailable — voice detection paused.', 'error', { sticky: true, key: 'voice:mic' });
+      } else if (transition.to === 'system_suspended') {
+        activityFeedRef.current?.push('System suspended — conversation paused.', 'info');
+      } else if (transition.from === 'system_suspended') {
+        activityFeedRef.current?.resolve('voice:mic');
+        activityFeedRef.current?.push('Krix resumed after sleep — conversation state restored.', 'info');
+      } else if (transition.from === 'microphone_unavailable' || transition.from === 'microphone_permission_denied' || transition.from === 'audio_service_unavailable') {
+        activityFeedRef.current?.resolve('voice:mic');
+        activityFeedRef.current?.push('Microphone detection restored.', 'success');
+      }
+    });
+    // Live Conversation Continuity (Step 5): ONE turn lifecycle over the
+    // existing surfaces — the turn manager observes playback start/end via
+    // the Step 2 listener, marks in-flight work stale from Step 1 watchdog
+    // events, and opens the no-wake-word continuity window for voice turns
+    // while Step 3 still reports an active conversation.
+    const turnManager = getConversationTurnManager({
+      stopPlayback: () => stopKrishaSpeech(), // the EXISTING pipeline stop
+    });
+    const detachTurnPhases = turnManager.subscribe((phase) => {
+      if (phase === 'processing') {
+        activityFeedRef.current?.push('Thinking…', 'running', { sticky: true, key: 'turn:live' });
+      } else if (phase === 'speaking') {
+        activityFeedRef.current?.resolve('turn:live');
+      } else if (phase === 'idle') {
+        activityFeedRef.current?.resolve('turn:live');
+      }
+    });
+    setVoiceOutputActivityListener((started) => {
+      // Krix actually speaking is meaningful conversational activity.
+      if (started) inactivityTracker.notifyActivity('krix_reply');
+      // Step 5: playback start/end drives the speaking phase of the live turn.
+      if (started) turnManager.notifySpeechStarted();
+      else turnManager.notifySpeechEnded();
+    });
+    // Proactive Conversations (Step 4): ONE occasional, contextually chosen
+    // message after sustained inactivity. Generation rides the existing chat
+    // intelligence (/api/proactive/generate — same identity/persona/memory
+    // pipeline, [SILENT] is a first-class outcome); delivery rides the Step 2
+    // voice pipeline. Cancellation is immediate on any user interaction, and
+    // the final eligibility gate runs again right before playback.
+    const proactiveService = getProactiveConversationService({
+      tracker: inactivityTracker,
+      getSettings: () => proactiveSettingsFromCompanion(settingsRef.current),
+      isVoiceEnabled: () => settingsRef.current.voiceEnabled,
+      isSpeaking: () => isSpeakingRef.current,
+      serverAvailable: () => watchdog.getStatus().serverAvailable,
+      generate: async ({ inactivityMinutes, signal }) => {
+        const s = settingsRef.current;
+        const convo =
+          conversationsRef.current.find((c) => c.id === activeConvoIdRef.current) ||
+          conversationsRef.current[0];
+        const history = (convo?.messages || []).slice(-16).map((m) => ({ role: m.role, content: m.content }));
+        const seed = [...history].reverse().find((m) => m.role === 'user')?.content || history[history.length - 1]?.content || '';
+        const res = await fetch('/api/proactive/generate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal,
+          body: JSON.stringify({
+            messages: history,
+            memories: getMemoryService().recall(seed, { limit: 6 }).map((m) => m.content),
+            userName: s.userName,
+            companionNotes: s.companionNotes,
+            languagePreference: s.languagePreference || 'auto',
+            identity: getIdentityService().getTransportPayload(),
+            inactivityMinutes,
+          }),
+        });
+        if (!res.ok) return { silent: true };
+        const data = await res.json();
+        if (data?.silent) return { silent: true };
+        const message: ProactiveMessage = {
+          text: String(data.reply || '').trim(),
+          expression: String(data.expression || 'gentle_smile'),
+          emotionData: {
+            expression: String(data.emotionData?.expression || 'gentle_smile'),
+            intensity: Number(data.emotionData?.intensity ?? 0.75),
+            gesture: String(data.emotionData?.gesture || 'none'),
+            blushLevel: Number(data.emotionData?.blushLevel ?? 0.2),
+          },
+        };
+        if (!message.text) return { silent: true };
+        return { silent: false, message };
+      },
+      deliver: (message, _ctx) => {
+        // Add the message to the ACTIVE conversation as a real model message
+        // (truthful history — nothing fabricated) and speak through the
+        // Step 2 pipeline with the user's existing voice settings.
+        const botMsg: Message = {
+          id: 'msg_' + (Date.now() + 2),
+          role: 'model',
+          content: message.text,
+          timestamp: Date.now(),
+          expression: normalizeExpression(message.expression),
+          emotionData: {
+            ...message.emotionData,
+            expression: normalizeExpression(message.expression),
+            sentiment: 'neutral',
+          } as EmotionAnalysis,
+        };
+        setConversations((prev) => {
+          const target =
+            prev.find((c) => c.id === activeConvoIdRef.current) || prev[0];
+          if (!target) return prev;
+          const updated = {
+            ...target,
+            updatedAt: Date.now(),
+            messages: [...target.messages, botMsg],
+          };
+          const next = prev.map((c) => (c.id === updated.id ? updated : c));
+          saveStoredConversations(next);
+          return next;
+        });
+        setExpression(normalizeExpression(message.expression));
+        setEmotionData({
+          ...message.emotionData,
+          expression: normalizeExpression(message.expression),
+          sentiment: 'neutral',
+        } as EmotionAnalysis);
+        setLastSpokenText(message.text);
+        const s = settingsRef.current;
+        if (s.voiceEnabled) {
+          speakKrishaText(
+            message.text,
+            s.voiceName || 'Aoede',
+            s.voiceSpeed,
+            () => setIsSpeaking(true),
+            () => setIsSpeaking(false),
+            undefined,
+            s.languagePreference || 'auto',
+            s.voicePitch ?? 1.0,
+            s.voiceEngine || 'auto'
+          );
+        }
+      },
+    });
+    proactiveServiceRef.current = proactiveService;
+    const detachWatchdog = watchdog.subscribe((event) => {
+      // Step 3: suspension awareness rides the Step 1 watchdog signal.
+      applyWatchdogEventToInactivity(inactivityTracker, event);
+      // Step 4: stale/dropped proactive state after sleep or server loss.
+      proactiveService.notifyWatchdogEvent(event);
+      // Step 5: in-flight live turns become stale after sleep/server loss —
+      // never replayed, never completed-fabricated.
+      turnManager.notifyWatchdogEvent(event);
+      switch (event.kind) {
+        case 'server_lost':
+          activityFeedRef.current?.push('Krix server unreachable — background runtime is paused until it returns.', 'error', { sticky: true, key: 'runtime:server' });
+          break;
+        case 'server_restored':
+          activityFeedRef.current?.resolve('runtime:server');
+          activityFeedRef.current?.push(
+            event.downtimeMs && event.downtimeMs > 0
+              ? `Krix server connection restored (was down ${Math.round(event.downtimeMs / 1000)}s).`
+              : 'Krix server connection restored.',
+            'success'
+          );
+          // The server may have been RESTARTED — re-check the authoritative
+          // E5 stop state instead of trusting the page's boot-time snapshot.
+          void refreshEmergencyStop();
+          break;
+        case 'system_resumed':
+          activityFeedRef.current?.push('Krix runtime resumed after system sleep.', 'info');
+          break;
+        case 'network_offline':
+          activityFeedRef.current?.push('Network offline — cloud features pause until it returns.', 'error', { sticky: true, key: 'runtime:network' });
+          break;
+        case 'network_online':
+          activityFeedRef.current?.resolve('runtime:network');
+          break;
+      }
+    });
+    watchdog.start();
     // Action Transparency: feed the stream from the real event bus.
     const feed = activityFeedRef.current!;
     const detachActivityBus = attachActivityFeedToSystem(feed, system.bus);
@@ -381,7 +629,15 @@ export default function App() {
     return () => {
       unsubscribeFeed();
       detachActivityBus();
+      detachWatchdog();
+      watchdog.stop();
+      detachInactivity();
+      detachTurnPhases();
+      proactiveServiceRef.current?.detach();
+      proactiveServiceRef.current = null;
+      setVoiceOutputActivityListener(null);
       memoryAttachment.detach();
+      system.liveWatcher?.dispose();
       system.screenObserver?.stop();
       system.keyboardControl?.releaseAll().catch(() => undefined);
       system.core.cancelAll();
@@ -501,6 +757,9 @@ export default function App() {
   const handleSaveSettings = (newSettings: CompanionSettings) => {
     setSettings(newSettings);
     saveStoredSettings(newSettings);
+    // Offline vision toggles take effect immediately — the observer downgrades
+    // or re-allows cloud analysis requests without any restart.
+    agentSystemRef.current?.screenObserver?.setOfflineVision(newSettings.offlineVision !== false);
   };
 
   const handleAddMemory = (newMemory: string) => {
@@ -540,6 +799,9 @@ export default function App() {
   };
 
   const handleNewConversation = () => {
+    // Step 3: the user explicitly ended the current conversation — the
+    // inactivity state records that honestly instead of plain silence.
+    getConversationInactivityTracker().markConversationEnded();
     const newId = 'convo_' + Date.now();
     const welcomeText = `Hi ${settings.userName || 'you'}. I'm right here with you. What's on your mind?`;
     const emotion = analyzeSentimentAndKeywords(welcomeText);
@@ -713,25 +975,68 @@ export default function App() {
         customPrompt ||
         'Read and visually inspect this screen. Describe the application, window title, all visible and legible text, key buttons, and any errors or notable content factual and clearly.';
 
+      // Offline vision (default ON): local pixel analysis + the on-device OCR
+      // route — the screenshot never leaves the machine. Cloud vision runs
+      // only when the user explicitly turns Offline Computer Use off.
+      const offlineVision = settings.offlineVision !== false;
       const state = await observer.getCurrentState({
-        analyze: 'cloud',
-        question: promptQuestion,
+        analyze: offlineVision ? 'local' : 'cloud',
+        question: offlineVision ? undefined : promptQuestion,
       });
 
-      const snapshotUrl = state.snapshotRef ? observer.getSnapshot(state.snapshotRef) : undefined;
       // SPF EP-12 — screen-derived content is sanitized BEFORE it becomes a
       // chat message (which persists to localStorage and feeds the cloud chat
       // request). Local display keeps working; secrets never persist.
       const spfCleanScreenText = (value: string): string =>
         spfScreenItem(value, 'local:screen-vision-message', state.id, 'summary').text;
+
+      let summary = spfCleanScreenText(state.analysis.summary ?? '');
+      let texts = (state.analysis.texts || []).map((t) => ({ ...t, text: spfCleanScreenText(t.text) }));
+      let textSummary = texts.map((t) => t.text).filter(Boolean).join(' • ');
+
+      if (offlineVision && state.snapshotRef) {
+        // On-device OCR through /api/screen/understand (local PowerShell OCR
+        // worker, SPF-screened) — real text extraction with zero upload.
+        try {
+          const dataUrl = observer.getSnapshot(state.snapshotRef);
+          if (dataUrl) {
+            const res = await fetch('/api/screen/understand', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                image: dataUrl,
+                activeWindowTitle: state.activeWindow?.available ? state.activeWindow.title : undefined,
+              }),
+            });
+            const body = await res.json();
+            if (body?.success && Array.isArray(body.result?.lines) && body.result.lines.length > 0) {
+              const ocrLines = body.result.lines
+                .slice(0, 40)
+                .map((l: { t?: string }) => spfScreenItem(String(l.t ?? ''), 'local:screen-vision-ocr', state.id, 'digest').text)
+                .filter(Boolean);
+              if (ocrLines.length > 0) {
+                texts = ocrLines.map((t: string) => ({ text: t, confidence: 0.8 }));
+                textSummary = ocrLines.join(' • ');
+                summary =
+                  `Read your screen with local OCR (${ocrLines.length} visible lines) — nothing was uploaded. ` +
+                  `Active window: ${state.activeWindow?.available ? state.activeWindow.title : 'unknown'}.`;
+              }
+            }
+          }
+        } catch {
+          // OCR unavailable — keep the local pixel-analysis summary honestly.
+        }
+      }
+
+      const snapshotUrl = state.snapshotRef ? observer.getSnapshot(state.snapshotRef) : undefined;
       const actionData: ScreenVisionAction = {
         type: 'observe',
         question: customPrompt,
-        summary: spfCleanScreenText(state.analysis.summary ?? ''),
+        summary,
         application: state.analysis.application || state.activeWindow?.title || 'Desktop / Browser Screen',
         activeWindowTitle: state.activeWindow?.title,
-        textSummary: state.analysis.texts?.map((t) => t.text).filter(Boolean).join(' • '),
-        texts: (state.analysis.texts || []).map((t) => ({ ...t, text: spfCleanScreenText(t.text) })),
+        textSummary,
+        texts,
         elements: state.analysis.elements || [],
         dialogs: state.analysis.dialogs?.map((d) => ({ ...d, text: d.text ? spfCleanScreenText(d.text) : d.text })),
         errors: (state.analysis.errors || []).map(spfCleanScreenText),
@@ -739,9 +1044,6 @@ export default function App() {
         snapshotUrl,
         timestamp: state.timestamp,
       };
-      actionData.textSummary = actionData.textSummary
-        ? spfCleanScreenText(actionData.textSummary)
-        : undefined;
 
       setActiveScreenVisionAction(actionData);
       setExpression('happy_sparkle');
@@ -791,6 +1093,147 @@ export default function App() {
       setIsLoading(false);
     }
   };
+
+  // -------------------------------------------------------------------
+  // Step 6 — Camera Vision: ONE authorized frame → structured perception →
+  // in-character reply through the EXISTING voice pipeline. The camera is
+  // only ever active through the explicit user control; every reply here is
+  // grounded in the perception result (observations vs interpretations vs
+  // uncertainties are labeled honestly). Delivery is deferred while Krix is
+  // speaking so visual analysis never interrupts active speech.
+  // -------------------------------------------------------------------
+  const deliverVisionReply = (text: string, expression: AvatarExpression = 'gentle_smile') => {
+    // Step 6: NEVER interrupt active speech — while Krix is speaking the
+    // visual reply is deferred until the current playback finishes.
+    const deliver = () => {
+      const botMsg: Message = {
+      id: 'msg_' + (Date.now() + 3),
+      role: 'model',
+      content: text,
+      timestamp: Date.now(),
+      expression,
+      emotionData: {
+        expression,
+        intensity: 0.7,
+        gesture: 'none',
+        blushLevel: 0.2,
+        sentiment: 'neutral',
+      } as EmotionAnalysis,
+    };
+    setConversations((prev) => {
+      const active = prev.find((c) => c.id === activeConvoIdRef.current) || prev[0];
+      if (!active) return prev;
+      const next = prev.map((c) => (c.id === active.id ? { ...c, updatedAt: Date.now(), messages: [...c.messages, botMsg] } : c));
+      saveStoredConversations(next);
+      return next;
+    });
+    setExpression(expression);
+    setLastSpokenText(text);
+    const s = settingsRef.current;
+    if (s.voiceEnabled) {
+      speakKrishaText(
+        text,
+        s.voiceName || 'Aoede',
+        s.voiceSpeed,
+        () => setIsSpeaking(true),
+        () => setIsSpeaking(false),
+        undefined,
+        s.languagePreference || 'auto',
+        s.voicePitch ?? 1.0,
+        s.voiceEngine || 'auto'
+      );
+    }
+    };
+    // Deferred delivery while Krix is speaking (Step 6 requirement) — the
+    // reply is spoken the moment the current playback finishes.
+    deliverWhenNotSpeaking(getConversationTurnManager(), deliver, cameraVisionUnsubsRef.current);
+  };
+
+  const handleCameraVision = async (userQuestion?: string) => {
+    const svc = getCameraVisionService();
+    setIsLoading(true);
+    try {
+      // Camera must be explicitly active; starting it is itself a user-visible
+      // authorization (the panel + indicator appear).
+      if (svc.getStatus() !== 'active') {
+        const start = await svc.start();
+        if (!start.ok) {
+          const reason =
+            start.status === 'permission_denied'
+              ? 'Camera permission was denied, so I cannot look right now. Please allow camera access and try again.'
+              : start.status === 'camera_unavailable'
+              ? 'I could not find an available camera to look through.'
+              : 'My camera could not start right now.';
+          deliverVisionReply(reason, 'thoughtful_gaze');
+          return;
+        }
+      }
+      const result = await svc.analyzeFrame(userQuestion?.slice(0, 200));
+      if (!result.ok || !result.perception) {
+        const reason =
+          result.reason === 'camera_disconnected' || result.reason === 'camera_not_active'
+            ? 'My camera stopped, so I could not see anything just now.'
+            : result.reason === 'network_unavailable'
+            ? 'I captured the frame but the vision service is unreachable right now — please try again in a moment.'
+            : result.reason === 'rate_limited'
+            ? 'I have used my vision budget for this moment — please ask me to look again shortly.'
+            : 'I could not analyze what my camera saw just now.';
+        deliverVisionReply(reason, 'thoughtful_gaze');
+        return;
+      }
+      const p = result.perception;
+      // Honest composition: observations vs interpretations vs uncertainties.
+      const observed = p.objects.slice(0, 4).map((o) => o.label).join(', ');
+      const interpreted = p.activities.slice(0, 2).map((a) => a.label).join(', ');
+      const uncertain = p.uncertainties.slice(0, 2).join(' and ');
+      let reply = p.scene || 'I looked through the camera, but the frame was too unclear to describe.';
+      if (observed) reply += ` I can clearly see ${observed}.`;
+      if (interpreted) reply += ` It looks like ${interpreted}.`;
+      if (p.personPresent === true) reply += ' You seem to be in view.';
+      if (uncertain) reply += ` I am not sure about ${uncertain}, though.`;
+      // Low-confidence honesty: say so rather than presenting guesses as fact.
+      if (p.confidence < 0.45) reply += ' To be honest, the frame was quite unclear, so take that with a grain of salt.';
+      if (userQuestion) reply = `${reply}`;
+      deliverVisionReply(reply, 'happy_sparkle');
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /** Explicit camera control: start (authorization) / immediate stop. */
+  const handleToggleCamera = async () => {
+    const svc = getCameraVisionService();
+    if (cameraStatus === 'active' || cameraStatus === 'starting') {
+      svc.stop(); // immediate shutdown — every track ends, preview clears
+      return;
+    }
+    await svc.start();
+  };
+
+  /** Panel "Ask Krix" — one authorized frame analysis + spoken reply. */
+  const handleCameraAsk = async () => {
+    setCameraAsking(true);
+    try {
+      await handleCameraVision('Describe what you can see right now.');
+    } finally {
+      setCameraAsking(false);
+    }
+  };
+
+  // Camera status subscription + preview binding + cleanup (Step 6).
+  useEffect(() => {
+    const svc = getCameraVisionService();
+    const unsub = svc.subscribe((status) => setCameraStatus(status));
+    setCameraStatus(svc.getStatus());
+    svc.attachPreview(cameraVideoRef.current);
+    return () => {
+      unsub();
+      for (const u of cameraVisionUnsubsRef.current) u();
+      cameraVisionUnsubsRef.current = [];
+      // Application shutdown stops the camera — never left running implicitly.
+      svc.stop();
+    };
+  }, []);
 
   // Execute a multi-step request through the Agent Core and report honestly in chat.
   const runAgentDelegated = async (text: string) => {
@@ -918,6 +1361,14 @@ export default function App() {
   const handleSendMessage = async (text: string, forceMapsGrounding?: boolean) => {
     if (!text.trim() || isLoading) return;
 
+    // Step 5: open (or adopt) the conversational turn — duplicate submissions
+    // are refused while a response is already in flight.
+    const liveTurnId = getConversationTurnManager().beginTurn('text');
+
+    // Step 3: a sent message (typed or wake-word voice command) is meaningful
+    // conversational activity — resets the silence clock.
+    getConversationInactivityTracker().notifyActivity('text_message');
+
     // Goal Continuity v1: observe every message for goal lifecycle statements
     // (create / confirm / complete / pause / resume / abandon). Pure local
     // detection — no I/O, no AI calls, no UI change; it never acts, only
@@ -928,7 +1379,7 @@ export default function App() {
     // Multi-step, screen-observation, mouse-control, keyboard-control,
     // filesystem/application, and deep-research requests run through the agent
     // loop. Other messages keep the original inline chat flow below.
-    if (agentSystemRef.current && (isMultiStepRequest(text) || isScreenIntent(text) || isMouseIntent(text) || isKeyboardIntent(text) || isSystemIntent(text) || isResearchIntent(text))) {
+    if (agentSystemRef.current && (isMultiStepRequest(text) || isScreenIntent(text) || isMouseIntent(text) || isKeyboardIntent(text) || isSystemIntent(text) || isResearchIntent(text) || isSpreadsheetIntent(text) || isPresentationIntent(text))) {
       await runAgentDelegated(text);
       return;
     }
@@ -1446,6 +1897,18 @@ export default function App() {
       return;
     }
 
+    // Step 6 — Camera vision commands: authorized-frame capture + analysis.
+    // Only fires when the camera pathway is involved; screen commands above
+    // keep priority (existing behavior unchanged).
+    const isCameraVisionCommand =
+      /\b(?:look\s+at\s+(?:this|that|it|me|the\s+camera)|what\s+do\s+you\s+see|use\s+your\s+camera|through\s+(?:your|the)\s+camera|camera\s+vision|show\s+me\s+what\s+you\s+(?:can\s+)?see|what\s+(?:am\s+I|is\s+this)\s+(?:holding|showing|doing))\b/i.test(text) &&
+      !/screen/i.test(text);
+
+    if (isCameraVisionCommand) {
+      void handleCameraVision(text);
+      return;
+    }
+
     // -------------------------------------------------------------------
     // Wind information queries (Phase 2): answer "wind speed ..." style
     // questions with real Open-Meteo data. Never estimates; honestly
@@ -1571,6 +2034,10 @@ export default function App() {
           useMapsGrounding: Boolean(forceMapsGrounding),
           languagePreference: settings.languagePreference || 'auto',
           habitsContext: formatHabitContextForPrompt(habits, calendarEvents),
+          // Persistent Identity Foundation (Step 1): the SAME validated
+          // identity rides every chat request — model/provider switches
+          // cannot replace who Krisha is.
+          identity: getIdentityService().getTransportPayload(),
         }),
       });
 
@@ -1693,6 +2160,9 @@ export default function App() {
         .catch((err) => console.warn('Background memory extraction error:', err));
     } catch (err) {
       console.warn('Chat request fallback triggered:', err);
+      // Step 5: a failed response is an honest FAILED turn (never completed);
+      // the conversation stays intact for the next real exchange.
+      if (liveTurnId !== null) getConversationTurnManager().failTurn(liveTurnId);
       activityFeedRef.current?.resolve('chat:reply');
       activityFeedRef.current?.push('The response could not be prepared.', 'error', { sticky: true, key: 'chat:error' });
       const fallbackReply = `I'm right here with you, ${settings.userName || 'you'}. Tell me more.`;
@@ -1765,6 +2235,18 @@ export default function App() {
 
   // Handle Wake-Word "Krisha" / "Hey Krisha" detection
   const handleWakeWordDetected = (res: WakeWordResult) => {
+    // Step 3: a MATCHED wake word is meaningful activity — raw ambient
+    // transcripts never reach this handler, so background noise cannot
+    // reset the inactivity clock.
+    getConversationInactivityTracker().notifyActivity('wake_word');
+    // Step 5: a matched wake word DURING playback is a confirmed barge-in —
+    // stop the current response and accept the new input. Noise alone can
+    // never reach this path (only matched wake patterns do).
+    if (isSpeakingRef.current) {
+      getConversationTurnManager().requestBargeIn();
+    }
+    // Step 5: open the turn (listening); the command submission below adopts it.
+    getConversationTurnManager().beginTurn('wake_word');
     // 1. Play dual-tone crystal chime
     if (settings.voiceEnabled) {
       playWakeChime();
@@ -1830,19 +2312,52 @@ export default function App() {
     if (settings.wakeWordEnabled !== false) {
       wakeWordManager.startListening(
         handleWakeWordDetected,
-        (status) => setWakeWordStatus(status),
+        (status) => {
+          setWakeWordStatus(status);
+          // Step 3: recognition actively listening ⇒ the microphone path works.
+          if (status === 'listening') {
+            getConversationInactivityTracker().resolveMicIssue();
+          }
+        },
         (transcript) => setLiveTranscript(transcript),
         settings.languagePreference || 'auto'
       );
+      // Step 3: detectable microphone/service failures (content-free kinds).
+      wakeWordManager.setDiagnosticListener((kind: WakeWordDiagnosticKind) => {
+        getConversationInactivityTracker().reportMicIssue(kind);
+      });
+      // Step 5: keep recognition alive during Krix's playback so a MATCHED
+      // wake word can barge in; subscribe to FINAL-only transcripts so live
+      // follow-ups carry real completed speech (never interim noise).
+      wakeWordManager.setBargeInEnabled(true);
+      wakeWordManager.setFinalTranscriptListener((finalText) => {
+        const mgr = getConversationTurnManager();
+        if (!mgr.canAcceptLiveFollowUp(finalText)) return;
+        const followUpId = mgr.beginTurn('voice_followup');
+        if (followUpId !== null) {
+          sendMessageRef.current(finalText.trim());
+        }
+      });
     } else {
       wakeWordManager.stopListening();
+      wakeWordManager.setBargeInEnabled(false);
+      wakeWordManager.setFinalTranscriptListener(null);
       setWakeWordStatus('idle');
     }
 
     return () => {
       wakeWordManager.stopListening();
+      wakeWordManager.setBargeInEnabled(false);
+      wakeWordManager.setFinalTranscriptListener(null);
     };
   }, [settings.wakeWordEnabled, settings.voiceEnabled, settings.voiceName, settings.voiceSpeed, settings.voicePitch, settings.userName, settings.languagePreference]);
+
+  // Proactive Conversations (Step 4): settings changed (e.g. the user disabled
+  // proactive conversations or voice output) — re-evaluate immediately; a
+  // disable also stops any pending or in-flight proactive message at once.
+  useEffect(() => {
+    proactiveServiceRef.current?.onSettingsChanged();
+  }, [settings.proactiveConversations, settings.voiceEnabled, settings.proactiveInactivityMinutes, settings.proactiveMinIntervalHours, settings.proactiveQuietHoursEnabled, settings.proactiveQuietHoursStart, settings.proactiveQuietHoursEnd]);
 
   return (
     <div
@@ -2182,6 +2697,8 @@ export default function App() {
               setInitialAppSearch('');
             }}
             onReadScreen={() => handleReadScreen()}
+            onToggleCamera={() => void handleToggleCamera()}
+            cameraActive={cameraStatus === 'active' || cameraStatus === 'starting'}
             isLoading={isLoading}
             isSpeaking={isSpeaking}
             isLightMode={isWhiteBackground}
@@ -2349,6 +2866,18 @@ export default function App() {
         onClose={() => setActiveModal(null)}
         onSendToChat={(txt) => handleSendMessage(txt)}
         isLightMode={isWhiteBackground}
+      />
+
+      {/* Step 6 — Camera Vision: visible only while the camera is active/starting. */}
+      <CameraVisionPanel
+        status={cameraStatus}
+        onVideoRef={(el) => {
+          cameraVideoRef.current = el;
+          getCameraVisionService().attachPreview(el);
+        }}
+        onStop={() => getCameraVisionService().stop()}
+        onAsk={() => void handleCameraAsk()}
+        asking={cameraAsking}
       />
 
       <ErrorBoundary fallbackTitle="Habits & Calendar Error" onReset={() => setActiveModal(null)}>

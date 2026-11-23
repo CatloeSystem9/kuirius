@@ -147,6 +147,7 @@ section('A. Emergency stop and authorization');
     '/api/app/discover', '/api/app/status',
     '/api/rollback/plan', '/api/rollback/approve', '/api/rollback/decline', '/api/rollback/pending',
     '/api/quarantine/list', '/api/quarantine/scan', '/api/chat', '/api/tts', '/api/audio/transcribe', '/api/maps/grounding', '/api/vision/analyze',
+    '/api/screen/understand', // live perception: local WinRT OCR only, per-line SPF screening, rate-capped, no side effects
     '/api/safety/stop/activate', // designed unauthenticated activation; own rate limit + audit (M1 D3)
   ]);
   const unenforcedMutationRisk = postRoutes.filter((r) => !enforced.includes(r) && !readOnlyAllowed.has(r));

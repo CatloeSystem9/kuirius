@@ -31,6 +31,13 @@ export type AgentEventName =
   | 'ACTIVE_WINDOW_CHANGED'
   | 'SCREEN_ANALYSIS_COMPLETED'
   | 'SCREEN_ANALYSIS_FAILED'
+  // Offline vision guarantee — a cloud analysis request was downgraded to the
+  // local provider (no pixel data left the machine).
+  | 'SCREEN_CLOUD_DOWNGRADED'
+  // Live Screen Perception — lightweight continuous observation (resource-bounded)
+  | 'SCREEN_LIVE_STARTED'
+  | 'SCREEN_LIVE_STOPPED'
+  | 'SCREEN_UNDERSTANDING_UPDATED'
   | 'CURSOR_MOVE_STARTED'
   | 'CURSOR_MOVE_COMPLETED'
   | 'MOUSE_CLICK_STARTED'

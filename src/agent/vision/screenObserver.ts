@@ -52,6 +52,14 @@ export interface ScreenObserverOptions {
   providers?: VisionProvider[];
   /** Capture timeout override (tests use small values). */
   captureTimeoutMs?: number;
+  /**
+   * OFFLINE VISION guarantee (user setting, default ON): when true, every
+   * 'cloud' analysis request is DOWNGRADED to the local provider — no pixel
+   * data ever leaves the machine through the vision stack, whatever a caller
+   * asked for. Targeting/verification for mouse & keyboard control also pins
+   * the local provider explicitly, so computer use is offline by construction.
+   */
+  offlineVision?: boolean;
 }
 
 export class ScreenObserver {
@@ -60,6 +68,7 @@ export class ScreenObserver {
   private permissions: PermissionManager | null;
   private providers: { local: VisionProvider; cloud: VisionProvider };
   private captureTimeoutMs: number;
+  private offlineVision: boolean;
   private lastState: ScreenState | null = null;
   private stateHistory: ScreenState[] = [];
   private lastActiveWindow: ActiveWindowInfo | null = null;
@@ -73,6 +82,7 @@ export class ScreenObserver {
     this.events = options.events ?? null;
     this.permissions = options.permissions ?? null;
     this.captureTimeoutMs = options.captureTimeoutMs ?? CAPTURE_TIMEOUT_MS;
+    this.offlineVision = options.offlineVision ?? true;
     this.providers = {
       local: options.providers?.[0] ?? new LocalPixelVisionProvider(),
       cloud: options.providers?.[1] ?? new GeminiVisionProvider(),
@@ -80,6 +90,15 @@ export class ScreenObserver {
   }
 
   // ------------------------------------------------------------------ modes
+
+  /** Flip the offline guarantee at runtime (bound to the user setting). */
+  setOfflineVision(on: boolean): void {
+    this.offlineVision = on;
+  }
+
+  getOfflineVision(): boolean {
+    return this.offlineVision;
+  }
 
   setMode(mode: ObservationMode): void {
     this.mode = mode;
@@ -136,7 +155,17 @@ export class ScreenObserver {
     const frame = await this.captureFrame();
     const analysisFrame = options.region ? cropFrame(frame, options.region) : frame;
 
-    const useCloud = options.analyze === 'cloud';
+    const requestedCloud = options.analyze === 'cloud';
+    if (requestedCloud && this.offlineVision) {
+      // Offline-vision guarantee: the request wanted the cloud provider, but
+      // no image data may leave the machine. Downgrade honestly and visibly.
+      this.events?.emit({
+        name: 'SCREEN_CLOUD_DOWNGRADED',
+        payload: { reason: 'offline_vision_setting', provider: this.providers.local.name },
+        timestamp: Date.now(),
+      });
+    }
+    const useCloud = requestedCloud && !this.offlineVision;
     const provider = useCloud ? this.providers.cloud : this.providers.local;
     if (!provider.available()) {
       throw new ObserverError('provider_unavailable', `Vision provider "${provider.name}" is unavailable`);

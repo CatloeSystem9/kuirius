@@ -1,0 +1,16 @@
+
+1. Heartbeat cadence + server_ok
+
+2. Hidden-tab cadence (lid-closed proxy)
+
+3. Server loss, bounded backoff, restore
+
+4. Sleep/wake detection
+
+5. Network offline/online signalling
+
+6. Resource discipline
+
+7. Graceful shutdown sequence
+
+35 passed, 0 failed

@@ -410,12 +410,25 @@ export async function appFocus(pid: number): Promise<{ focused: boolean; pid: nu
   const { promisify } = await import('util');
   const execFileAsync = promisify(execFile);
   try {
-    await execFileAsync(
+    // Honest verification (spec §13): AppActivate's return value alone is not
+    // evidence — report focused only when the foreground window's owning
+    // process is the requested PID after the activation attempt.
+    const { stdout } = await execFileAsync(
       'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-Command', `(New-Object -ComObject WScript.Shell).AppActivate(${pid}) | Out-Null`],
+      [
+        '-NoProfile',
+        '-NonInteractive',
+        '-Command',
+        `Add-Type -MemberDefinition '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow(); [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);' -Name FOC -Namespace W3; ` +
+          `[void](New-Object -ComObject WScript.Shell).AppActivate(${pid}); Start-Sleep -Milliseconds 400; ` +
+          `$h=[W3.FOC]::GetForegroundWindow(); $fgPid=[uint32]0; [void][W3.FOC]::GetWindowThreadProcessId($h,[ref]$fgPid); ` +
+          `Write-Output ("FGPID {0}" -f $fgPid)`,
+      ],
       { timeout: 15000, windowsHide: true }
     );
-    return { focused: true, pid };
+    const m = stdout.match(/FGPID (\d+)/);
+    const focused = m ? parseInt(m[1], 10) === pid : false;
+    return { focused, pid };
   } catch {
     return { focused: false, pid };
   }

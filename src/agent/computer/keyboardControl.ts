@@ -141,8 +141,9 @@ export class KeyboardControlService {
     if (expectText) {
       // Expected-text matching needs a full provider analysis (signature-only
       // baselines carry no text), so take a fresh observation.
+      // analyze:'local' — keyboard verification must never upload a screenshot.
       this.checkCancelled(signal);
-      const state = await this.observer.getCurrentState({ maxAgeMs: 0 });
+      const state = await this.observer.getCurrentState({ maxAgeMs: 0, analyze: 'local' });
       const haystack =
         JSON.stringify(state.analysis.texts ?? []) +
         JSON.stringify((state.analysis.elements ?? []).map((e) => e.text ?? ''));

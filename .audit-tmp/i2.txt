@@ -1,0 +1,24 @@
+
+1. Initial identity creation
+
+2. Identity restoration after restart
+
+3. Identity consistency across conversation sessions
+
+4. Identity consistency after AI model switching
+
+5. Identity consistency after provider switching
+
+6. Missing identity recovery
+
+7. Corrupted identity handling
+
+8. Identity schema migration
+
+9. Concurrent initialization protection
+
+Extra. Update immutability + backup adoption
+
+10. Regression — existing agent functionality on the shared stack
+
+81 passed, 0 failed

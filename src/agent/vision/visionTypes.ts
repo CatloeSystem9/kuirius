@@ -147,6 +147,13 @@ export interface CaptureSource {
   capture(): Promise<CapturedFrame>;
   getActiveWindowInfo(): ActiveWindowInfo;
   stop(): void;
+  /**
+   * Optional cheap probe: analysis-resolution frame WITHOUT any encoding
+   * (no JPEG, no dataUrl) — used by the live watcher for change detection.
+   * Implementations SHOULD reuse internal buffers; the returned `data` view
+   * is valid only until the next call. Falls back to capture() when absent.
+   */
+  captureAnalysis?(): Promise<CapturedFrame>;
 }
 
 /** Classified observer failures — mapped onto ToolResult error kinds by the tools. */

@@ -14,11 +14,14 @@ import {
   AudioLines,
   MapPin,
   Eye,
+  Camera,
   X,
   Check,
 } from 'lucide-react';
 import { LanguagePreference } from '../types';
 import { AudioRecordingSession, transcribeAudio } from '../utils/transcribeService';
+import { getConversationInactivityTracker } from '../utils/conversationInactivity';
+import { getConversationTurnManager } from '../utils/conversationTurnManager';
 import { WindowsLogo } from './WindowsLogo';
 
 interface DirectChatInputProps {
@@ -28,6 +31,9 @@ interface DirectChatInputProps {
   onOpenTranscribeModal?: () => void;
   onOpenWindowsApps?: () => void;
   onReadScreen?: () => void;
+  /** Step 6: explicit camera activation/stop control (toggle). */
+  onToggleCamera?: () => void;
+  cameraActive?: boolean;
   /** Action Transparency: live activity entries rendered directly above the input. */
   aboveInput?: React.ReactNode;
   isLoading: boolean;
@@ -51,6 +57,8 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   onOpenTranscribeModal,
   onOpenWindowsApps,
   onReadScreen,
+  onToggleCamera,
+  cameraActive = false,
   aboveInput,
   isLoading,
   isSpeaking,
@@ -88,10 +96,18 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
   }, []);
 
   const handleStartRecording = async () => {
+    // Step 5: pressing the mic while Krix speaks is a confirmed barge-in —
+    // stop her playback FIRST so the recording never captures her own voice.
+    getConversationTurnManager().requestBargeIn();
     try {
       const session = new AudioRecordingSession();
       session.onVolumeChange = (vol) => {
         setRecordVolume(vol);
+      };
+      // Step 3: detectable microphone failures are reported to the inactivity
+      // tracker as failures — never as ordinary conversational silence.
+      session.onMutedDetected = () => {
+        getConversationInactivityTracker().reportMicIssue('microphone_permission_denied');
       };
       await session.start();
       sessionRef.current = session;
@@ -103,6 +119,13 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
       }, 1000);
     } catch (err: any) {
       console.warn('Microphone recording error:', err);
+      // Step 3: map the getUserMedia failure to a content-free diagnostic kind.
+      const name = String(err?.name || '');
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        getConversationInactivityTracker().reportMicIssue('microphone_permission_denied');
+      } else if (name === 'NotFoundError' || name === 'NotReadableError' || name === 'OverconstrainedError') {
+        getConversationInactivityTracker().reportMicIssue('microphone_unavailable');
+      }
       setIsRecording(false);
     }
   };
@@ -130,6 +153,9 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
         onTypingChange?.(text);
 
         if (sendImmediately && text) {
+          // Step 3: a successfully transcribed + sent voice message is
+          // meaningful activity (also proves the microphone path recovered).
+          getConversationInactivityTracker().notifyActivity('transcribed_speech');
           onSendMessage(text, useMapsGrounding);
           setInputText('');
           onTypingChange?.('');
@@ -278,6 +304,25 @@ export const DirectChatInput: React.FC<DirectChatInputProps> = ({
           >
             <Eye className="w-3 h-3 text-cyan-400" />
             <span>Read Screen</span>
+          </button>
+        )}
+
+        {/* Step 6 — Camera Vision Pill: explicit camera activation control. */}
+        {onToggleCamera && (
+          <button
+            type="button"
+            onClick={onToggleCamera}
+            className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-[11px] font-medium transition-all cursor-pointer border backdrop-blur-md ${
+              cameraActive
+                ? 'bg-rose-950/50 border-rose-500/50 text-rose-200 hover:bg-rose-900/50 shadow-[0_0_12px_rgba(244,63,94,0.25)]'
+                : isLightMode
+                ? 'bg-violet-50/90 border-violet-300 text-violet-800 hover:text-violet-950 hover:bg-violet-100'
+                : 'bg-violet-950/40 border-violet-500/30 text-violet-300 hover:text-violet-100 hover:bg-violet-900/40 shadow-[0_0_12px_rgba(139,92,246,0.15)]'
+            }`}
+            title={cameraActive ? 'Stop the camera immediately' : 'Start camera vision (you will be asked for permission)'}
+          >
+            <Camera className="w-3 h-3 text-violet-400" />
+            <span>{cameraActive ? 'Stop Camera' : 'Camera'}</span>
           </button>
         )}
       </div>

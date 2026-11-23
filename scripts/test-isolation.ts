@@ -20,6 +20,14 @@ import * as path from 'node:path';
 const __isoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'krisha-test-iso-'));
 process.env.KRISHA_SANDBOX_DIR = path.join(__isoDir, 'e5store');
 process.env.KRISHA_FS_ROOTS = path.join(__isoDir, 'fsroots');
+// Recovery-pipe transport isolation (targeted repair, Issue 1): every
+// process importing serverSafety binds a recovery pipe at module load.
+// Without a unique transport name, test-runner processes race the LIVE
+// application for the global production pipe — a lost race logs EADDRINUSE
+// (fail-closed, harmless) but a WON race starves the live application's
+// recovery endpoint for as long as the test process runs. Each runner gets
+// its own pipe name; the production default is unchanged.
+process.env.KRISHA_RECOVERY_PIPE_PATH = `\\\\.\\pipe\\krisha-e5-recovery-iso-${process.pid}`;
 
 export function cleanupTestIsolation(): void {
   try { fs.rmSync(__isoDir, { recursive: true, force: true }); } catch { /* best-effort */ }

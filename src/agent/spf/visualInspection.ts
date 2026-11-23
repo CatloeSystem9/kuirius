@@ -50,6 +50,7 @@
 import { spawn } from 'node:child_process';
 
 import { scanText } from './detectors';
+import { spfFirewall } from './index';
 import type { SpfFinding } from './spfTypes';
 
 // ------------------------------------------------------------------ types
@@ -311,6 +312,34 @@ export class OcrWorker implements VisualWorkerLike {
   private queue: Promise<unknown> = Promise.resolve();
   private pending: { id: number; resolve: (out: string) => void; reject: (e: Error) => void; timer: NodeJS.Timeout } | null = null;
   private pendingCount = 0;
+  /** Idle release (RAM): kill the process after this many idle ms (0 = disabled). */
+  private idleReleaseMs = 0;
+  private idleTimer: NodeJS.Timeout | null = null;
+
+  /** Configure idle release (server entrypoint enables this for perception). */
+  configureIdleRelease(idleReleaseMs: number): void {
+    this.idleReleaseMs = Math.max(0, idleReleaseMs);
+    if (this.idleReleaseMs === 0) this.cancelIdleRelease();
+  }
+
+  private cancelIdleRelease(): void {
+    if (this.idleTimer) {
+      clearTimeout(this.idleTimer);
+      this.idleTimer = null;
+    }
+  }
+
+  private scheduleIdleRelease(): void {
+    this.cancelIdleRelease();
+    if (this.idleReleaseMs <= 0 || this.pendingCount > 0) return;
+    this.idleTimer = setTimeout(() => {
+      this.idleTimer = null;
+      // Full stop — the boot path recreates the worker lazily on next use.
+      this.kill();
+    }, this.idleReleaseMs);
+    // Never keep the process alive just for this timer.
+    if (this.idleTimer && typeof this.idleTimer.unref === 'function') this.idleTimer.unref();
+  }
 
   ensureReady(timeoutMs: number): Promise<void> {
     if (this.booted && this.proc && !this.proc.killed) return Promise.resolve();
@@ -395,6 +424,7 @@ export class OcrWorker implements VisualWorkerLike {
   private runOp(build: (id: number) => string, timeoutMs: number): Promise<string> {
     if (!this.booted) return Promise.reject(new Error('ocr_worker_not_ready'));
     if (this.pendingCount >= 8) return Promise.reject(new Error('ocr_worker_queue_full'));
+    this.cancelIdleRelease();
     this.pendingCount += 1;
     const task = this.queue.then(
       () =>
@@ -418,6 +448,7 @@ export class OcrWorker implements VisualWorkerLike {
     );
     const settled = task.finally(() => {
       this.pendingCount -= 1;
+      if (this.pendingCount <= 0) this.scheduleIdleRelease();
     });
     this.queue = settled.catch(() => undefined);
     return settled;
@@ -446,6 +477,7 @@ export class OcrWorker implements VisualWorkerLike {
     this.proc = null;
     this.booted = false;
     this.pendingCount = 0;
+    this.cancelIdleRelease();
   }
 }
 
@@ -467,7 +499,10 @@ function parseWorkerJson<T>(output: string): T {
 let sharedWorker: OcrWorker | null = null;
 
 function getSharedWorker(): OcrWorker {
-  if (!sharedWorker) sharedWorker = new OcrWorker();
+  if (!sharedWorker) {
+    sharedWorker = new OcrWorker();
+    sharedWorker.configureIdleRelease(sharedIdleReleaseMs);
+  }
   return sharedWorker;
 }
 
@@ -700,4 +735,128 @@ export async function inspectImageForTransmission(
 export function disposeSharedOcrWorker(): void {
   sharedWorker?.kill();
   sharedWorker = null;
+}
+
+// ------------------------------------------------- shared-worker idle release
+// The WinRT OCR worker is a persistent PowerShell process (~40-70 MB RAM).
+// The Live Screen Perception system keeps it warm during active watching;
+// after an idle period the worker is released and reboots lazily on next use
+// (the boot path already supports kill→reboot). Default: DISABLED so the
+// existing SPF transmission-gate behavior is unchanged; the server
+// entrypoint enables it for perception workloads.
+
+let sharedIdleReleaseMs = 0;
+
+export function configureSharedOcrWorker(options: { idleReleaseMs?: number }): void {
+  sharedIdleReleaseMs = Math.max(0, options.idleReleaseMs ?? 0);
+  sharedWorker?.configureIdleRelease(sharedIdleReleaseMs);
+}
+
+/** Test hook: read the configured idle release (no process side effects). */
+export function sharedOcrWorkerIdleReleaseMs(): number {
+  return sharedIdleReleaseMs;
+}
+
+// ------------------------------------------- live screen perception (OCR API)
+// LOCAL understanding path for the Live Screen Perception system. The SAME
+// shared WinRT OCR worker used by the SPF transmission gate produces the
+// lines (single-flight by construction — perception OCR and gate OCR can
+// never run concurrently), and every recognized line passes the SPF
+// detectors BEFORE it is returned. Sensitive lines never leave this module:
+// they are replaced by content-free placeholders, mirroring the tool-output
+// policy (per-item strip, never a whole-response block). Nothing here is
+// transmitted anywhere — this is local understanding for the agent only.
+
+export interface ScreenUnderstandResult {
+  status: 'ok' | 'ocr_unavailable' | 'unsupported_dimensions' | 'too_many_frames' | 'frame_unreadable' | 'error';
+  message?: string;
+  width?: number;
+  height?: number;
+  ocrMs?: number;
+  totalLines?: number;
+  /** SPF-screened lines — sensitive content is replaced, never present. */
+  lines?: Array<{ t: string; x: number; y: number; w: number; h: number; spf: 'allow' | 'strip' }>;
+  redactedLines?: number;
+  /** Detection categories involved (labels only — no content). */
+  categories?: string[];
+}
+
+const UNDERSTAND_MAX_LINES = 60;
+const UNDERSTAND_LINE_CHARS = 160;
+
+export async function screenUnderstandImage(
+  imageBase64: string,
+  options: { worker?: VisualWorkerLike; opTimeoutMs?: number } = {}
+): Promise<ScreenUnderstandResult> {
+  if (typeof imageBase64 !== 'string' || imageBase64.length < 100) {
+    return { status: 'error', message: 'unrecognized_image_payload' };
+  }
+  if (process.platform !== 'win32') {
+    return { status: 'ocr_unavailable', message: 'ocr_unavailable_platform' };
+  }
+  const worker = options.worker ?? getSharedWorker();
+  const opTimeoutMs = options.opTimeoutMs ?? 6000;
+  const started = Date.now();
+
+  try {
+    await worker.ensureReady(Math.min(15000, Math.max(opTimeoutMs * 2, 10000)));
+  } catch (err) {
+    return { status: 'error', message: `ocr_initialization_failed:${String((err as Error)?.message || err).slice(0, 80)}` };
+  }
+
+  let first: OcrInspectResult;
+  try {
+    first = await worker.inspect(imageBase64, opTimeoutMs);
+  } catch (err) {
+    const msg = String((err as Error)?.message || err);
+    return { status: 'error', message: msg.includes('timeout') ? 'ocr_timeout' : 'ocr_inspection_failed' };
+  }
+  if (first.status !== 'ok' || !Array.isArray(first.lines) || typeof first.width !== 'number' || typeof first.height !== 'number') {
+    // Honest failure/limit statuses — never fabricated text.
+    return { status: first.status === 'ok' ? 'error' : first.status, message: first.message };
+  }
+
+  // SPF screening per line (same detector engine as every other screen path).
+  let redacted = 0;
+  const categories = new Set<string>();
+  const lines: Array<{ t: string; x: number; y: number; w: number; h: number; spf: 'allow' | 'strip' }> = [];
+  for (const line of first.lines.slice(0, UNDERSTAND_MAX_LINES)) {
+    const raw = String(line.t ?? '');
+    let screened: string;
+    let spf: 'allow' | 'strip' = 'allow';
+    try {
+      const verdict = spfFirewall.inspectText(raw, { destination: 'perception:understanding', payloadKind: 'text', transport: 'digest' });
+      if (verdict.decision === 'allow') {
+        screened = raw;
+      } else if (verdict.decision === 'redact' && verdict.redactedText !== undefined) {
+        screened = verdict.redactedText;
+        spf = 'strip';
+        redacted += 1;
+        for (const c of verdict.categories) categories.add(c);
+      } else {
+        screened = `[REDACTED-SPF:${verdict.categories[0] ?? 'sensitive'}]`;
+        spf = 'strip';
+        redacted += 1;
+        for (const c of verdict.categories) categories.add(c);
+      }
+    } catch {
+      // Fail-safe for the LOCAL understanding path: an unusable line is
+      // dropped (placeholder) rather than emitted unscreened.
+      screened = '[REDACTED-SPF:scan_error]';
+      spf = 'strip';
+      redacted += 1;
+    }
+    lines.push({ t: screened.slice(0, UNDERSTAND_LINE_CHARS), x: line.x, y: line.y, w: line.w, h: line.h, spf });
+  }
+
+  return {
+    status: 'ok',
+    width: first.width,
+    height: first.height,
+    ocrMs: Date.now() - started,
+    totalLines: first.lines.length,
+    lines,
+    redactedLines: redacted,
+    categories: Array.from(categories),
+  };
 }

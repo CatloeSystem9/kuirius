@@ -1,0 +1,5 @@
+SPF|Screen Privacy|PrivacyFirewall|privacyFirewall
+Windows\.Data\.Ocr|OcrEngine|WinRT
+new Worker|Worker\(
+sensitive|Sensitive
+setInterval|requestAnimationFrame

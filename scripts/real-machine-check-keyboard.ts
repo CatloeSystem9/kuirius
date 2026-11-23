@@ -45,12 +45,24 @@ async function main() {
   await waitForHealth();
   console.log('server healthy');
 
+  // E5 M1b enforcement reads server-side permission state — mirror this
+  // script's keyboard-control grant (the explicit run IS the operator action).
+  await fetch(`${BASE}/api/permissions/session`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ grant: ['keyboard.control'] }),
+  });
+
   // 1. Launch + focus Notepad (with active-window safety: never type into an
   //    unrelated foreground application).
   await exec('start notepad.exe', { shell: 'cmd.exe' });
-  await new Promise((r) => setTimeout(r, 2500));
-  const pidOut = await ps('(Get-Process notepad | Select-Object -First 1).Id');
-  const pid = parseInt(pidOut.trim(), 10);
+  // Cold WinUI launches can take several seconds — poll for the process.
+  let pid = NaN;
+  for (let i = 0; i < 20 && !Number.isFinite(pid); i++) {
+    await new Promise((r) => setTimeout(r, 700));
+    const pidOut = await ps('(Get-Process notepad | Select-Object -First 1).Id');
+    pid = parseInt(pidOut.trim(), 10);
+  }
   if (!Number.isFinite(pid)) throw new Error('Notepad did not start');
 
   const fgTitle = () =>

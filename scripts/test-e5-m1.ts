@@ -67,6 +67,14 @@ const storeDir = path.join(tmp, 'e5store');
 fs.mkdirSync(fsRoots, { recursive: true });
 process.env.KRISHA_FS_ROOTS = fsRoots;
 process.env.KRISHA_SANDBOX_DIR = storeDir;
+// Test isolation: bind THIS suite's recovery transport to a unique pipe so
+// the in-process serverSafety instance never races the live application (or
+// any other serverSafety process) for the global production pipe name. The
+// recovery AUTHORITY under test is still this suite's own stop-state
+// machine; only the transport name changes. Without this, a lost bind race
+// made the pipe client reach the live application's state machine and armed
+// it (documented live-store drift in the D.4/D.3 campaigns).
+process.env.KRISHA_RECOVERY_PIPE_PATH = `\\\\.\\pipe\\krisha-e5-recovery-m1-${process.pid}`;
 
 const safety = await import('../serverSafety');
 const sys = await import('../systemAgentServer');
@@ -190,47 +198,62 @@ if (!PIPE_OK) {
     });
   }
 
-  const armNonce = crypto.randomBytes(32).toString('hex');
-  const armFrame = { op: 'arm', code: 'PipeCred1!', nonce: armNonce };
-  assert((await pipeRequest({ op: 'status' })).parsed.ok === true, 'pipe status responds');
-  await sleep(50); // one-connection-at-a-time: let the previous socket close
+  // Ownership precheck (defense in depth for the unique-pipe isolation):
+  // the pipe responder MUST be this process's own stop-state machine. A
+  // generation mismatch means a FOREIGN authority answered — the suite
+  // refuses to test against it (the D.3/D.4 campaigns documented exactly
+  // this failure mode when the suite lost the global pipe bind race and its
+  // arm/recover requests reached the live application).
+  const localGeneration = stopSnapshot().generation;
+  const ownershipProbe = await pipeRequest({ op: 'status' });
+  const responderGeneration = (ownershipProbe.parsed?.result as { generation?: number } | undefined)?.generation;
+  if (ownershipProbe.parsed?.ok !== true || responderGeneration !== localGeneration) {
+    console.log(`  SKIP: recovery pipe responder is NOT this suite's state machine (local generation ${localGeneration}, responder ${responderGeneration}) — foreign authority, refusing to test against it`);
+  } else {
+    assert(true, `pipe ownership verified (responder generation ${responderGeneration} matches this suite's state machine)`);
 
-  const armResp = await pipeSend(armFrame);
-  assert(armResp.parsed?.ok === true, `pipe arm activates a credentialed stop (raw: ${armResp.raw.slice(0, 200)})`);
-  assert(stopKind() === 'ACTIVE_CREDENTIALED', `pipe arm reached the server state machine (kind: ${stopKind()})`);
-  await sleep(50);
+    const armNonce = crypto.randomBytes(32).toString('hex');
+    const armFrame = { op: 'arm', code: 'PipeCred1!', nonce: armNonce };
+    assert((await pipeRequest({ op: 'status' })).parsed.ok === true, 'pipe status responds');
+    await sleep(50); // one-connection-at-a-time: let the previous socket close
 
-  // Nonce replay: the EXACT same frame must be rejected as a replayed nonce.
-  const replay = await pipeSend(armFrame);
-  assert(replay.parsed?.error === 'replayed_nonce', `nonce replay rejected (raw: ${replay.raw.slice(0, 200)})`);
-  await sleep(50);
+    const armResp = await pipeSend(armFrame);
+    assert(armResp.parsed?.ok === true, `pipe arm activates a credentialed stop (raw: ${armResp.raw.slice(0, 200)})`);
+    assert(stopKind() === 'ACTIVE_CREDENTIALED', `pipe arm reached the server state machine (kind: ${stopKind()})`);
+    await sleep(50);
 
-  const rec = await pipeRequest({ op: 'recover', code: 'PipeCred1!' });
-  assert(rec.parsed?.ok === true && stopKind() === 'INACTIVE', `pipe recover deactivates with the correct credential (raw: ${rec.raw.slice(0, 200)}, kind: ${stopKind()})`);
-  await sleep(50);
+    // Nonce replay: the EXACT same frame must be rejected as a replayed nonce.
+    const replay = await pipeSend(armFrame);
+    assert(replay.parsed?.error === 'replayed_nonce', `nonce replay rejected (raw: ${replay.raw.slice(0, 200)})`);
+    await sleep(50);
 
-  const wrong = await pipeRequest({ op: 'recover', code: 'WrongPipe99!' });
-  assert(wrong.parsed?.ok === false, 'pipe recover with wrong credential refused');
-  await sleep(1100); // clear the 1 s backoff from the failed attempt
-  await sleep(50);
+    const rec = await pipeRequest({ op: 'recover', code: 'PipeCred1!' });
+    assert(rec.parsed?.ok === true && stopKind() === 'INACTIVE', `pipe recover deactivates with the correct credential (raw: ${rec.raw.slice(0, 200)}, kind: ${stopKind()})`);
+    await sleep(50);
 
-  const malformed = await new Promise<{ raw: string }>((resolve, reject) => {
-    const socket = net.connect(RECOVERY_PIPE_PATH);
-    const timer = setTimeout(() => reject(new Error('timeout')), 5000);
-    let buffer = '';
-    socket.on('connect', () => socket.write('this is not json\n'));
-    socket.on('data', (chunk: Buffer) => {
-      buffer += chunk.toString('utf8');
-      const nl = buffer.indexOf('\n');
-      if (nl < 0) return;
-      clearTimeout(timer);
-      socket.end();
-      resolve({ raw: buffer.slice(0, nl) });
+    const wrong = await pipeRequest({ op: 'recover', code: 'WrongPipe99!' });
+    assert(wrong.parsed?.ok === false, 'pipe recover with wrong credential refused');
+    await sleep(1100); // clear the 1 s backoff from the failed attempt
+    await sleep(50);
+
+    const malformed = await new Promise<{ raw: string }>((resolve, reject) => {
+      const socket = net.connect(RECOVERY_PIPE_PATH);
+      const timer = setTimeout(() => reject(new Error('timeout')), 5000);
+      let buffer = '';
+      socket.on('connect', () => socket.write('this is not json\n'));
+      socket.on('data', (chunk: Buffer) => {
+        buffer += chunk.toString('utf8');
+        const nl = buffer.indexOf('\n');
+        if (nl < 0) return;
+        clearTimeout(timer);
+        socket.end();
+        resolve({ raw: buffer.slice(0, nl) });
+      });
+      socket.on('error', reject);
     });
-    socket.on('error', reject);
-  });
-  assert(malformed.raw.includes('malformed'), 'malformed frame refused');
-  void net; // net used above via closure types
+    assert(malformed.raw.includes('malformed'), 'malformed frame refused');
+    void net; // net used above via closure types
+  }
 }
 
 // ===========================================================================

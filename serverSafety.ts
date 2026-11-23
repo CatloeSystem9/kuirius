@@ -962,6 +962,164 @@ export function recoverStop(code: string, source: string): { generation: number 
 }
 
 // ---------------------------------------------------------------------------
+// Containment approval credential (Phase D completion)
+//
+// The operator's dedicated approval secret for high-stakes containment
+// actions. DELIBERATELY SEPARATE from the episode-scoped recovery
+// credential (which exists only during an active stop episode and is
+// cleared on activation/recovery): containment approval must work in the
+// normal INACTIVE state. Stored in the protected E5 store with the same
+// scrypt + timing-safe + integrity self-hash machinery as the stop state;
+// set and cleared ONLY through the operator's existing trusted channel
+// (the recovery pipe). The MODEL/agent has no tool or bridge path to the
+// pipe (documented doctrine), so it cannot enroll or self-approve. The
+// disclosed same-user OS boundary applies to the pipe exactly as it does
+// to the recovery credential itself.
+// ---------------------------------------------------------------------------
+
+const CONTAINMENT_APPROVAL_FILE = 'containment-approval.json';
+const CONTAINMENT_APPROVAL_SCHEMA = 1;
+
+interface ContainmentApprovalState {
+  schemaVersion: number;
+  credentialSet: boolean;
+  recoveryCodeHash?: string;
+  recoverySalt?: string;
+  setAt?: number;
+  integrity: string;
+}
+
+let containmentApproval: ContainmentApprovalState | null = null;
+let containmentApprovalEpochCounter = 0;
+let containmentApprovalFailures = 0;
+let containmentApprovalNextAttemptAt = 0;
+
+function containmentApprovalFile(): string {
+  return path.join(storeRoot ?? '', CONTAINMENT_APPROVAL_FILE);
+}
+
+function containmentApprovalIntegrity(fields: Omit<ContainmentApprovalState, 'integrity'>): string {
+  return crypto.createHash('sha256').update(JSON.stringify(fields), 'utf8').digest('hex');
+}
+
+function persistContainmentApproval(next: ContainmentApprovalState): void {
+  const file = containmentApprovalFile();
+  durableWrite(file, JSON.stringify(next) + '\n');
+  containmentApproval = next;
+}
+
+function loadContainmentApprovalSync(): void {
+  containmentApproval = { schemaVersion: CONTAINMENT_APPROVAL_SCHEMA, credentialSet: false, integrity: '' };
+  if (storeRoot === null) return;
+  const file = containmentApprovalFile();
+  let raw: string | null = null;
+  try {
+    raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : null;
+  } catch { raw = null; }
+  if (raw === null) return; // not enrolled — approval unavailable (fail-closed)
+  try {
+    const parsed = JSON.parse(raw) as ContainmentApprovalState;
+    if (!parsed || typeof parsed !== 'object' || parsed.schemaVersion !== CONTAINMENT_APPROVAL_SCHEMA) throw new Error('schema');
+    const { integrity, ...fields } = parsed;
+    if (containmentApprovalIntegrity(fields) !== integrity) throw new Error('integrity');
+    if (typeof parsed.credentialSet !== 'boolean') throw new Error('shape');
+    containmentApproval = parsed;
+  } catch (err) {
+    // Corrupt approval state is NEVER silently treated as enrolled.
+    containmentApproval = { schemaVersion: CONTAINMENT_APPROVAL_SCHEMA, credentialSet: false, integrity: '' };
+    console.error(`[E5] containment-approval state corrupt — failing closed (not enrolled): ${String((err as Error)?.message || err)}`);
+    appendAuditSyncSafe({ kind: 'e5_containment_credential_corrupt' });
+  }
+}
+
+/** Whether an operator approval credential is enrolled. Approval authority
+ *  does not exist until the operator enrolls (D.4 posture preserved). */
+export function containmentApprovalCredentialSet(): boolean {
+  return containmentApproval?.credentialSet === true;
+}
+
+/** Monotonic epoch of the approval authority — changes on every enrollment
+ *  change so issued approvals can detect mid-operation invalidation. */
+export function containmentApprovalEpoch(): number {
+  return containmentApprovalEpochCounter;
+}
+
+/** Operator enrolls (or re-enrolls) the containment approval credential via
+ *  the recovery pipe (`set-containment-credential`). Strength rules are the
+ *  recovery credential's (assertValidCredential). */
+export function setContainmentApprovalCredential(code: string, source: string): { epoch: number } {
+  if (storeRoot === null) throw new Error('storage unavailable — containment approval credential cannot be enrolled');
+  const normalized = assertValidCredential(code);
+  const salt = crypto.randomBytes(16).toString('hex');
+  const next: ContainmentApprovalState = {
+    schemaVersion: CONTAINMENT_APPROVAL_SCHEMA,
+    credentialSet: true,
+    recoveryCodeHash: hashCredential(normalized, salt),
+    recoverySalt: salt,
+    setAt: Date.now(),
+    integrity: '',
+  };
+  next.integrity = containmentApprovalIntegrity(next);
+  persistContainmentApproval(next);
+  containmentApprovalEpochCounter += 1;
+  containmentApprovalFailures = 0;
+  containmentApprovalNextAttemptAt = 0;
+  appendAuditSyncSafe({ kind: 'e5_containment_credential_set', source: String(source ?? '').slice(0, 64) });
+  return { epoch: containmentApprovalEpochCounter };
+}
+
+/** Operator clears enrollment via the recovery pipe. Termination falls back
+ *  to the disabled (D.4) posture. Failure pacing resets too: with no
+ *  credential enrolled there is nothing to brute-force, and a cleared
+ *  authority must fail closed QUIETLY (never with backoff throws). */
+export function clearContainmentApprovalCredential(source: string): { epoch: number } {
+  if (storeRoot === null) throw new Error('storage unavailable');
+  const next: ContainmentApprovalState = {
+    schemaVersion: CONTAINMENT_APPROVAL_SCHEMA,
+    credentialSet: false,
+    integrity: '',
+  };
+  persistContainmentApproval(next);
+  containmentApprovalEpochCounter += 1;
+  containmentApprovalFailures = 0;
+  containmentApprovalNextAttemptAt = 0;
+  appendAuditSyncSafe({ kind: 'e5_containment_credential_cleared', source: String(source ?? '').slice(0, 64) });
+  return { epoch: containmentApprovalEpochCounter };
+}
+
+/**
+ * Server-side verification of a candidate approval credential. READ-ONLY on
+ * success (the stop state machine is untouched — this is not a recovery).
+ * Failed attempts share an exponential backoff with recovery-style pacing
+ * so the approval route cannot be used as a brute-force oracle.
+ */
+export function verifyContainmentApprovalCredential(code: string, source = 'containment-approval'): boolean {
+  const now = Date.now();
+  if (now < containmentApprovalNextAttemptAt) {
+    const waitSec = Math.ceil((containmentApprovalNextAttemptAt - now) / 1000);
+    throw new Error(`too many failed approval attempts — retry in ${waitSec}s`);
+  }
+  const state = containmentApproval;
+  if (!state || !state.credentialSet || !state.recoveryCodeHash || !state.recoverySalt) {
+    // Not enrolled: fail-closed without consuming backoff (nothing to brute-force).
+    return false;
+  }
+  const normalized = code.normalize('NFKC');
+  const candidate = Buffer.from(hashCredential(normalized, state.recoverySalt), 'hex');
+  const stored = Buffer.from(state.recoveryCodeHash, 'hex');
+  const ok = candidate.length === stored.length && crypto.timingSafeEqual(candidate, stored);
+  if (ok) {
+    containmentApprovalFailures = 0;
+    containmentApprovalNextAttemptAt = 0;
+    return true;
+  }
+  containmentApprovalFailures += 1;
+  containmentApprovalNextAttemptAt = now + backoffDelayMs(containmentApprovalFailures);
+  appendAuditSyncSafe({ kind: 'e5_containment_approval_denied', source: String(source ?? '').slice(0, 64) });
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Server-side permission state (M1b)
 // ---------------------------------------------------------------------------
 
@@ -1224,7 +1382,17 @@ export function enforce(options: EnforcementOptions) {
 // Recovery named pipe (M1c) — restricted local transport, ONE operation set
 // ---------------------------------------------------------------------------
 
-export const RECOVERY_PIPE_PATH = '\\\\.\\pipe\\krisha-e5-recovery';
+/**
+ * Recovery-pipe transport path. The recovery AUTHORITY is always this
+ * process's own stop-state machine; the pipe is only its transport. The
+ * default name is the production endpoint (recovery CLI compatibility).
+ * Test processes may override it via KRISHA_RECOVERY_PIPE_PATH so an
+ * isolated store's tests bind their OWN transport instead of racing the
+ * live application for the global name — one authority per store, no
+ * second recovery authority is created.
+ */
+export const RECOVERY_PIPE_PATH =
+  (process.env.KRISHA_RECOVERY_PIPE_PATH ?? '').trim() || '\\\\.\\pipe\\krisha-e5-recovery';
 let recoveryAvailable = false;
 let activePipeConnections = 0;
 const MAX_PIPE_CONNECTIONS = 4;
@@ -1260,6 +1428,15 @@ function pipeDispatch(msg: any): { ok: boolean; error?: string; result?: unknown
       }
       case 'rotate': {
         const r = rotateCredential(String(msg.currentCode ?? ''), String(msg.newCode ?? ''), source);
+        return { ok: true, result: r };
+      }
+      case 'set-containment-credential': {
+        // Operator channel only (recovery CLI doctrine — no model/tool path).
+        const r = setContainmentApprovalCredential(String(msg.code ?? ''), source);
+        return { ok: true, result: r };
+      }
+      case 'clear-containment-credential': {
+        const r = clearContainmentApprovalCredential(source);
         return { ok: true, result: r };
       }
       default:
@@ -1336,4 +1513,5 @@ export function startRecoveryPipe(): { available: boolean; error?: string } {
 
 resolveStoreRootSync();
 initStopStateSync();
+loadContainmentApprovalSync();
 startRecoveryPipe();

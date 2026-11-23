@@ -248,6 +248,19 @@ export interface CompanionSettings {
   languagePreference?: LanguagePreference;
   companionNotes: string;
   voiceEngine?: 'auto' | 'gemini' | 'browser';
+  // Offline vision (default ON): Krix's computer use, screen targeting and
+  // agent screen observation run fully on-device — screenshots are never
+  // uploaded. The "look at screen" button uses local OCR instead of cloud
+  // vision while this is on. Stored settings without the key fall back to ON.
+  offlineVision?: boolean;
+  // Step 4 — Proactive Conversations (all optional: stored settings without
+  // these keys fall back to the defaults below).
+  proactiveConversations?: boolean;
+  proactiveInactivityMinutes?: number;
+  proactiveMinIntervalHours?: number;
+  proactiveQuietHoursEnabled?: boolean;
+  proactiveQuietHoursStart?: number;
+  proactiveQuietHoursEnd?: number;
 }
 
 export type ActiveModal =

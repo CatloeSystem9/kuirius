@@ -23,6 +23,9 @@ const ENCODE_QUALITY = 0.6;
 export class BrowserCaptureSource implements CaptureSource {
   private stream: MediaStream | null = null;
   private video: HTMLVideoElement | null = null;
+  /** Reused analysis canvas + context (live probes avoid per-frame allocation). */
+  private analysisCanvas: HTMLCanvasElement | null = null;
+  private analysisCtx: CanvasRenderingContext2D | null = null;
 
   private async ensureStream(): Promise<MediaStream> {
     if (this.stream && this.stream.getVideoTracks().some((t) => t.readyState === 'live')) {
@@ -103,10 +106,12 @@ export class BrowserCaptureSource implements CaptureSource {
       throw new ObserverError('capture_failed', 'Capture stream reported no frame dimensions');
     }
 
-    const analysisCanvas = document.createElement('canvas');
+    const analysisCanvas = this.analysisCanvas ?? document.createElement('canvas');
+    this.analysisCanvas = analysisCanvas;
     analysisCanvas.width = ANALYSIS_WIDTH;
     analysisCanvas.height = Math.max(1, Math.round((srcHeight / srcWidth) * ANALYSIS_WIDTH));
-    const actx = analysisCanvas.getContext('2d', { willReadFrequently: true });
+    const actx = this.analysisCtx ?? analysisCanvas.getContext('2d', { willReadFrequently: true });
+    this.analysisCtx = actx;
     if (!actx) throw new ObserverError('capture_failed', 'Canvas 2D context unavailable');
     actx.drawImage(video, 0, 0, analysisCanvas.width, analysisCanvas.height);
     const imageData = actx.getImageData(0, 0, analysisCanvas.width, analysisCanvas.height);
@@ -127,6 +132,35 @@ export class BrowserCaptureSource implements CaptureSource {
       dataUrl,
       capturedAt: Date.now(),
     };
+  }
+
+  /**
+   * Cheap probe for the live watcher: analysis-resolution RGBA ONLY — no
+   * JPEG encode, no dataUrl, reused canvas. The returned `data` view is
+   * valid until the next call (consumers must not retain it).
+   */
+  async captureAnalysis(): Promise<CapturedFrame> {
+    const stream = await this.ensureStream();
+    const video = await this.ensureVideo(stream);
+
+    const track = stream.getVideoTracks()[0];
+    const settings = track?.getSettings?.() ?? {};
+    const srcWidth = settings.width || video.videoWidth || ANALYSIS_WIDTH;
+    const srcHeight = settings.height || video.videoHeight || ANALYSIS_WIDTH * 9 / 16;
+    if (!srcWidth || !srcHeight) {
+      throw new ObserverError('capture_failed', 'Capture stream reported no frame dimensions');
+    }
+
+    const canvas = this.analysisCanvas ?? document.createElement('canvas');
+    this.analysisCanvas = canvas;
+    canvas.width = ANALYSIS_WIDTH;
+    canvas.height = Math.max(1, Math.round((srcHeight / srcWidth) * ANALYSIS_WIDTH));
+    const actx = this.analysisCtx ?? canvas.getContext('2d', { willReadFrequently: true });
+    this.analysisCtx = actx;
+    if (!actx) throw new ObserverError('capture_failed', 'Canvas 2D context unavailable');
+    actx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const imageData = actx.getImageData(0, 0, canvas.width, canvas.height);
+    return { width: canvas.width, height: canvas.height, data: imageData.data, capturedAt: Date.now() };
   }
 
   getActiveWindowInfo(): ActiveWindowInfo {
@@ -154,5 +188,7 @@ export class BrowserCaptureSource implements CaptureSource {
       this.video.srcObject = null;
       this.video = null;
     }
+    this.analysisCanvas = null;
+    this.analysisCtx = null;
   }
 }

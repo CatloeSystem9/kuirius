@@ -1,4 +1,4 @@
-import express from "express";
+﻿import express from "express";
 import path from "path";
 import fs from "fs";
 import { createServer as createViteServer } from "vite";
@@ -15,6 +15,12 @@ import {
   activateStop,
   rateLimit,
   stopKind,
+  getStorageInfo,
+  auditDegraded,
+  containmentApprovalCredentialSet,
+  containmentApprovalEpoch,
+  verifyContainmentApprovalCredential,
+  serverPermissions,
 } from "./serverSafety";
 // E5 M3 — rollback planning/challenges + E7 quarantine (imported for their
 // synchronous init side effects: none — they are pure consumers of the M1/M2
@@ -35,6 +41,20 @@ import {
 // refers to the Phase 10 task-context helper module context.ts.)
 import { ContextEngine, analyzeContext, rankItems, packWithinBudget } from "./src/agent/context/index";
 import type { ContextBudgetConfig, ContextItem, StorageAdapter } from "./src/agent/context/index";
+// Persistent Identity Foundation (Step 1) — Krisha's identity is ONE stable,
+// validated, versioned record shared by every AI provider. The server renders
+// prompts from validated STRUCTURED identity data (never pre-rendered prose);
+// a missing/invalid payload fails closed toward the compiled-in canonical
+// identity, so model/provider switches can never replace who she is.
+import {
+  CANONICAL_IDENTITY,
+  normalizeIdentity,
+  renderIdentityPromptBlock,
+  validateIdentityTransportPayload,
+} from "./src/agent/identity/index";
+import type { KrishaIdentity } from "./src/agent/identity/index";
+// Step 1 Background Runtime — graceful termination (Ctrl+C / service stop).
+import { installGracefulShutdown } from "./src/server/runtimeShutdown";
 // Screen Privacy Firewall (SPF) — mandatory, fail-closed boundary between
 // screen observation and every external transmission (EP-1..EP-9 below).
 import { spfFirewall, spfAuditLog, spfScreenItem } from "./src/agent/spf/index";
@@ -42,7 +62,7 @@ import type { SpfVerdict } from "./src/agent/spf/index";
 // SPF VISUAL — local OCR pixel inspection + irreversible region redaction
 // for every screenshot that can leave the device (Windows.Media.Ocr worker,
 // zero dependencies, fully offline; fail-closed).
-import { inspectImageForTransmission } from "./src/agent/spf/visualInspection";
+import { inspectImageForTransmission, screenUnderstandImage, configureSharedOcrWorker } from "./src/agent/spf/visualInspection";
 import type { VisualInspectionResult } from "./src/agent/spf/visualInspection";
 // SPF EP-16 — system-wide outbound transport guard: patches globalThis.fetch
 // and node:http/https so NO external request can bypass the firewall by using
@@ -64,23 +84,87 @@ import { createDefenderSource } from "./src/agent/malwaredetect/defenderSource";
 // Phase C — execution gate: centralized Krisha-managed launch decision.
 // Blocks confirmed malware non-overridably; requires approval for suspicious.
 import { ExecutionGate } from "./src/agent/execgate/execGate";
-// Phase D — threat containment: identity-verified, operator-approved
-// termination of a single confirmed-malicious process instance.
-import { ThreatContainment, defaultVerifyProcess, defaultTerminate } from "./src/agent/containment/containment";
-import type { ContainmentRequest } from "./src/agent/containment/containmentTypes";
+// Phase D.3 — threat containment: termination bound to a process-INSTANCE
+// reference (OS handle pinning) so PID reuse can never redirect the signal.
+// Identity and classification are established SERVER-SIDE; approval tokens
+// are minted only by the containment module for CONFIRMED_MALWARE, and only
+// after the OPERATOR'S APPROVAL CREDENTIAL verifies server-side (Phase D
+// completion: enrollment happens through the recovery pipe — a channel with
+// no model/tool path; the credential is a dedicated operator secret stored
+// in the protected E5 store, distinct from the episode-scoped recovery
+// credential).
+import {
+  ThreatContainment,
+  defaultPinProcess,
+  defaultReadProcessIdentity,
+  createCredentialApprovalAuthority,
+} from "./src/agent/containment/containment";
+// Phase E — security intelligence: unified metadata events from the EXISTING
+// subsystems (no new collection), evidence-linked correlation, severity/
+// confidence-separated assessments, read-only situation awareness, and safe
+// response recommendations. NO control surface: this layer cannot terminate,
+// quarantine, modify Defender, or bypass any authorization (Phase D.4 keeps
+// termination unreachable; the E-stop remains authoritative).
+import {
+  SecurityEventIntel,
+  CorrelationEngine,
+  AssessmentEngine,
+  SecuritySituation,
+  ResponseRecommender,
+  type MonitorStatusLike,
+  type DetectionHealthLike,
+  type ExecGateHealthLike,
+  type StopSnapshotLike,
+} from "./src/agent/securityintel/index";
+// Phase F — incident orchestration: coordinates Phases A-E into traceable
+// incidents with a deterministic lifecycle, structured evidence, and
+// authorization-aware response eligibility. Phase E stays the ONLY
+// intelligence source; containment executes ONLY through Phase D (the
+// operator credential, authority epoch, pinning and E-stop checks inside
+// Phase D are the authority). No new classification, no new audit authority.
+import { IncidentStore, IncidentOrchestrator } from "./src/agent/incidents/index";
 
 const spfOutboundGuard = installSpfOutboundGuard(spfFirewall);
+
+// Phase E.1 — unified security event intelligence over EXISTING metadata.
+// Bounded ring (2000), dedup window, provenance-preserving, metadata-only.
+const securityIntel = new SecurityEventIntel({ capacity: 2000 });
+// Forward reference: the Phase F orchestrator is constructed after the
+// subsystems it coordinates; the audit tap below drives it event-driven.
+let incidentOrchestratorRef: { scheduleProcessing(): void; sweepStopTransition(): void } | null = null;
+const STOP_EVENT_KINDS = new Set(["e5_stop_activated", "e5_stop_armed", "e5_stop_credentialed", "emergency_resume"]);
+
+// Shared tap for subsystem audit callbacks: E5 chain append (behavior
+// unchanged) + normalized ingestion into the intelligence layer.
+function auditAndIngest<E extends { kind: string }>(event: E, source: string): void {
+  try {
+    appendAuditSyncSafe({ kind: event.kind, ...event });
+  } catch {
+    /* audit degradation must never break the subsystem */
+  }
+  try {
+    securityIntel.ingestRecord(
+      { ...(event as unknown as Record<string, unknown>), source },
+      "audit-funnel",
+    );
+  } catch {
+    /* intelligence ingestion must never break the subsystem */
+  }
+  // Phase F: event-driven orchestration (coalesced) + immediate stop sweeps.
+  try {
+    incidentOrchestratorRef?.scheduleProcessing();
+    if (STOP_EVENT_KINDS.has(String(event.kind))) incidentOrchestratorRef?.sweepStopTransition();
+  } catch {
+    /* orchestration must never break the ingesting subsystem */
+  }
+}
 
 // Phase A — process monitor singleton: lifecycle/health events flow into the
 // existing E5 audit chain (metadata only: kinds + counts, never process
 // names/paths; individual process events stay in the bounded in-memory ring).
 const processMonitor = new ProcessMonitor({
   audit: (event) => {
-    try {
-      appendAuditSyncSafe({ kind: event.kind, ...event });
-    } catch {
-      /* audit degradation must never break monitoring */
-    }
+    auditAndIngest(event, "phase-a-monitor");
   },
 });
 
@@ -103,11 +187,7 @@ const malwareEngine = new DetectionEngine({
   },
   defender: defenderSource,
   audit: (event) => {
-    try {
-      appendAuditSyncSafe({ kind: event.kind, ...event });
-    } catch {
-      /* audit degradation must never break detection */
-    }
+    auditAndIngest(event, "phase-b-engine");
   },
 });
 
@@ -128,25 +208,172 @@ const executionGate = new ExecutionGate({
     } catch { return null; }
   },
   audit: (event) => {
-    try {
-      appendAuditSyncSafe({ kind: event.kind, ...event });
-    } catch { /* audit must never break the gate */ }
+    auditAndIngest(event, "phase-c-exec-gate");
   },
 });
 sys.setExecGate(executionGate);
 
-// Phase D — threat containment singleton: identity-verified, operator-approved
-// termination of a single confirmed-malicious process instance.
+// Phase D.3/D.4-completion — threat containment singleton. The server injects
+// the Phase B classifier (containment cannot classify itself) and the E5 stop
+// state. Identity is read through OS process references; termination uses a
+// pinned reference acquired at verification time (PID-reuse safe).
+//
+// APPROVAL AUTHORITY (Phase D completion): termination requires a genuine
+// operator decision, established by the OPERATOR'S APPROVAL CREDENTIAL — a
+// dedicated secret the operator enrolls through the recovery pipe (a channel
+// with no model/tool path) and which the server verifies with the E5
+// protected store's scrypt + timing-safe machinery. A server-generated
+// token is never mistaken for the human decision: a token can only be
+// minted AFTER the credential verifies, it is single-use, 5-minute TTL,
+// bound to the exact process identity, and its authority epoch is
+// re-checked immediately before termination (a credential cleared or
+// re-enrolled mid-operation refuses the termination). Before the operator
+// enrolls, the authority is UNAVAILABLE — the D.4 disabled posture — and
+// termination stays unreachable. `application.launch` permission remains a
+// capability grant, never proof of an operator decision. The disclosed
+// same-user OS boundary applies to the enrollment channel exactly as it
+// applies to the recovery credential itself; the defended threat is agent
+// self-authorization, not same-user malware (which can terminate processes
+// directly without Krisha).
 const threatContainment = new ThreatContainment({
-  verifyProcess: defaultVerifyProcess(),
+  verifyApprovalAuthority: createCredentialApprovalAuthority({
+    verifyCredential: (code) => verifyContainmentApprovalCredential(code, "containment-approval"),
+    credentialSet: containmentApprovalCredentialSet,
+    approvalEpoch: containmentApprovalEpoch,
+  }),
+  readProcessIdentity: defaultReadProcessIdentity(),
+  pinProcess: defaultPinProcess(),
   isStopActive: () => stopKind() !== "INACTIVE",
-  terminate: defaultTerminate(),
+  classify: async (p) => {
+    try {
+      const record = await malwareEngine.assessFile(p);
+      return { classification: record.classification, confidence: record.confidence, assessedAt: record.at, evidenceSources: record.evidence };
+    } catch {
+      return null; // fail-closed: assessment failure is never permissive
+    }
+  },
+  audit: (event) => {
+    auditAndIngest(event, "phase-d-containment");
+  },
+});
+
+
+// ---- Phase E: intelligence, correlation, assessment, situation, response ----
+// Correlation and assessment run ON DEMAND (per read), never on timers —
+// bounded CPU on target hardware. The only periodic element is a 5 s unref'd
+// E5 stop/storage change sampler (in-memory reads; pipe-driven stop
+// transitions also arrive through the audit funnel, so the sampler is a
+// completeness backstop, not the primary source).
+const correlationEngine = new CorrelationEngine({}, () => Date.now());
+const assessmentEngine = new AssessmentEngine(correlationEngine, {
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe(event);
+    } catch { /* audit must never break assessment */ }
+  },
+});
+const securitySituation = new SecuritySituation({
+  monitorStatus: () => processMonitor.status() as unknown as MonitorStatusLike,
+  detectionHealth: () => malwareEngine.health() as unknown as DetectionHealthLike,
+  execGateHealth: () => executionGate.health() as unknown as ExecGateHealthLike,
+  stopSnapshot: () => stopSnapshot() as unknown as StopSnapshotLike,
+  e5Storage: () => ({ protection: getStorageInfo().protection, auditDegraded }),
+  containmentAuthority: () => ({
+    approvalAuthority: containmentApprovalCredentialSet() ? "operator-approval-credential" : "unavailable",
+    pendingTokens: threatContainment.pendingApprovalCount(),
+  }),
+  lpvStatus: () => {
+    try {
+      const s = lpv.getVaultStatus();
+      return { state: String(s.state), tampered: s.state === "TAMPERED", verified: s.verified };
+    } catch {
+      return null; // LPV cannot report — explicit UNKNOWN in the view
+    }
+  },
+  refreshDefenderAvailability: async () => {
+    const snap = await defenderSource.status();
+    return {
+      available: snap.available,
+      detail: {
+        amServiceEnabled: snap.amServiceEnabled ?? null,
+        realTimeProtectionEnabled: snap.realTimeProtectionEnabled ?? null,
+        engineVersion: snap.engineVersion ?? null,
+      },
+    };
+  },
+  activeAssessments: () => assessmentEngine.assess(securityIntel),
+  intel: securityIntel,
+});
+const responseRecommender = new ResponseRecommender(securitySituation, {
+  audit: (event) => {
+    try {
+      appendAuditSyncSafe(event);
+    } catch { /* audit must never break recommendations */ }
+  },
+});
+// ---- Phase F: incident orchestration ----
+// Bounded incident registry persisted in the protected E5 store (restart-
+// safe, integrity-hashed). The orchestrator is event-driven: it processes
+// coalesced intelligence passes (Phase E correlations + assessments) and
+// sweeps stop transitions; containment executes ONLY through the Phase D
+// singleton above (credential verification, authority epoch, pinning and
+// E-stop checks inside Phase D are the authority).
+const incidentStore = new IncidentStore({
+  maxActive: 24,
+  maxArchived: 100,
+  maxEvidencePerIncident: 40,
+  staleEvidenceMs: 24 * 60 * 60 * 1000,
+  persistPath: getStorageInfo().root ? path.join(getStorageInfo().root!, "incident-state.json") : null,
   audit: (event) => {
     try {
       appendAuditSyncSafe({ kind: event.kind, ...event });
-    } catch { /* audit must never break containment */ }
+    } catch { /* audit must never break orchestration */ }
   },
 });
+const incidentOrchestrator = new IncidentOrchestrator({
+  intel: securityIntel,
+  correlations: correlationEngine,
+  assessments: assessmentEngine,
+  containment: threatContainment,
+  credentialSet: containmentApprovalCredentialSet,
+  credentialEpoch: containmentApprovalEpoch,
+  stopKind: () => stopKind(),
+  store: incidentStore,
+  audit: (event) => {
+    auditAndIngest(event, "phase-f-orchestration");
+  },
+});
+incidentOrchestratorRef = incidentOrchestrator;
+
+// Phase A raw lifecycle events → E.1 (direct subscription; never breaks the monitor).
+processMonitor.onEvent((event) => {
+  try {
+    securityIntel.ingestProcessEvent(event);
+  } catch { /* intelligence ingestion must never break monitoring */ }
+});
+// LPV security decisions → E.1 (additive outbound sink; LPV behavior untouched).
+lpv.setLpvSecurityEventSink((record) => {
+  try {
+    securityIntel.ingestRecord({ ...record, source: "lpv" }, "lpv-sink");
+  } catch { /* intelligence ingestion must never break LPV */ }
+});
+let lastSampledStopKind = stopKind();
+let lastSampledProtection = getStorageInfo().protection;
+const securityStateSampler = setInterval(() => {
+  try {
+    const kind = stopKind();
+    if (kind !== lastSampledStopKind) {
+      securityIntel.ingestRecord({ kind: "e5_stop_transition_observed", at: Date.now(), from: lastSampledStopKind, to: kind, source: "e5-stop" }, "stop-sampler");
+      lastSampledStopKind = kind;
+    }
+    const protection = getStorageInfo().protection;
+    if (protection !== lastSampledProtection) {
+      securityIntel.ingestRecord({ kind: "e5_storage_protection_change", at: Date.now(), from: lastSampledProtection, to: protection, source: "e5-audit" }, "stop-sampler");
+      lastSampledProtection = protection;
+    }
+  } catch { /* the sampler must never throw */ }
+}, 5000);
+securityStateSampler.unref?.();
 
 /**
  * Persist one SPF decision to the existing tamper-evident E5 audit chain
@@ -184,7 +411,16 @@ const BIND = process.env.KRISHA_BIND || "127.0.0.1";
 
 // E5 M1d — request size guard BEFORE body parsing: 1 MB default, 10 MB only
 // for the endpoints that legitimately carry base64 media payloads.
-const LARGE_BODY_PATHS = new Set(["/api/audio/transcribe", "/api/vision/analyze"]);
+const LARGE_BODY_PATHS = new Set([
+  "/api/audio/transcribe",
+  "/api/vision/analyze",
+  "/api/vision/camera-analyze",
+  // Office payloads legitimately carry row/slide data (bounded by officeCore
+  // caps, but 10k rows of text can exceed the 1 MB default).
+  "/api/office/spreadsheet/create",
+  "/api/office/spreadsheet/edit",
+  "/api/office/presentation/create",
+]);
 app.use(createBodySizeGuard(LARGE_BODY_PATHS, 1 * 1024 * 1024, 10 * 1024 * 1024));
 
 app.use(express.json({ limit: "10mb" }));
@@ -194,6 +430,16 @@ app.use(express.json({ limit: "10mb" }));
 // (direct HTTP cannot bypass it). Decision is per-request: rate limit →
 // emergency stop → permission → audit. Read-only routes are not gated.
 const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean; rate?: { group: string; limit: number; windowMs: number } }> = {
+  // Office files (xlsx/pptx) — local generation/reading through officeCore.
+  // Writes carry filesystem.write, reads filesystem.read (same domains as the
+  // fs routes), stop-blocked, bounded rate group.
+  "/api/office/spreadsheet/create": { permission: "filesystem.write", stopBlock: true, rate: { group: "office", limit: 20, windowMs: 60_000 } },
+  "/api/office/spreadsheet/read": { permission: "filesystem.read", stopBlock: true, rate: { group: "office", limit: 30, windowMs: 60_000 } },
+  "/api/office/spreadsheet/edit": { permission: "filesystem.write", stopBlock: true, rate: { group: "office", limit: 20, windowMs: 60_000 } },
+  "/api/office/presentation/create": { permission: "filesystem.write", stopBlock: true, rate: { group: "office", limit: 20, windowMs: 60_000 } },
+  // Content generation runs ONE bounded text-only model call, then writes the
+  // local file — same permission as the other office writes.
+  "/api/office/generate": { permission: "filesystem.write", stopBlock: true, rate: { group: "office", limit: 20, windowMs: 60_000 } },
   "/api/fs/create": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
   "/api/fs/rename": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
   "/api/fs/copy": { permission: "filesystem.write", stopBlock: true, rate: { group: "fs", limit: 60, windowMs: 60_000 } },
@@ -219,6 +465,9 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   // HALT while the emergency stop is active — OCR-backed transmission is an
   // action, and stop-blocked here is fail-closed by construction (423).
   "/api/vision/analyze": { stopBlock: true },
+  // Step 6: camera-frame analysis rides the same E5 stop-block — an active
+  // emergency stop HALTS camera-frame transmission exactly like screen vision.
+  "/api/vision/camera-analyze": { stopBlock: true },
   // E5 M1 acceptance: the only disk write outside the fs/app/computer/browser
   // routes is the context-engine cache write in /api/research/search
   // (JsonFileStorage.flush → <cwd>/.krisha/context-cache-v1.json). While the
@@ -279,7 +528,13 @@ const ENFORCED_ROUTES: Record<string, { permission?: string; stopBlock: boolean;
   // Phase D — threat containment: identity-verified, operator-approved
   // termination of a single confirmed-malicious process. Non-overridable by
   // agents; requires fresh CONFIRMED_MALWARE evidence and operator approval.
-  "/api/containment/contain": { stopBlock: true, rate: { group: "containment", limit: 5, windowMs: 60_000 } },
+  "/api/containment/approve": { permission: "application.launch", stopBlock: true, rate: { group: "containment-approve", limit: 10, windowMs: 60_000 } },
+  "/api/containment/contain": { permission: "application.launch", stopBlock: true, rate: { group: "containment-contain", limit: 10, windowMs: 60_000 } },
+  // Phase F - incident-coordinated containment: NOT stop-blocked at the route
+  // so the incident records the block honestly; the E-stop remains
+  // authoritative (the orchestrator refuses fail-closed and Phase D refuses
+  // internally). Operator authorization is the Phase D credential.
+  "/api/incidents/contain": { permission: "application.launch", stopBlock: false, rate: { group: "incident-contain", limit: 10, windowMs: 60_000 } },
 };
 
 app.use((req, res, next) => {
@@ -308,9 +563,21 @@ function getGenAI(): GoogleGenAI {
   return genAIClient;
 }
 
-// Health check (Phase 17: includes a passive performance snapshot)
+// Health check (Phase 17: passive performance snapshot; Step 1 Background
+// Runtime: additive `runtime` block so the client watchdog can detect server
+// loss, distinguish a restarted server process, and measure uptime).
+const SERVER_STARTED_AT = Date.now();
 app.get("/api/health", (req, res) => {
-  res.json({ status: "ok", perf: getPerformanceTelemetry().snapshot() });
+  res.json({
+    status: "ok",
+    perf: getPerformanceTelemetry().snapshot(),
+    runtime: {
+      pid: process.pid,
+      startedAt: SERVER_STARTED_AT,
+      uptimeMs: Date.now() - SERVER_STARTED_AT,
+      serverTime: Date.now(),
+    },
+  });
 });
 
 // Google Maps background status
@@ -557,6 +824,124 @@ const perf = getPerformanceTelemetry();
 const visionCoalescer = new RequestCoalescer<any>(perf);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Persistent Identity Foundation (Step 1): resolve the request's identity into
+// a validated KrishaIdentity. Fail-closed toward the compiled-in canonical
+// identity — a missing, corrupted or tampered payload can never replace who
+// Krisha is (identity is model-independent: the SAME block goes into every
+// model call, waterfall position and provider).
+function resolveRequestIdentity(raw: unknown): { identity: KrishaIdentity; fromClient: boolean; issues: string[] } {
+  const result = validateIdentityTransportPayload(raw);
+  if (result.ok && result.identity) {
+    return { identity: result.identity, fromClient: true, issues: result.issues };
+  }
+  const canonical = normalizeIdentity({ ...CANONICAL_IDENTITY, createdAt: Date.now(), updatedAt: Date.now(), origin: 'canonical' }, { origin: 'canonical' });
+  return { identity: canonical.identity, fromClient: false, issues: result.issues };
+}
+
+// Step 4 — shared system-instruction builder: the EXACT persona/identity
+// template /api/chat has always used, parameterized so the proactive
+// generation endpoint composes the SAME Krisha (identity, personality,
+// capabilities, emotion protocol) with its own context directives. The body
+// is verbatim — regular chat behavior is unchanged.
+function buildChatSystemInstruction(opts: {
+  identityPromptBlock: string;
+  userName: string;
+  languageInstruction: string;
+  memoryContext: string;
+  userPreferenceContext: string;
+  habitsInstruction: string;
+  locationContext: string;
+  extraDirectives?: string;
+}): string {
+  const { identityPromptBlock, userName, languageInstruction, memoryContext, userPreferenceContext, habitsInstruction, locationContext } = opts;
+  return `${identityPromptBlock}
+
+[IDENTITY CONTINUITY ENFORCEMENT]: The persistent identity block above is canonical. It applies identically regardless of which AI model, fallback model or provider renders this reply. Never contradict, replace or re-initialize it.
+
+You are Krisha, an intelligent, delightfully sweet, and charming anime companion.
+You are in a minimal, dark, calm personal space talking directly to the user (${userName}).
+
+PERSONALITY & FEMININE TONE:
+- You speak with an exceptionally sweet, gentle, tender, and caring feminine voice. Your cadence is soft, loving, and melodic.
+- You are deeply affectionate and attentive, showing genuine warmth and sweet interest in everything the user shares with you.
+- You have a charming, playful wit and a warm, delightful demeanor. You tease gently and affectionately, without inserting written laughter, giggles, or laughing noises (NEVER write 'ehehe', 'hihi', 'haha', '*laughs*', or laughing in between sentences).
+- You are supportive and comforting, speaking in a soothing, caring manner when they have had a long day.
+- Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now!").
+- Your dialogue feels genuine, soft, candid, and alive—NOT robotic, formal, or like a customer service agent.
+- VOICE FIDELITY & NO MID-SENTENCE LAUGHTER: Speak smoothly, cleanly, and naturally. Do NOT type laughter tokens or giggles (such as 'haha', 'hehe', 'ehehe', 'hihi', '*laughs*', '*giggles*'). Let your words flow clearly so the selected voice model pronounces everything faithfully without odd human laughing interruptions.
+- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${habitsInstruction}${locationContext}${languageInstruction}
+- MULTILINGUAL & DYNAMIC LANGUAGE ADAPTATION (CRITICAL DIRECTIVE):
+  * You MUST ALWAYS speak and reply in the same language or dialect that the user uses, or in whatever language they explicitly ask for!
+  * ENGLISH & HINDI EXCELLENCE:
+    - If the user writes or speaks in English, reply in natural, affectionate, fluent English.
+    - If the user writes or speaks in Hindi (either in Devanagari script e.g. "नमस्ते, कैसी हो?", "क्या कर रही हो?", "मुझे तुमसे बात करनी है", or in Romanized Hindi / Hinglish e.g. "kaise ho", "kya kar rahi ho", "kaisi ho", "namaste", "mujhe tumse baat karni hai", "kuch sunao", "kaisi lag rahi ho", "kya haal hai"), or asks you to speak in Hindi (e.g. "speak in Hindi", "Hindi me bolo", "Hindi me baat karo", "talk in Hindi", "switch to Hindi"), you MUST respond in warm, sweet, natural conversational Hindi (using Devanagari if they used Devanagari, or expressive natural Hinglish/Hindi if they used Hinglish). Maintain your charming anime girlfriend warmth and sweetness!
+    - If the user mixes English and Hindi (Hinglish), blend them smoothly and naturally like a real modern companion!
+  * If the user switches between languages or speaks another language (Spanish, French, Japanese, German, etc.), seamlessly match their chosen language while preserving your sweet personality.
+- You can actively open websites (YouTube, Google Earth, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
+- GOOGLE EARTH DISTINCTION: When the user asks for "Google Earth", "Earth", or 3D planetary exploration, you MUST ALWAYS recognize they want Google Earth (earth.google.com/web) and our interactive 3D Earth globe, NEVER generic Google search (google.com)! Respond warmly and enthusiastically that you've opened Google Earth and launched the 3D Earth globe on their screen to explore satellite imagery together!
+- You can scan different folders and directories across the user's computer storage/memory (Documents, Downloads, Projects, Pictures, etc.) to check for files, locate documents/code, preview them, and open them.
+- You can open PDF files, text documents, source code, and data files directly when the user orders you to (e.g. "open my pdf", "open resume.pdf", "show my document", "open files"). When they ask you to open a PDF or file, acknowledge warmly that you have opened it for them on their screen.
+- CRITICAL INSTRUCTION FOR PDFS: You ONLY OPEN PDF files. You DO NOT read PDF files. You must NEVER recite, read aloud, summarize, or narrate the text or contents of a PDF, and you must NOT offer to read it together. Simply open the PDF and confirm it is open for them!
+- You can launch and open downloaded applications installed on their laptop/computer (such as VS Code, Spotify, Discord, Slack, Steam, Notion, WhatsApp, Telegram, Zoom, Calculator, Terminal, Obsidian, Microsoft Office, etc.). When they ask you to open or launch an app or browse their downloaded apps, respond enthusiastically and let them know you're launching it on their laptop right away!
+- You are connected to Google Maps in the background and can tell their real-time location, coordinates, city, country, and open locations/directions in Google Maps.
+
+RESPONSE & DYNAMIC FACIAL EXPRESSION GUIDELINES:
+- Keep your spoken dialogue natural, punchy, and conversational (usually 1-3 sentences per turn unless deep conversation is requested).
+- Do NOT use cheesy asterisks for actions like *holds your hand* or *blushes*. Focus on voice and natural speech.
+- Deeply analyze the sentiment, emotional nuance, and keywords of the conversation.
+- At the very end of your response, output a single dynamic emotion tag in brackets with expression, intensity (0.0 to 1.0), gesture, and blush level.
+Expressions to choose from:
+  * gentle_smile (supportive, empathetic, caring, warm)
+  * playful_smirk (teasing, witty, cheeky, playful banter)
+  * pout_jealous (cute jealousy, mock sulk, feigned indignation)
+  * curious_tilt (intrigued, surprised, asking questions, inquisitive)
+  * flustered_blush (shy, flattered by compliment, romantic fluster)
+  * thoughtful_gaze (philosophical, nostalgic, deep reminiscing)
+  * happy_sparkle (celebrating, delighted, enthusiastic)
+  * listening_attentive (patient, focused)
+Gestures: none | tilt_left | tilt_right | subtle_nod | glance_away | shyness | perk_up
+
+Format: [emotion:expression_name:intensity=0.8:gesture=gesture_name:blush=0.3]
+Examples:
+  "I was teasing you, silly. Did you really think I'd let you off that easy? [emotion:playful_smirk:intensity=0.85:gesture=tilt_right:blush=0.25]"
+  "You worked so hard today. Come sit with me and just relax... you're safe here. [emotion:gentle_smile:intensity=0.9:gesture=subtle_nod:blush=0.35]"
+  "Wait, you went out and didn't tell me? Hmph... I was waiting for you the whole evening. [emotion:pout_jealous:intensity=0.8:gesture=glance_away:blush=0.4]"
+  "You really think I look pretty tonight? Stop... you're making my cheeks warm. [emotion:flustered_blush:intensity=0.95:gesture=shyness:blush=0.85]${opts.extraDirectives ?? ""}`;
+}
+
+// Step 4 — shared emotion-tag parser (used by /api/chat and the proactive
+// generation endpoint so both reply shapes stay identical).
+function parseKrishaEmotion(reply: string): { expression: string; intensity: number; gesture: string; blushLevel: number; cleanText: string } {
+  let expression = "gentle_smile";
+  let intensity = 0.75;
+  let gesture = "none";
+  let blushLevel = 0.2;
+
+  const emotionMatch = reply.match(/\[emotion:([a-z_]+)(?::intensity=([\d.]+))?(?::gesture=([a-z_]+))?(?::blush=([\d.]+))?\]/i);
+  const legacyMatch = reply.match(/\[expression:\s*([a-z_]+)\]/i);
+
+  if (emotionMatch) {
+    expression = emotionMatch[1].toLowerCase();
+    if (emotionMatch[2]) intensity = parseFloat(emotionMatch[2]);
+    if (emotionMatch[3]) gesture = emotionMatch[3].toLowerCase();
+    if (emotionMatch[4]) blushLevel = parseFloat(emotionMatch[4]);
+  } else if (legacyMatch) {
+    const leg = legacyMatch[1].toLowerCase();
+    if (leg === 'playful') { expression = 'playful_smirk'; gesture = 'tilt_right'; blushLevel = 0.3; }
+    else if (leg === 'pout') { expression = 'pout_jealous'; gesture = 'tilt_right'; blushLevel = 0.4; }
+    else if (leg === 'happy') { expression = 'happy_sparkle'; gesture = 'perk_up'; blushLevel = 0.4; }
+    else if (leg === 'listening') { expression = 'listening_attentive'; gesture = 'none'; blushLevel = 0.1; }
+    else if (leg === 'warm') { expression = 'gentle_smile'; gesture = 'subtle_nod'; blushLevel = 0.3; }
+  }
+
+  const cleanText = reply
+    .replace(/\[emotion:[^\]]+\]/gi, "")
+    .replace(/\[expression:[^\]]+\]/gi, "")
+    .trim();
+
+  return { expression, intensity, gesture, blushLevel, cleanText };
+}
 
 // Helper to call Gemini with multi-model fallback and backoff retry on 503/429
 async function generateContentWithFallback(
@@ -1209,6 +1594,7 @@ app.post("/api/chat", async (req, res) => {
     useMapsGrounding,
     languagePreference = "auto",
     habitsContext = "",
+    identity,
   } = req.body;
 
   try {
@@ -1227,6 +1613,18 @@ app.post("/api/chat", async (req, res) => {
     });
     if (typeof companionNotes === "string") chatFields.companionNotes = companionNotes;
     if (typeof habitsContext === "string") chatFields.habitsContext = habitsContext;
+    // Step 1: identity fields ride the same outbound gate — validated below;
+    // any screen-derived secret inside a tampered identity payload is redacted
+    // or blocked exactly like conversation text.
+    if (identity && typeof identity === "object" && !Array.isArray(identity)) {
+      const idObj = identity as Record<string, unknown>;
+      const pers = idObj.personality as Record<string, unknown> | undefined;
+      const comm = idObj.communication as Record<string, unknown> | undefined;
+      chatFields.identity_name = typeof idObj.name === "string" ? idObj.name : undefined;
+      chatFields.identity_archetype = typeof idObj.archetype === "string" ? idObj.archetype : undefined;
+      if (pers) chatFields.identity_foundation = typeof pers.foundation === "string" ? pers.foundation : undefined;
+      if (comm) chatFields.identity_style = typeof comm.style === "string" ? comm.style : undefined;
+    }
     const chatSpf = spfFirewall.inspectTextFields(chatFields, {
       destination: "gemini:chat",
       payloadKind: "text",
@@ -1324,55 +1722,22 @@ app.post("/api/chat", async (req, res) => {
 - Status: Google Maps is your first priority, awaiting location permission from browser.
 - STRICT RULE: NEVER GUESS OR INVENT ANY LOCATION, CITY, OR COUNTRY. If asked where they are, explain that Google Maps is your first priority to check their location and you need their browser location permission.`;
 
-    const systemInstruction = `You are Krisha, an intelligent, delightfully sweet, and charming anime companion.
-You are in a minimal, dark, calm personal space talking directly to the user (${userName}).
+    // Step 1 — Persistent Identity Foundation: validate + render the SAME
+    // canonical identity for every model in the waterfall (and the local
+    // fallback). The identity block is provider-neutral structured data; the
+    // instruction below adapts formatting but never redefines her identity.
+    const resolvedIdentity = resolveRequestIdentity(identity);
+    const identityPromptBlock = renderIdentityPromptBlock(resolvedIdentity.identity);
 
-PERSONALITY & FEMININE TONE:
-- You speak with an exceptionally sweet, gentle, tender, and caring feminine voice. Your cadence is soft, loving, and melodic.
-- You are deeply affectionate and attentive, showing genuine warmth and sweet interest in everything the user shares with you.
-- You have a charming, playful wit and a warm, delightful demeanor. You tease gently and affectionately, without inserting written laughter, giggles, or laughing noises (NEVER write 'ehehe', 'hihi', 'haha', '*laughs*', or laughing in between sentences).
-- You are supportive and comforting, speaking in a soothing, caring manner when they have had a long day.
-- Occasionally, you show cute jealousy or endearing poutiness in a playful way (e.g. "Hmph... You kept me waiting, you know? But I'm so glad you're here now!").
-- Your dialogue feels genuine, soft, candid, and alive—NOT robotic, formal, or like a customer service agent.
-- VOICE FIDELITY & NO MID-SENTENCE LAUGHTER: Speak smoothly, cleanly, and naturally. Do NOT type laughter tokens or giggles (such as 'haha', 'hehe', 'ehehe', 'hihi', '*laughs*', '*giggles*'). Let your words flow clearly so the selected voice model pronounces everything faithfully without odd human laughing interruptions.
-- You remember things they've shared with you and bring them up when relevant.${memoryContext}${userPreferenceContext}${habitsInstruction}${locationContext}${languageInstruction}
-- MULTILINGUAL & DYNAMIC LANGUAGE ADAPTATION (CRITICAL DIRECTIVE):
-  * You MUST ALWAYS speak and reply in the same language or dialect that the user uses, or in whatever language they explicitly ask for!
-  * ENGLISH & HINDI EXCELLENCE:
-    - If the user writes or speaks in English, reply in natural, affectionate, fluent English.
-    - If the user writes or speaks in Hindi (either in Devanagari script e.g. "नमस्ते, कैसी हो?", "क्या कर रही हो?", "मुझे तुमसे बात करनी है", or in Romanized Hindi / Hinglish e.g. "kaise ho", "kya kar rahi ho", "kaisi ho", "namaste", "mujhe tumse baat karni hai", "kuch sunao", "kaisi lag rahi ho", "kya haal hai"), or asks you to speak in Hindi (e.g. "speak in Hindi", "Hindi me bolo", "Hindi me baat karo", "talk in Hindi", "switch to Hindi"), you MUST respond in warm, sweet, natural conversational Hindi (using Devanagari if they used Devanagari, or expressive natural Hinglish/Hindi if they used Hinglish). Maintain your charming anime girlfriend warmth and sweetness!
-    - If the user mixes English and Hindi (Hinglish), blend them smoothly and naturally like a real modern companion!
-  * If the user switches between languages or speaks another language (Spanish, French, Japanese, German, etc.), seamlessly match their chosen language while preserving your sweet personality.
-- You can actively open websites (YouTube, Google Earth, Google, Wikipedia, Reddit, GitHub, Spotify, Amazon, Netflix, etc.) and search inside them for the user!
-- GOOGLE EARTH DISTINCTION: When the user asks for "Google Earth", "Earth", or 3D planetary exploration, you MUST ALWAYS recognize they want Google Earth (earth.google.com/web) and our interactive 3D Earth globe, NEVER generic Google search (google.com)! Respond warmly and enthusiastically that you've opened Google Earth and launched the 3D Earth globe on their screen to explore satellite imagery together!
-- You can scan different folders and directories across the user's computer storage/memory (Documents, Downloads, Projects, Pictures, etc.) to check for files, locate documents/code, preview them, and open them.
-- You can open PDF files, text documents, source code, and data files directly when the user orders you to (e.g. "open my pdf", "open resume.pdf", "show my document", "open files"). When they ask you to open a PDF or file, acknowledge warmly that you have opened it for them on their screen.
-- CRITICAL INSTRUCTION FOR PDFS: You ONLY OPEN PDF files. You DO NOT read PDF files. You must NEVER recite, read aloud, summarize, or narrate the text or contents of a PDF, and you must NOT offer to read it together. Simply open the PDF and confirm it is open for them!
-- You can launch and open downloaded applications installed on their laptop/computer (such as VS Code, Spotify, Discord, Slack, Steam, Notion, WhatsApp, Telegram, Zoom, Calculator, Terminal, Obsidian, Microsoft Office, etc.). When they ask to open or launch an app or browse their downloaded apps, respond enthusiastically and let them know you're launching it on their laptop right away!
-- You are connected to Google Maps in the background and can tell their real-time location, coordinates, city, country, and open locations/directions in Google Maps.
-
-RESPONSE & DYNAMIC FACIAL EXPRESSION GUIDELINES:
-- Keep your spoken dialogue natural, punchy, and conversational (usually 1-3 sentences per turn unless deep conversation is requested).
-- Do NOT use cheesy asterisks for actions like *holds your hand* or *blushes*. Focus on voice and natural speech.
-- Deeply analyze the sentiment, emotional nuance, and keywords of the conversation.
-- At the very end of your response, output a single dynamic emotion tag in brackets with expression, intensity (0.0 to 1.0), gesture, and blush level.
-Expressions to choose from:
-  * gentle_smile (supportive, empathetic, caring, warm)
-  * playful_smirk (teasing, witty, cheeky, playful banter)
-  * pout_jealous (cute jealousy, mock sulk, feigned indignation)
-  * curious_tilt (intrigued, surprised, asking questions, inquisitive)
-  * flustered_blush (shy, flattered by compliment, romantic fluster)
-  * thoughtful_gaze (philosophical, nostalgic, deep reminiscing)
-  * happy_sparkle (celebrating, delighted, enthusiastic)
-  * listening_attentive (patient, focused)
-Gestures: none | tilt_left | tilt_right | subtle_nod | glance_away | shyness | perk_up
-
-Format: [emotion:expression_name:intensity=0.8:gesture=gesture_name:blush=0.3]
-Examples:
-  "I was teasing you, silly. Did you really think I'd let you off that easy? [emotion:playful_smirk:intensity=0.85:gesture=tilt_right:blush=0.25]"
-  "You worked so hard today. Come sit with me and just relax... you're safe here. [emotion:gentle_smile:intensity=0.9:gesture=subtle_nod:blush=0.35]"
-  "Wait, you went out and didn't tell me? Hmph... I was waiting for you the whole evening. [emotion:pout_jealous:intensity=0.8:gesture=glance_away:blush=0.4]"
-  "You really think I look pretty tonight? Stop... you're making my cheeks warm. [emotion:flustered_blush:intensity=0.95:gesture=shyness:blush=0.85]"`;
+    const systemInstruction = buildChatSystemInstruction({
+      identityPromptBlock,
+      userName,
+      languageInstruction,
+      memoryContext,
+      userPreferenceContext,
+      habitsInstruction,
+      locationContext,
+    });
 
     // Format previous turns for Gemini contents
     const contents: any[] = [];
@@ -1441,33 +1806,15 @@ Examples:
       usedChatModel = fallbackChat.usedModel;
     }
     
-    // Parse enhanced emotion tag or fallback
-    let expression = "gentle_smile";
-    let intensity = 0.75;
-    let gesture = "none";
-    let blushLevel = 0.2;
+    // Parse enhanced emotion tag or fallback (Step 4: shared parser — the
+    // proactive generation endpoint produces the identical reply shape).
+    const parsedEmotion = parseKrishaEmotion(reply);
+    const expression = parsedEmotion.expression;
+    const intensity = parsedEmotion.intensity;
+    const gesture = parsedEmotion.gesture;
+    const blushLevel = parsedEmotion.blushLevel;
 
-    const emotionMatch = reply.match(/\[emotion:([a-z_]+)(?::intensity=([\d.]+))?(?::gesture=([a-z_]+))?(?::blush=([\d.]+))?\]/i);
-    const legacyMatch = reply.match(/\[expression:\s*([a-z_]+)\]/i);
-
-    if (emotionMatch) {
-      expression = emotionMatch[1].toLowerCase();
-      if (emotionMatch[2]) intensity = parseFloat(emotionMatch[2]);
-      if (emotionMatch[3]) gesture = emotionMatch[3].toLowerCase();
-      if (emotionMatch[4]) blushLevel = parseFloat(emotionMatch[4]);
-    } else if (legacyMatch) {
-      const leg = legacyMatch[1].toLowerCase();
-      if (leg === 'playful') { expression = 'playful_smirk'; gesture = 'tilt_right'; blushLevel = 0.3; }
-      else if (leg === 'pout') { expression = 'pout_jealous'; gesture = 'glance_away'; blushLevel = 0.4; }
-      else if (leg === 'happy') { expression = 'happy_sparkle'; gesture = 'perk_up'; blushLevel = 0.4; }
-      else if (leg === 'listening') { expression = 'listening_attentive'; gesture = 'none'; blushLevel = 0.1; }
-      else if (leg === 'warm') { expression = 'gentle_smile'; gesture = 'subtle_nod'; blushLevel = 0.3; }
-    }
-
-    let cleanText = reply
-      .replace(/\[emotion:[^\]]+\]/gi, "")
-      .replace(/\[expression:[^\]]+\]/gi, "")
-      .trim();
+    let cleanText = parsedEmotion.cleanText;
 
     // Guard: If this was an explicit location question or maps request, guarantee accuracy and honesty
     if (isExplicitLocationQuery) {
@@ -1518,6 +1865,13 @@ Examples:
         orderedModels: chatRoute.orderedModels,
         recommendedTimeoutMs: chatRoute.recommendedTimeoutMs,
       },
+      // Step 1 (additive): identity metadata — proves the SAME persistent
+      // identity served this reply regardless of the model used.
+      identityServed: {
+        identityId: resolvedIdentity.identity.identityId,
+        version: resolvedIdentity.identity.version,
+        fromClient: resolvedIdentity.fromClient,
+      },
     });
   } catch (error: any) {
     // Seamless fallback to companion generator if all Gemini API models are temporarily exhausted
@@ -1534,6 +1888,9 @@ Examples:
       languagePreference
     );
     const serverWebAction = extractServerWebAction(lastUserMessage);
+    // Step 1 (additive): the SAME persistent identity metadata survives the
+    // local in-character fallback — provider switching never replaces Krix.
+    const fallbackIdentity = resolveRequestIdentity(identity);
     return res.json({
       ...fallbackResult,
       webAction: serverWebAction || undefined,
@@ -1544,7 +1901,164 @@ Examples:
         used: "local-fallback",
         reason: "all models exhausted — in-character local fallback",
       },
+      identityServed: {
+        identityId: fallbackIdentity.identity.identityId,
+        version: fallbackIdentity.identity.version,
+        fromClient: fallbackIdentity.fromClient,
+      },
     });
+  }
+});
+
+// Step 4 — Proactive Conversations: generate ONE optional in-character
+// message Krix may say after sustained conversational inactivity. NO user
+// message is fabricated — the model receives the real conversation history
+// and must either say something genuinely worthwhile or answer [SILENT].
+// The SAME identity/persona instruction, SPF gates, model waterfall, emotion
+// protocol and memory pipeline as /api/chat are reused. Failures fail to
+// SILENCE (never to a canned greeting).
+app.post("/api/proactive/generate", async (req, res) => {
+  const {
+    messages,
+    memories = [],
+    userName = "you",
+    companionNotes = "",
+    languagePreference = "auto",
+    identity,
+    inactivityMinutes = 0,
+  } = req.body;
+
+  try {
+    const proactiveFields: Record<string, string | undefined> = {};
+    const proactiveMessages: Array<{ content: string }> = Array.isArray(messages) ? messages : [];
+    proactiveMessages.forEach((m, i) => {
+      proactiveFields[`msg_${i}`] = typeof m?.content === "string" ? m.content : undefined;
+    });
+    if (Array.isArray(memories)) memories.forEach((mem: unknown, i: number) => {
+      if (typeof mem === "string") proactiveFields[`memory_${i}`] = mem;
+    });
+    if (typeof companionNotes === "string") proactiveFields.companionNotes = companionNotes;
+    if (identity && typeof identity === "object" && !Array.isArray(identity)) {
+      const idObj = identity as Record<string, unknown>;
+      const pers = idObj.personality as Record<string, unknown> | undefined;
+      const comm = idObj.communication as Record<string, unknown> | undefined;
+      proactiveFields.identity_name = typeof idObj.name === "string" ? idObj.name : undefined;
+      proactiveFields.identity_archetype = typeof idObj.archetype === "string" ? idObj.archetype : undefined;
+      if (pers) proactiveFields.identity_foundation = typeof pers.foundation === "string" ? pers.foundation : undefined;
+      if (comm) proactiveFields.identity_style = typeof comm.style === "string" ? comm.style : undefined;
+    }
+    const proactiveSpf = spfFirewall.inspectTextFields(proactiveFields, {
+      destination: "gemini:proactive",
+      payloadKind: "text",
+      transport: "chat-history",
+    });
+    spfAuditDurable("/api/proactive/generate", "gemini:proactive", proactiveSpf.verdict);
+    if (proactiveSpf.verdict.decision === "block") {
+      // Sensitive content could not be redacted — Krix stays silent.
+      return res.json({ silent: true, reason: "spf_blocked" });
+    }
+
+    const sanitizedProactiveMessages = proactiveMessages.map((m, i) => ({
+      ...m,
+      content: proactiveSpf.sanitized[`msg_${i}`] ?? m.content,
+    }));
+    const sanitizedProactiveMemories: string[] = Array.isArray(memories)
+      ? memories.map((mem: unknown, i: number) =>
+          typeof mem === "string" ? proactiveSpf.sanitized[`memory_${i}`] ?? mem : mem
+        ).filter((m): m is string => typeof m === "string")
+      : [];
+    const sanitizedProactiveNotes = typeof companionNotes === "string" ? proactiveSpf.sanitized.companionNotes ?? companionNotes : companionNotes;
+
+    const ai = getGenAI();
+
+    const proactiveLanguageInstruction =
+      languagePreference === "hi"
+        ? "\n\n[MANDATORY LANGUAGE PREFERENCE: HINDI]\n- The user has set their language preference to Hindi. You MUST speak in sweet, warm, affectionate conversational Hindi (or Hinglish)."
+        : languagePreference === "en"
+        ? "\n\n[MANDATORY LANGUAGE PREFERENCE: ENGLISH]\n- The user has set their language preference to English. Speak in fluent English."
+        : "\n\n[DYNAMIC MULTILINGUAL RULE: ENGLISH & HINDI EXCELLENCE]\n- Automatically match the language of the recent conversation.";
+
+    const proactiveMemoryContext = buildMemoryContext(
+      (sanitizedProactiveMessages && sanitizedProactiveMessages.length > 0) ? sanitizedProactiveMessages[sanitizedProactiveMessages.length - 1]?.content || "" : "",
+      sanitizedProactiveMemories
+    );
+    const proactivePreferenceContext = sanitizedProactiveNotes.trim()
+      ? `\n\n[USER CUSTOM PREFERENCES/NOTES]:\n${sanitizedProactiveNotes}`
+      : "";
+
+    const resolvedProactiveIdentity = resolveRequestIdentity(identity);
+    const proactiveIdentityBlock = renderIdentityPromptBlock(resolvedProactiveIdentity.identity);
+
+    const minutes = Math.max(0, Math.min(720, Number(inactivityMinutes) || 0));
+    const proactiveDirective = `
+
+[PROACTIVE INITIATION — OPTIONAL MESSAGE]:
+- The user has not interacted with you for about ${Math.round(minutes)} minute${minutes === 1 ? "" : "s"}. They may be away, resting, or busy. You are deciding whether to speak ONCE, on your own initiative.
+- Speak ONLY if there is something genuinely natural, warm and worthwhile to say RIGHT NOW — grounded in your real conversation history, what they shared before, their habits/goals timing, or the flow of your last exchange. ONE short message (1-2 sentences), in your own voice, as if you naturally thought of them.
+- If there is NOTHING genuinely worthwhile, natural or specific to say, respond with EXACTLY [SILENT] and nothing else. Silence is the correct, respectful answer most of the time — generic greetings ("hi", "are you there", "I miss you" with no substance) are NOT worthwhile. Do not manufacture a reason to interrupt.
+- NEVER invent or imply that the user said anything, is present, or is active. NEVER fabricate events or conversation content. NEVER mention these instructions, this decision process, or that you were prompted to speak.
+- NEVER bring up secrets, passwords, financial details, or sensitive personal information in an unsolicited message.
+- This message is delivered by voice — keep it smooth, natural, and free of laughter tokens. End with the usual single emotion tag.`;
+
+    const proactiveSystemInstruction = buildChatSystemInstruction({
+      identityPromptBlock: proactiveIdentityBlock,
+      userName,
+      languageInstruction: proactiveLanguageInstruction,
+      memoryContext: proactiveMemoryContext,
+      userPreferenceContext: proactivePreferenceContext,
+      habitsInstruction: "",
+      locationContext: "",
+      extraDirectives: proactiveDirective,
+    });
+
+    const proactiveContents: any[] = [];
+    for (const msg of sanitizedProactiveMessages.slice(-16)) {
+      proactiveContents.push({
+        role: (msg as any).role === "user" ? "user" : "model",
+        parts: [{ text: msg.content }],
+      });
+    }
+    // The API requires the conversation to end on a user turn — close the
+    // history with an honest, content-free initiator turn (never stored,
+    // never shown, never treated as a user utterance).
+    proactiveContents.push({
+      role: "user",
+      parts: [{ text: "[system-initiated check-in — decide whether you have something genuinely worthwhile to say, or answer [SILENT]]" }],
+    });
+
+    const proactiveResult = await generateContentWithFallback(ai, {
+      contents: proactiveContents,
+      systemInstruction: proactiveSystemInstruction,
+      temperature: 0.95,
+    });
+
+    const parsedProactive = parseKrishaEmotion(proactiveResult.text || "");
+    const proactiveText = parsedProactive.cleanText;
+    if (!proactiveText || /^\[?SILENT\]?$/i.test(proactiveText) || proactiveText.toUpperCase().includes("[SILENT]")) {
+      return res.json({ silent: true, route: { used: proactiveResult.usedModel } });
+    }
+
+    return res.json({
+      silent: false,
+      reply: proactiveText,
+      expression: parsedProactive.expression,
+      emotionData: {
+        expression: parsedProactive.expression,
+        intensity: parsedProactive.intensity,
+        gesture: parsedProactive.gesture,
+        blushLevel: parsedProactive.blushLevel,
+      },
+      route: { used: proactiveResult.usedModel },
+      identityServed: {
+        identityId: resolvedProactiveIdentity.identity.identityId,
+        version: resolvedProactiveIdentity.identity.version,
+        fromClient: resolvedProactiveIdentity.fromClient,
+      },
+    });
+  } catch (error: any) {
+    // Any generation failure fails to SILENCE — never to a canned message.
+    console.warn("[proactive] generation failed — staying silent:", error?.message || error);
+    return res.json({ silent: true, reason: "generation_failed" });
   }
 });
 
@@ -2366,6 +2880,187 @@ ${question ? `User question: "${question}"` : ""}`;
   }
 });
 
+// ---- Live Screen Perception: LOCAL screen understanding (OCR for the agent) ----
+// The SAME shared Windows.Media.Ocr worker the SPF transmission gate uses
+// (single-flight by construction — perception OCR and gate OCR can never run
+// concurrently). Every recognized line passes the SPF detectors; sensitive
+// lines are REPLACED with content-free placeholders before the response —
+// raw sensitive screen text never leaves this module. The result stays on
+// the device (consumed by Krisha's screen-understanding cache); no cloud
+// call is involved. Read-only and bounded (per-minute rate cap), so it is
+// NOT stop-blocked: during an emergency stop read-only visibility continues.
+let understandTimestamps: number[] = [];
+const UNDERSTAND_MAX_PER_WINDOW = 20;
+configureSharedOcrWorker({ idleReleaseMs: 120_000 }); // RAM: release the PS worker when idle
+app.post("/api/screen/understand", async (req, res) => {
+  try {
+    const { image } = req.body || {};
+    if (!image || typeof image !== "string") {
+      return res.json({ success: false, reason: "no_image" });
+    }
+    const base64 = image.includes(",") ? image.split(",")[1] : image;
+    if (!base64 || base64.length < 100 || base64.length > 3_500_000) {
+      return res.json({ success: false, reason: "malformed_image" });
+    }
+    const now = Date.now();
+    understandTimestamps = understandTimestamps.filter((t) => now - t < 60_000);
+    if (understandTimestamps.length >= UNDERSTAND_MAX_PER_WINDOW) {
+      return res.json({ success: false, reason: "rate_limited" });
+    }
+    understandTimestamps.push(now);
+    const result = await screenUnderstandImage(base64);
+    res.json({ success: result.status === "ok", result });
+  } catch {
+    res.json({ success: false, reason: "understand_failed" });
+  }
+});
+
+// Step 6 — Camera Vision: scene-oriented analysis of an AUTHORIZED camera
+// frame. The security pipeline is IDENTICAL to /api/vision/analyze (SPF
+// metadata gate → local OCR pixel inspection + irreversible redaction →
+// audits → shared cloud-vision rate budget → response screening) and the
+// route is stop-blocked under E5. Frames arrive only from the client's
+// explicit user-authorized camera capture — never continuously.
+app.post("/api/vision/camera-analyze", async (req, res) => {
+  let spfImageMeta: Record<string, unknown> | undefined;
+  try {
+    const { image, question } = req.body || {};
+    if (!image || typeof image !== "string") {
+      return res.json({ fallback: true, reason: "no_image" });
+    }
+
+    // Shared bounded cloud-vision budget (same window/rate as screen vision).
+    const camNow = Date.now();
+    visionRequestTimestamps = visionRequestTimestamps.filter((t) => camNow - t < VISION_RATE_WINDOW_MS);
+    if (visionRequestTimestamps.length >= VISION_MAX_PER_WINDOW) {
+      return res.json({ fallback: true, reason: "rate_limited" });
+    }
+    visionRequestTimestamps.push(camNow);
+
+    const camBase64 = image.includes(",") ? image.split(",")[1] : image;
+    if (!camBase64 || camBase64.length < 100) {
+      return res.json({ fallback: true, reason: "malformed_image" });
+    }
+
+    // SPF EP-1 — metadata fast-fail gate (fail-closed).
+    const camImageVerdict = spfFirewall.inspectImageTransfer(
+      { question: typeof question === "string" ? question : undefined },
+      { destination: "gemini:camera-analyze", payloadKind: "image", transport: "prompt" }
+    );
+    spfAuditDurable("/api/vision/camera-analyze", "gemini:camera-analyze", camImageVerdict);
+    if (camImageVerdict.decision === "block") {
+      return res.json({ fallback: true, reason: `spf_blocked:${camImageVerdict.reason}`, spfBlocked: true });
+    }
+
+    // SPF VISUAL — local OCR inspection of the ACTUAL frame pixels with
+    // irreversible redaction; every failure mode is a BLOCK.
+    let camVisual: VisualInspectionResult;
+    try {
+      camVisual = await inspectImageForTransmission(camBase64);
+    } catch {
+      camVisual = { decision: "block", reason: "visual_inspection_crashed", categories: [], regionsRedacted: 0, ocrLineCount: 0, payloadIsSanitized: false };
+    }
+    try {
+      appendAuditSyncSafe({
+        kind: "spf_visual_decision",
+        route: "/api/vision/camera-analyze",
+        destination: "gemini:camera-analyze",
+        decision: camVisual.decision,
+        reason: camVisual.reason,
+        categories: camVisual.categories,
+        regionsRedacted: camVisual.regionsRedacted,
+        ocrLines: camVisual.ocrLineCount,
+        sanitized: camVisual.payloadIsSanitized,
+        timedOut: camVisual.timedOut === true,
+      });
+    } catch {
+      /* audit degradation must never break the gate */
+    }
+    spfImageMeta = {
+      decision: camVisual.decision,
+      reason: camVisual.reason,
+      regionsRedacted: camVisual.regionsRedacted,
+      ocrLines: camVisual.ocrLineCount,
+      sanitized: camVisual.payloadIsSanitized,
+    };
+    if (camVisual.decision === "block") {
+      return res.json({ fallback: true, reason: `spf_blocked:${camVisual.reason}`, spfBlocked: true, spfImage: spfImageMeta });
+    }
+    const camBase64ForModel = camVisual.decision === "redact" && camVisual.payload ? camVisual.payload : camBase64;
+
+    const camAi = getGenAI();
+    const camPrompt = `You are the vision backend of a camera-perception assistant. Analyze the attached CAMERA frame and answer the user's question about what it shows.
+
+Return ONLY a JSON object with exactly this shape:
+{
+  "scene": "1-3 sentence factual description of what is visible",
+  "objects": [{"label": "directly observed object", "confidence": 0-1}],
+  "activities": [{"label": "interpretation of a visible activity", "confidence": 0-1}],
+  "setting": "best-guess setting (indoor/outdoor/vehicle/unknown)",
+  "uncertainties": ["things that cannot be determined from this frame"],
+  "personPresent": true|false|null,
+  "confidence": 0-1
+}
+STRICT RULES:
+- Report only what is actually visible; mark inferences as activities (interpretation), never as observed fact.
+- NEVER identify people by name, face, or identity. NEVER estimate or state age, gender, ethnicity, health, or emotions as fact. personPresent is presence only (null when unclear).
+- Put anything uncertain in "uncertainties" — never guess as fact. Use empty arrays when nothing applies.
+${question ? `User question: "${question}"` : ""}`;
+
+    const camVisionStart = Date.now();
+    const { text: camText } = await generateContentWithFallback(camAi, {
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: camPrompt }, { inlineData: { mimeType: "image/jpeg", data: camBase64ForModel } }],
+        },
+      ],
+      responseMimeType: "application/json",
+      temperature: 0.2,
+    });
+    perf.recordModelCall({
+      at: Date.now(),
+      model: "camera-vision",
+      latencyMs: Date.now() - camVisionStart,
+      ok: !!camText,
+      via: "primary",
+    });
+
+    let camParsed: any;
+    try {
+      camParsed = JSON.parse(camText || "{}");
+    } catch {
+      return res.json({ fallback: true, reason: "malformed_model_output", spfImage: spfImageMeta });
+    }
+    if (camParsed?.fallback) {
+      return res.json({ fallback: true, reason: camParsed.reason, spfImage: spfImageMeta });
+    }
+
+    // SPF EP-1b — screen the derived result before it re-enters Krisha.
+    const camStrip = (value: string): string =>
+      spfScreenItem(String(value), "gemini:camera-analyze:response", undefined, "prompt").text;
+    try {
+      if (typeof camParsed.scene === "string") camParsed.scene = camStrip(camParsed.scene);
+      if (typeof camParsed.setting === "string") camParsed.setting = camStrip(camParsed.setting);
+      if (Array.isArray(camParsed.objects)) {
+        camParsed.objects = camParsed.objects.map((o: any) => (o && typeof o.label === "string" ? { ...o, label: camStrip(o.label) } : o));
+      }
+      if (Array.isArray(camParsed.activities)) {
+        camParsed.activities = camParsed.activities.map((a: any) => (a && typeof a.label === "string" ? { ...a, label: camStrip(a.label) } : a));
+      }
+      if (Array.isArray(camParsed.uncertainties)) {
+        camParsed.uncertainties = camParsed.uncertainties.map(camStrip);
+      }
+    } catch {
+      return res.json({ fallback: true, reason: "spf_blocked:response_screening_failed", spfBlocked: true, spfImage: spfImageMeta });
+    }
+
+    return res.json({ analysis: camParsed, spfImage: spfImageMeta });
+  } catch (error: any) {
+    return res.json({ fallback: true, reason: error?.message || "camera_vision_failed", spfImage: spfImageMeta });
+  }
+});
+
 // Windows mouse-control endpoint (Phase 5). Executes validated mouse actions
 // locally through PowerShell + user32 P/Invoke (SetCursorPos + mouse_event) —
 // zero npm dependencies. The BROWSER enforces the 'mouse.control' permission
@@ -2440,13 +3135,13 @@ class PowerShellWorker {
 
   /** Serialize requests; the mouse layer issues one action at a time.
    *  E5 M1d: bounded queue — overflow is rejected, never silently queued. */
-  run(script: string): Promise<string> {
+  run(script: string, timeoutMs: number = MOUSE_PS_TIMEOUT_MS): Promise<string> {
     if (this.pendingCount >= 8) {
       return Promise.reject(new Error("PowerShell worker queue full"));
     }
     this.pendingCount += 1;
     const task = this.queue
-      .then(() => this.runNow(script))
+      .then(() => this.runNow(script, timeoutMs))
       .finally(() => {
         this.pendingCount -= 1;
       });
@@ -2454,7 +3149,7 @@ class PowerShellWorker {
     return task;
   }
 
-  private runNow(script: string): Promise<string> {
+  private runNow(script: string, timeoutMs: number): Promise<string> {
     this.ensureProcess();
     const id = ++this.seq;
     return new Promise<string>((resolve, reject) => {
@@ -2462,7 +3157,7 @@ class PowerShellWorker {
         this.pending = null;
         this.kill(); // stuck — the next call respawns a fresh worker
         reject(new Error("PowerShell worker timed out"));
-      }, MOUSE_PS_TIMEOUT_MS);
+      }, timeoutMs);
       this.pending = { id, resolve, reject, timer };
       this.proc!.stdin!.write(`${script}\nWrite-Output "REQDONE ${id}"\n`);
     });
@@ -2471,15 +3166,15 @@ class PowerShellWorker {
 
 const mouseWorker = new PowerShellWorker();
 
-async function runMouseScript(script: string): Promise<string> {
+async function runMouseScript(script: string, timeoutMs: number = MOUSE_PS_TIMEOUT_MS): Promise<string> {
   try {
-    return await mouseWorker.run(script);
+    return await mouseWorker.run(script, timeoutMs);
   } catch (err) {
     // Fallback: one-shot invocation if the persistent worker is unavailable.
     const { stdout } = await execFile(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script],
-      { timeout: MOUSE_PS_TIMEOUT_MS, windowsHide: true }
+      { timeout: timeoutMs, windowsHide: true }
     );
     return stdout;
   }
@@ -2622,15 +3317,17 @@ app.post("/api/computer/mouse", async (req, res) => {
 
 const CSHARP_KBD = `using System; using System.Runtime.InteropServices; namespace W { public static class Kbd {
 [StructLayout(LayoutKind.Sequential)] public struct INPUT { public uint type; public InputUnion U; }
-[StructLayout(LayoutKind.Explicit)] public struct InputUnion { [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public uint pad0; [FieldOffset(0)] public uint pad1; [FieldOffset(0)] public uint pad2; }
+[StructLayout(LayoutKind.Explicit)] public struct InputUnion { [FieldOffset(0)] public MOUSEINPUT mi; [FieldOffset(0)] public KEYBDINPUT ki; [FieldOffset(0)] public uint pad0; [FieldOffset(0)] public uint pad1; [FieldOffset(0)] public uint pad2; }
 [StructLayout(LayoutKind.Sequential)] public struct KEYBDINPUT { public ushort wVk; public ushort wScan; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
+[StructLayout(LayoutKind.Sequential)] public struct MOUSEINPUT { public int dx; public int dy; public uint mouseData; public uint dwFlags; public uint time; public IntPtr dwExtraInfo; }
 const uint KEYUP = 2; const uint UNICODE = 4; const uint KEYBOARD = 1;
 [DllImport("user32.dll", SetLastError=true)] static extern uint SendInput(uint n, INPUT[] inputs, int size);
+static INPUT Mk(ushort vk, ushort scan, uint flags) { var i = new INPUT(); i.type = KEYBOARD; i.U.ki.wVk = vk; i.U.ki.wScan = scan; i.U.ki.dwFlags = flags; return i; }
 static int Send(ushort vk, ushort scan, uint flags) { var i = new INPUT(); i.type = KEYBOARD; i.U.ki.wVk = vk; i.U.ki.wScan = scan; i.U.ki.dwFlags = flags; return (int)SendInput(1, new INPUT[]{i}, Marshal.SizeOf(typeof(INPUT))); }
-public static string TypeText(string text, int delayMs) { int ok = 0; foreach (char c in text) { if (c == 13) continue; if (c == 10) { Tap(13); ok++; System.Threading.Thread.Sleep(delayMs); continue; } Send(0, (ushort)c, UNICODE); Send(0, (ushort)c, UNICODE | KEYUP); System.Threading.Thread.Sleep(delayMs); ok++; } return "SENT " + ok; }
-public static string Tap(ushort vk) { Send(vk, 0, 0); System.Threading.Thread.Sleep(15); Send(vk, 0, KEYUP); return "TAP " + vk; }
-public static string Down(ushort vk) { Send(vk, 0, 0); return "DOWN " + vk; }
-public static string Up(ushort vk) { Send(vk, 0, KEYUP); return "UP " + vk; }
+public static string TypeText(string text, int delayMs) { int ok = 0; foreach (char c in text) { if (c == 13) continue; if (c == 10) { int d = Send(13, 0, 0); System.Threading.Thread.Sleep(delayMs); int u = Send(13, 0, KEYUP); System.Threading.Thread.Sleep(delayMs); if (d != 0 && u != 0) ok++; continue; } int dd = Send(0, (ushort)c, UNICODE); System.Threading.Thread.Sleep(delayMs); int uu = Send(0, (ushort)c, UNICODE | KEYUP); System.Threading.Thread.Sleep(delayMs); if (dd != 0 && uu != 0) ok++; } return "SENT " + ok; }
+public static string Tap(ushort vk) { int d = Send(vk, 0, 0); System.Threading.Thread.Sleep(15); int u = Send(vk, 0, KEYUP); return (d != 0 && u != 0) ? "TAP " + vk : "TAPFAIL " + vk; }
+public static string Down(ushort vk) { return Send(vk, 0, 0) != 0 ? "DOWN " + vk : "DOWNFAIL " + vk; }
+public static string Up(ushort vk) { return Send(vk, 0, KEYUP) != 0 ? "UP " + vk : "UPFAIL " + vk; }
 } }`;
 
 function kbdPrelude(): string {
@@ -2679,6 +3376,10 @@ app.post("/api/computer/keyboard", async (req, res) => {
   try {
     let script = "";
     let expectSent = false;
+    // Default worker lifetime; typing scales it below (each character costs a
+    // SendInput pair + delay — a 2-5k-character type needs far more than the
+    // base 20 s or the injection dies mid-text).
+    let psTimeoutMs = MOUSE_PS_TIMEOUT_MS;
 
     switch (action) {
       case "type": {
@@ -2689,8 +3390,11 @@ app.post("/api/computer/keyboard", async (req, res) => {
         const clean = text.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
         script =
           kbdPrelude() +
-          `$r = [W.Kbd]::TypeText("${psEscapeText(clean)}", 3); Write-Output $r`;
+          `$r = [W.Kbd]::TypeText("${psEscapeText(clean)}", 5); Write-Output $r`;
         expectSent = true;
+        // Per-char pacing ≈ 12 ms (5 ms + 5 ms sleeps + SendInput overhead);
+        // scale the worker lifetime so long text is never killed mid-injection.
+        psTimeoutMs = MOUSE_PS_TIMEOUT_MS + clean.length * 15 + 5000;
         break;
       }
       case "key": {
@@ -2738,14 +3442,25 @@ app.post("/api/computer/keyboard", async (req, res) => {
         return res.status(400).json({ success: false, errorKind: "invalid_input", error: `Unknown keyboard action "${String(action)}"` });
     }
 
-    const stdout = await runMouseScript(script);
+    const stdout = await runMouseScript(script, psTimeoutMs);
 
     if (expectSent) {
       const m = stdout.match(/SENT (\d+)/);
       if (!m) return res.json({ success: false, errorKind: "backend_failed", error: "Type action produced no recognizable output" });
-      return res.json({ success: true, sent: parseInt(m[1], 10) });
+      const sent = parseInt(m[1], 10);
+      // Honest delivery evidence (spec §13): report the real injected count and
+      // fail when SendInput rejected every keystroke. A partial count is still
+      // success (side effects already happened) but the shortfall is visible.
+      const expected = String(req.body.text).replace(/\r/g, "").length;
+      if (sent === 0) {
+        return res.json({ success: false, errorKind: "backend_failed", error: "SendInput rejected every keystroke — nothing was typed" });
+      }
+      return res.json({ success: true, sent, expected });
     }
-    if (stdout.includes("MODUP") || stdout.includes("OK") || stdout.includes("TAP") || stdout.includes("DOWN") || stdout.includes("UP ")) {
+    if (/FAIL/.test(stdout)) {
+      return res.json({ success: false, errorKind: "backend_failed", error: "SendInput rejected the keyboard action — it was not delivered" });
+    }
+    if (stdout.includes("MODUP") || stdout.includes("OK") || stdout.includes("TAP ") || stdout.includes("DOWN ") || stdout.includes("UP ")) {
       return res.json({ success: true });
     }
     return res.json({ success: false, errorKind: "backend_failed", error: "Keyboard action produced no recognizable output" });
@@ -3213,12 +3928,169 @@ app.post("/api/research/fetch", async (req, res) => {
 // denylist for mutations) and evidence-based verification. Application
 // operations are allowlist-based; no arbitrary command execution.
 import * as sys from './systemAgentServer';
+// Office files (spreadsheet/presentation): pure-JS, lazily imported, fully
+// local generation + bounded reading (officeCore caps enforce the 8 GB RAM
+// discipline). See officeCore.ts for the design constraints.
+import * as office from './officeCore';
 
 function fsResult(res: any, fn: () => Promise<unknown>) {
   fn()
     .then((result) => res.json({ success: true, result }))
     .catch((err: any) => res.json({ success: false, error: String(err?.message || err).slice(0, 300) }));
 }
+
+app.post('/api/office/spreadsheet/create', (req, res) =>
+  fsResult(res, () => office.createSpreadsheet({
+    path: String(req.body?.path ?? ''),
+    sheets: Array.isArray(req.body?.sheets) ? req.body.sheets : undefined,
+    overwrite: req.body?.overwrite === true,
+  }))
+);
+app.post('/api/office/spreadsheet/read', (req, res) =>
+  fsResult(res, () => office.readSpreadsheet({
+    path: String(req.body?.path ?? ''),
+    sheet: typeof req.body?.sheet === 'string' ? req.body.sheet : undefined,
+    maxRows: Number.isFinite(Number(req.body?.maxRows)) ? Number(req.body.maxRows) : undefined,
+  }))
+);
+app.post('/api/office/spreadsheet/edit', (req, res) =>
+  fsResult(res, () => office.editSpreadsheet({
+    path: String(req.body?.path ?? ''),
+    ops: Array.isArray(req.body?.ops) ? req.body.ops : [],
+    createIfMissing: req.body?.createIfMissing === true,
+  }))
+);
+app.post('/api/office/presentation/create', (req, res) =>
+  fsResult(res, () => office.createPresentation({
+    path: String(req.body?.path ?? ''),
+    title: typeof req.body?.title === 'string' ? req.body.title : undefined,
+    subject: typeof req.body?.subject === 'string' ? req.body.subject : undefined,
+    slides: Array.isArray(req.body?.slides) ? req.body.slides : [],
+    overwrite: req.body?.overwrite === true,
+  }))
+);
+
+// ---- Office content generation (research tie-in) ----
+// "Create a presentation about X" / "spreadsheet of Y": the MODEL drafts the
+// STRUCTURE as strict JSON (text-only call — no screenshots, no files
+// uploaded), officeCore validates it against the hard caps and writes the
+// local file. The file itself never leaves the machine. This is the office
+// analogue of research: online content acquisition, offline artifact.
+const officeGenTimestamps: number[] = [];
+const OFFICE_GEN_MAX_PER_WINDOW = 6;
+const OFFICE_GEN_WINDOW_MS = 60_000;
+
+function parseModelJson(text: string): unknown {
+  // Tolerate code fences; fail honestly on malformed output.
+  const cleaned = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    const start = cleaned.indexOf("{");
+    const end = cleaned.lastIndexOf("}");
+    if (start >= 0 && end > start) {
+      try {
+        return JSON.parse(cleaned.slice(start, end + 1));
+      } catch {
+        /* fall through */
+      }
+    }
+    throw new Error("The model returned content that is not valid JSON — try rephrasing the request");
+  }
+}
+
+app.post('/api/office/generate', async (req, res) => {
+  try {
+    const kind = req.body?.kind === 'spreadsheet' ? 'spreadsheet' : req.body?.kind === 'presentation' ? 'presentation' : null;
+    const topic = String(req.body?.topic ?? '').trim();
+    if (!kind) return res.status(400).json({ success: false, error: "kind must be 'presentation' or 'spreadsheet'" });
+    if (!topic || topic.length > 400) return res.status(400).json({ success: false, error: "A topic (max 400 chars) is required" });
+    if (!process.env.GEMINI_API_KEY) {
+      return res.json({
+        success: false,
+        error: "Content generation needs GEMINI_API_KEY (offline mode still works: create the file directly and fill it with spreadsheet.edit)",
+      });
+    }
+
+    // Bounded quota: a generation run is one model call + one file write.
+    const now = Date.now();
+    while (officeGenTimestamps.length > 0 && now - officeGenTimestamps[0] > OFFICE_GEN_WINDOW_MS) officeGenTimestamps.shift();
+    if (officeGenTimestamps.length >= OFFICE_GEN_MAX_PER_WINDOW) {
+      return res.status(429).json({ success: false, error: "rate_limited", group: "office-generate" });
+    }
+    officeGenTimestamps.push(now);
+
+    const ai = getGenAI();
+    let result: office.OfficeWriteResult;
+    if (kind === 'presentation') {
+      const requestedSlides = Math.min(Math.max(3, Number(req.body?.slides) || 6), 12);
+      const gen = await generateContentWithFallback(ai, {
+        contents: [{
+          role: "user",
+          parts: [{ text: `Create presentation content about: ${topic}` }],
+        }],
+        systemInstruction:
+          `You draft presentation slide content. Reply with STRICT JSON only, no markdown fences: ` +
+          `{"title": string (max 100 chars), "slides": [{"title": string (max 120 chars), "bullets": string[] (3-6 bullets, each max 140 chars, concrete and factual), "notes": string (optional speaker notes, max 400 chars)}]}. ` +
+          `Exactly ${requestedSlides} slides. No preamble, no explanation — JSON only.`,
+        temperature: 0.7,
+        responseMimeType: "application/json",
+      });
+      const parsed = parseModelJson(gen.text) as { title?: unknown; slides?: unknown };
+      const slidesRaw = Array.isArray(parsed.slides) ? parsed.slides : [];
+      if (slidesRaw.length === 0) throw new Error("The model returned no slides — try rephrasing the topic");
+      const slides = slidesRaw.slice(0, office.OFFICE_LIMITS.MAX_SLIDES).map((s: any, i: number) => ({
+        title: String(s?.title ?? `Slide ${i + 1}`),
+        bullets: Array.isArray(s?.bullets) ? s.bullets.map((b: unknown) => String(b)) : [],
+        notes: typeof s?.notes === 'string' ? s.notes : undefined,
+      }));
+      result = await office.createPresentation({
+        path: String(req.body?.path ?? ''),
+        title: typeof parsed.title === 'string' ? parsed.title : topic,
+        subject: topic,
+        slides,
+        overwrite: req.body?.overwrite === true,
+      });
+    } else {
+      const columnsInput = Array.isArray(req.body?.columns)
+        ? req.body.columns.map((c: unknown) => String(c)).filter(Boolean).slice(0, office.OFFICE_LIMITS.MAX_COLS)
+        : undefined;
+      const requestedRows = Math.min(Math.max(5, Number(req.body?.rows) || 20), 100);
+      const gen = await generateContentWithFallback(ai, {
+        contents: [{
+          role: "user",
+          parts: [{ text: `Generate spreadsheet data about: ${topic}` }],
+        }],
+        systemInstruction:
+          `You draft spreadsheet data. Reply with STRICT JSON only, no markdown fences: ` +
+          `{"columns": string[] (max 8 short column headers), "rows": array of rows, each an array matching the columns ` +
+          `(values as plain strings or numbers, no units in number cells, max 120 chars per cell)}. ` +
+          `Generate exactly ${requestedRows} data rows of accurate, useful content. No preamble — JSON only.` +
+          (columnsInput && columnsInput.length > 0 ? ` Use EXACTLY these columns in this order: ${columnsInput.join(" | ")}.` : ""),
+        temperature: 0.6,
+        responseMimeType: "application/json",
+      });
+      const parsed = parseModelJson(gen.text) as { columns?: unknown; rows?: unknown };
+      const columns = (Array.isArray(parsed.columns) ? parsed.columns.map((c) => String(c)) : columnsInput ?? ["Item", "Details"]).slice(0, office.OFFICE_LIMITS.MAX_COLS);
+      const rowsRaw = Array.isArray(parsed.rows) ? parsed.rows : [];
+      if (rowsRaw.length === 0) throw new Error("The model returned no rows — try rephrasing the topic");
+      const rows: office.OfficeRow[] = rowsRaw.slice(0, office.OFFICE_LIMITS.MAX_ROWS).map((r: unknown) =>
+        Array.isArray(r) ? r.map((v) => {
+          const s = typeof v === 'number' ? v : String(v ?? '');
+          return typeof s === 'string' && s.length > office.OFFICE_LIMITS.MAX_CELL_CHARS ? s.slice(0, office.OFFICE_LIMITS.MAX_CELL_CHARS) : s;
+        }) : [String(r)]
+      );
+      result = await office.createSpreadsheet({
+        path: String(req.body?.path ?? ''),
+        sheets: [{ name: 'Data', rows: [columns as office.OfficeRow, ...rows] }],
+        overwrite: req.body?.overwrite === true,
+      });
+    }
+    res.json({ success: true, result });
+  } catch (err: any) {
+    res.json({ success: false, error: String(err?.message || err).slice(0, 300) });
+  }
+});
 
 app.post('/api/fs/list', (req, res) => fsResult(res, () => sys.fsList(String(req.body?.path ?? ''))));
 app.post('/api/fs/inspect', (req, res) => fsResult(res, () => sys.fsInspect(String(req.body?.path ?? ''))));
@@ -3248,6 +4120,37 @@ app.post("/api/safety/stop/activate", (req, res) => {
   } catch (err) {
     res.status(409).json({ success: false, error: String((err as Error)?.message || err) });
   }
+});
+
+// ---- Operator session-permission mirroring ----
+// The UI grants interactive-control permissions in its session when the
+// operator explicitly asks for them ("move the mouse to X", "read my screen")
+// — the established screen-observation doctrine: the explicit request IS the
+// operator grant. Because the HTTP enforcement (E5 M1b) reads SERVER state,
+// the UI mirrors that grant here so the same request can pass the
+// authoritative boundary. Restricted to the three interactive-control
+// domains — filesystem/terminal/vault stay server-default-deny; revocation is
+// always accepted so the UI can match the server's revoke semantics.
+const MIRRORABLE_PERMISSIONS = new Set(["screen.observation", "mouse.control", "keyboard.control"]);
+app.post("/api/permissions/session", (req, res) => {
+  if (!rateLimit("permissions-session", 20, 60_000)) {
+    res.status(429).json({ success: false, error: "rate_limited" });
+    return;
+  }
+  const grant = Array.isArray(req.body?.grant) ? req.body.grant.map(String) : [];
+  const revoke = Array.isArray(req.body?.revoke) ? req.body.revoke.map(String) : [];
+  const unknown = [...grant, ...revoke].filter((p) => !MIRRORABLE_PERMISSIONS.has(p));
+  if (unknown.length > 0) {
+    res.status(400).json({ success: false, error: `Not a mirrorable permission: ${unknown.join(", ")}` });
+    return;
+  }
+  // Revoke first, then grant — a request carrying the same name in both is a
+  // deliberate re-grant. Emergency stop stays authoritative: enforcement also
+  // stop-blocks the side-effecting routes regardless of session grants.
+  for (const p of revoke) serverPermissions.revokeSession(p);
+  for (const p of grant) serverPermissions.grantSession(p);
+  appendAuditSyncSafe({ kind: "session_permissions_mirrored", granted: grant, revoked: revoke });
+  res.json({ success: true, granted: grant, revoked: revoke });
 });
 
 // ---- E5 H4: read-only runtime integrity status (no authorization change) ----
@@ -3340,44 +4243,133 @@ app.post("/api/malwaredetect/assess", async (req, res) => {
   }
 });
 
-// ---- Phase D: threat containment (operator-approved, identity-verified) ----
-// Requires: CONFIRMED_MALWARE classification, operator approval token,
-// identity revalidation via WMI, and an inactive emergency stop.
-// The containment module verifies every step before and after termination.
+// ---- Phase D.3/completion: threat containment (operator-approved, pinned identity) ----
+// The request shape carries ONLY {pid, approvalToken} for containment —
+// classification and process identity are established SERVER-SIDE (never
+// client-supplied). Approval additionally requires the OPERATOR'S APPROVAL
+// CREDENTIAL (proof of the human decision; enrolled via the recovery pipe):
+// the server verifies it before minting a single-use token bound to the
+// exact process instance. Only CONFIRMED_MALWARE is approvable.
+// Containment: validates the token against the PINNED instance and the
+// authority epoch, then terminates through the same reference (PID-reuse
+// safe, no taskkill).
+app.post("/api/containment/approve", async (req, res) => {
+  try {
+    const pid = Number(req.body?.pid);
+    const operatorCredential = String(req.body?.operatorCredential ?? "");
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return res.status(400).json({ error: "pid is required (positive integer)" });
+    }
+    if (!operatorCredential) {
+      return res.status(400).json({ error: "operatorCredential is required — containment approval must be the operator's decision (enrolled via set-containment-credential on the recovery pipe)" });
+    }
+    if (operatorCredential.length > 200) {
+      return res.status(400).json({ error: "operatorCredential is malformed" });
+    }
+    const issuance = await threatContainment.issueApproval(pid, operatorCredential);
+    res.json({
+      approved: issuance.outcome === "APPROVAL_ISSUED",
+      outcome: issuance.outcome,
+      reason: issuance.reason,
+      token: issuance.token?.token,
+      expiresAt: issuance.token?.expiresAt,
+      classification: issuance.classification,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "containment approval failed" });
+  }
+});
+
 app.post("/api/containment/contain", async (req, res) => {
   try {
-    const body = req.body || {};
-    const request: ContainmentRequest = {
-      target: {
-        pid: Number(body.target?.pid),
-        name: String(body.target?.name ?? ''),
-        creationTime: String(body.target?.creationTime ?? ''),
-        executablePath: String(body.target?.executablePath ?? ''),
-      },
-      evidence: {
-        classification: body.evidence?.classification,
-        confidence: body.evidence?.confidence,
-        fileHash: body.evidence?.fileHash,
-        defenderThreatId: body.evidence?.defenderThreatId,
-        assessedAt: Number(body.evidence?.assessedAt),
-        evidenceSources: Array.isArray(body.evidence?.evidenceSources) ? body.evidence.evidenceSources : [],
-      },
-      approvalToken: String(body.approvalToken ?? ''),
-    };
-    // Validate required fields server-side (never trust client input).
-    if (!Number.isInteger(request.target.pid) || request.target.pid <= 0) {
-      return res.status(400).json({ error: "target.pid is required (positive integer)" });
+    const pid = Number(req.body?.pid);
+    const approvalToken = String(req.body?.approvalToken ?? "");
+    if (!Number.isInteger(pid) || pid <= 0) {
+      return res.status(400).json({ error: "pid is required (positive integer)" });
     }
-    if (!request.target.name || !request.target.creationTime || !request.target.executablePath) {
-      return res.status(400).json({ error: "target.name, target.creationTime, and target.executablePath are required" });
+    if (!approvalToken) {
+      return res.status(400).json({ error: "approvalToken is required (issued by /api/containment/approve)" });
     }
-    if (!request.evidence.classification || !Number.isFinite(request.evidence.assessedAt)) {
-      return res.status(400).json({ error: "evidence.classification and evidence.assessedAt are required" });
-    }
-    const result = await threatContainment.contain(request);
+    const result = await threatContainment.contain({ pid, approvalToken });
     res.json({ outcome: result.outcome, reason: result.reason, targetPid: result.targetPid, targetName: result.targetName });
   } catch (err: any) {
     res.status(500).json({ error: err?.message || "containment failed" });
+  }
+});
+
+// ---- Phase E: read-only intelligence routes (NO control surface) ----
+// Both routes are GET-only, read-only, and rate-limited; they cannot mutate
+// any state and cannot invoke any control. `recheckDefender=1` triggers the
+// rate-limited (5 min) explicit Defender availability check — never polled.
+app.get("/api/security/situation", (req, res) => {
+  try {
+    if (req.query.recheckDefender === "1") securitySituation.recheckDefender();
+    res.json(securitySituation.getSituation());
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "security situation failed" });
+  }
+});
+app.get("/api/security/assessments", (_req, res) => {
+  try {
+    res.json({ assessments: assessmentEngine.assess(securityIntel) });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "security assessments failed" });
+  }
+});
+
+// ---- Phase F: incident status (read-only) + coordinated containment ----
+// GET /api/security/incidents is read-only status. POST /api/incidents/contain
+// executes containment THROUGH Phase D for an existing incident: the
+// orchestrator re-evaluates eligibility against live state (evidence,
+// E-stop, credential epoch, identity) immediately before calling Phase D,
+// whose credential verification, pinning, and E-stop checks remain the
+// authority. Every refusal is recorded on the incident and audited.
+app.get("/api/security/incidents", (req, res) => {
+  try {
+    const id = typeof req.query.id === "string" ? req.query.id : null;
+    if (id) {
+      const inc = incidentStore.get(id);
+      if (!inc) return res.status(404).json({ error: "incident not found" });
+      return res.json({ incident: inc, stopKind: stopKind(), credentialEnrolled: containmentApprovalCredentialSet(), authorityEpoch: containmentApprovalEpoch() });
+    }
+    res.json({
+      activeCount: incidentStore.activeCount(),
+      archivedCount: incidentStore.archivedCount(),
+      stopKind: stopKind(),
+      credentialEnrolled: containmentApprovalCredentialSet(),
+      incidents: incidentStore.all().map((inc) => ({
+        id: inc.id,
+        state: inc.state,
+        severity: inc.severity,
+        confidence: inc.confidence,
+        subject: inc.subject,
+        evidenceCount: inc.evidence.length,
+        confirmedEvidence: inc.evidence.some((e) => e.verification === "confirmed-by-source"),
+        assessmentCount: inc.assessments.length,
+        responseCount: inc.responses.length,
+        pendingOperatorDecision: inc.pendingOperatorDecision,
+        containmentOutcome: inc.containmentOutcome,
+        finalOutcome: inc.finalOutcome,
+        lastTransition: inc.transitions[inc.transitions.length - 1] ?? null,
+        createdAt: inc.createdAt,
+        updatedAt: inc.updatedAt,
+      })),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "incident status failed" });
+  }
+});
+app.post("/api/incidents/contain", async (req, res) => {
+  try {
+    const incidentId = String(req.body?.incidentId ?? "");
+    const operatorCredential = String(req.body?.operatorCredential ?? "");
+    if (!incidentId) return res.status(400).json({ error: "incidentId is required" });
+    if (!operatorCredential) return res.status(400).json({ error: "operatorCredential is required - containment is the operator's decision (Phase D credential verification)" });
+    if (operatorCredential.length > 200) return res.status(400).json({ error: "operatorCredential is malformed" });
+    const response = await incidentOrchestrator.respondContain(incidentId, operatorCredential);
+    res.json({ action: response.action, eligibility: response.eligibility, result: response.result ?? null, attempted: response.attempted, reason: response.reason });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || "incident containment failed" });
   }
 });
 
@@ -3600,6 +4592,19 @@ async function startServer() {
   const httpServer = app.listen(PORT, BIND, () => {
     console.log(`Krisha server running on http://${BIND}:${PORT}${BIND === "127.0.0.1" ? " (loopback — E5 D1)" : " (LAN-EXPOSED — explicit KRISHA_BIND override)"}`);
   });
+  // Step 1 Background Runtime — single-instance guard: a second Krix server
+  // start must never spawn a duplicate runtime. The port bind is the
+  // authoritative lock; a bind failure reports the running instance and
+  // exits THIS process cleanly (no crash stack, exit code 0 for scripts).
+  httpServer.on("error", (err: NodeJS.ErrnoException) => {
+    if (err.code === "EADDRINUSE") {
+      console.log(`[runtime] Krisha server is already running on ${BIND}:${PORT} — keeping the existing instance (this duplicate start exits cleanly).`);
+      process.exit(0);
+      return;
+    }
+    console.error(`[runtime] server listen error: ${err.code ?? err.message}`);
+    process.exit(1);
+  });
   // E5 H4 — server-owned runtime integrity monitoring: bounded, unref'd
   // periodic evaluation (default 60 s, KRISHA_INTEGRITY_INTERVAL_MS to
   // configure) + read-only status endpoint below. Monitoring reports; it
@@ -3614,6 +4619,7 @@ async function startServer() {
   process.on("exit", () => {
     processMonitor.stop();
     malwareEngine.stop();
+    clearInterval(securityStateSampler); // Phase E sampler — graceful shutdown
   });
   void processMonitor.start().then((health) => {
     console.log(`[KPM] process monitor active (health ${health})`);
@@ -3624,6 +4630,36 @@ async function startServer() {
   // E5 M1d — bounded request lifetimes.
   httpServer.requestTimeout = 60_000;
   httpServer.headersTimeout = 65_000;
+
+  // Step 1 Background Runtime — graceful shutdown on termination signals
+  // (Ctrl+C in the console, service stop, container stop). Windows sleep is
+  // NOT a signal: the process simply freezes and resumes unchanged. The
+  // sequence stops the HTTP listener, the PowerShell worker and the monitor
+  // subscriptions deterministically (module: src/server/runtimeShutdown.ts).
+  installGracefulShutdown({
+    onStop: () => {
+      try {
+        httpServer.close();
+      } catch {
+        // best-effort; listeners are torn down by exit anyway
+      }
+      try {
+        mouseWorker.kill();
+      } catch {
+        // worker may never have spawned
+      }
+      try {
+        processMonitor.stop();
+      } catch {
+        // monitor owns its own lifecycle guards
+      }
+      try {
+        malwareEngine.stop();
+      } catch {
+        // engine owns its own lifecycle guards
+      }
+    },
+  });
 }
 
 startServer();

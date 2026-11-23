@@ -22,6 +22,150 @@ let currentAudio: HTMLAudioElement | null = null;
 let currentUtterance: SpeechSynthesisUtterance | null = null;
 let serverTtsCooldownUntil = 0;
 
+// ── Background voice output (Step 2) — playback session discipline ───────────
+// A monotonically increasing session id makes every async continuation and
+// every media event session-checked: a stale Gemini-TTS fetch resolving after
+// a newer request (or after stopKrishaSpeech) can never start playback, so
+// duplicate/overlapping speech is structurally impossible — not just
+// best-effort cancelled. No new engine, no new dependency; the same Gemini
+// TTS audio and the same Web Speech voices/characteristics are used.
+let playbackSession = 0;
+/** Device-disconnect recovery: set while an unexpected pause is pending recovery. */
+let unexpectedPausePending = false;
+/** Session id whose one allowed recovery attempt has been used. */
+let recoveryAttemptedForSession = -1;
+let deviceChangeListenerInstalled = false;
+/** One-time user-gesture audio unlock (autoplay policy) — hidden tabs may
+ *  only play audio once the origin has interacted. Set on first gesture. */
+let audioUnlocked = false;
+let unlockInstalled = false;
+let unlockContext: AudioContext | null = null;
+
+/** Test hook: replace the HTMLAudioElement constructor (unit tests only). */
+let audioElementFactory: (src: string) => HTMLAudioElement = (src) => new Audio(src);
+export function setAudioElementFactoryForTests(factory: (src: string) => HTMLAudioElement): void {
+  audioElementFactory = factory;
+}
+
+function isCurrentSession(session: number): boolean {
+  return session === playbackSession;
+}
+
+// ── Conversational silence detection (Step 3) — voice-output activity signal ─
+// Krix actually starting to speak IS meaningful conversational activity: the
+// inactivity tracker subscribes here so replies reset the silence clock. The
+// signal carries no content — just "playback started" — session-checked so
+// superseded/recovered sessions cannot fake activity.
+let voiceOutputActivityListener: ((started: boolean) => void) | null = null;
+export function setVoiceOutputActivityListener(fn: ((started: boolean) => void) | null): void {
+  voiceOutputActivityListener = fn;
+}
+function notifyVoiceOutputActivity(started: boolean): void {
+  try {
+    voiceOutputActivityListener?.(started);
+  } catch {}
+}
+
+/**
+ * One-time muted AudioContext start on the first user gesture. This satisfies
+ * the browser autoplay policy so a LATER hidden/minimized playback attempt is
+ * allowed — it costs one silent buffer at install time and nothing afterwards.
+ * It never touches OS audio privacy settings and never keeps a device open
+ * (the context is closed immediately).
+ */
+function installAudioUnlock(): void {
+  if (unlockInstalled || typeof window === 'undefined') return;
+  unlockInstalled = true;
+  const unlock = () => {
+    if (audioUnlocked) return;
+    audioUnlocked = true;
+    try {
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioContextClass) {
+        const ctx: AudioContext = new AudioContextClass();
+        unlockContext = ctx;
+        const buffer = ctx.createBuffer(1, 1, 22050);
+        const source = ctx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(ctx.destination);
+        source.start(0);
+        setTimeout(() => {
+          try {
+            void ctx.close();
+          } catch {}
+          if (unlockContext === ctx) unlockContext = null;
+        }, 300);
+      }
+    } catch {
+      // unlock is best-effort; the visible-flow gesture already permits audio
+    }
+    try {
+      window.removeEventListener('pointerdown', unlock);
+      window.removeEventListener('keydown', unlock);
+    } catch {}
+  };
+  try {
+    window.addEventListener('pointerdown', unlock, { once: false, passive: true });
+    window.addEventListener('keydown', unlock, { once: false, passive: true });
+  } catch {
+    // exotic environments without DOM event wiring — unlock degrades gracefully
+  }
+}
+
+/**
+ * Device-change handling (audio output disconnect/reconnect). Installed once,
+ * passive: on devicechange, if the current session's audio paused
+ * unexpectedly (e.g. the output device vanished), attempt ONE bounded resume —
+ * Windows routes audio to the remaining device when one reconnects, and the
+ * element can usually resume. Never retries in a loop, never re-speaks
+ * finished sessions.
+ */
+function installDeviceChangeRecovery(): void {
+  if (deviceChangeListenerInstalled || typeof navigator === 'undefined') return;
+  const mediaDevices = (navigator as Navigator & { mediaDevices?: EventTarget }).mediaDevices;
+  if (!mediaDevices) return;
+  deviceChangeListenerInstalled = true;
+  try {
+    mediaDevices.addEventListener('devicechange', () => {
+      const session = playbackSession;
+      const audio = currentAudio;
+      if (!audio || !isCurrentSession(session)) return;
+      // If the element is stuck paused because its device disappeared, try once.
+      if (audio.paused && !audio.ended) {
+        try {
+          void audio.play().catch(() => undefined);
+        } catch {}
+      }
+    });
+  } catch {
+    // environments without devicechange support — recovery via onpause remains
+  }
+}
+
+/**
+ * Bounded recovery of an unexpected pause (device disconnect while speaking,
+ * OS audio-route change). Exactly ONE resume attempt PER SESSION, 1 s after
+ * the pause so Windows has settled the new default device. The budget is
+ * session-wide (not per-pause): if the device stays missing, repeated OS
+ * pause events must not retry forever — the session ends honestly instead.
+ * Does not re-synthesize speech — the same decoded audio element resumes,
+ * voice identity unchanged.
+ */
+function scheduleUnexpectedPauseRecovery(audio: HTMLAudioElement, session: number): void {
+  if (unexpectedPausePending || recoveryAttemptedForSession === session || !isCurrentSession(session)) return;
+  recoveryAttemptedForSession = session;
+  unexpectedPausePending = true;
+  setTimeout(() => {
+    unexpectedPausePending = false;
+    if (!isCurrentSession(session) || audio.ended) return;
+    if (audio.paused) {
+      try {
+        void audio.play().catch(() => undefined);
+      } catch {}
+    }
+  }, 1000);
+}
+
 // Preload browser voices
 if (typeof window !== 'undefined' && window.speechSynthesis) {
   window.speechSynthesis.onvoiceschanged = () => {
@@ -90,8 +234,15 @@ export async function speakKrishaText(
   pitch: number = 1.0,
   voiceEngine: 'auto' | 'gemini' | 'browser' = 'auto'
 ): Promise<void> {
-  // Stop previous speech
+  // Stop previous speech AND open a fresh session: every async continuation
+  // below checks isCurrentSession(session) so a superseded request can never
+  // start playback (overlap prevention is structural).
   stopKrishaSpeech();
+  const session = ++playbackSession;
+  recoveryAttemptedForSession = -1; // fresh recovery budget per session
+
+  installAudioUnlock();
+  installDeviceChangeRecovery();
 
   const cleaned = cleanSpeechText(text);
   if (!cleaned) {
@@ -109,7 +260,9 @@ export async function speakKrishaText(
 
   // If user explicitly configured browser engine or server is cooling down, skip cloud call directly
   if (voiceEngine === 'browser' || Date.now() < serverTtsCooldownUntil) {
-    playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
+    if (isCurrentSession(session)) {
+      playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName, session);
+    }
     return;
   }
 
@@ -121,6 +274,9 @@ export async function speakKrishaText(
       body: JSON.stringify({ text: cleaned, voice: voiceName, lang: targetLang }),
     });
 
+    // A newer request (or stop) superseded this one while we were fetching.
+    if (!isCurrentSession(session)) return;
+
     if (res.ok) {
       const data = await res.json();
       if (data.fallback) {
@@ -131,48 +287,106 @@ export async function speakKrishaText(
         // Play base64 audio (handles standard audio/wav returned by Gemini TTS)
         const mimeType = data.mimeType || 'audio/wav';
         const audioSrc = `data:${mimeType};base64,${data.audio}`;
-        const audio = new Audio(audioSrc);
+        const audio = audioElementFactory(audioSrc);
         audio.playbackRate = speed;
         currentAudio = audio;
+        unexpectedPausePending = false;
 
         let mouthInterval: any = null;
+        // Stuck-session watchdog: if playback neither starts nor fails within
+        // 12 s (suspended element, wedged decoder), clean up and hand the
+        // session to the Web Speech path exactly once. No polling loops.
+        const stuckTimer = setTimeout(() => {
+          if (!isCurrentSession(session)) return;
+          if (audio.paused && !audio.ended) {
+            if (mouthInterval) clearInterval(mouthInterval);
+            try {
+              audio.pause();
+            } catch {}
+            if (currentAudio === audio) currentAudio = null;
+            getKrixBridge()?.stopKrixAudioAnalysis();
+            if (isCurrentSession(session)) {
+              playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName, session);
+            }
+          }
+        }, 12_000);
+        if (typeof stuckTimer === 'object' && 'unref' in stuckTimer) (stuckTimer as any).unref?.();
+
+        const teardownLipSync = () => {
+          if (mouthInterval) clearInterval(mouthInterval);
+          onSpeakingChunk?.(false);
+          getKrixBridge()?.stopKrixAudioAnalysis();
+        };
 
         audio.onplay = () => {
+          if (!isCurrentSession(session)) return;
           onStart?.();
+          notifyVoiceOutputActivity(true);
           // Connect to Krix 3D lip-sync analyser (real audio frequency analysis)
           const bridge = getKrixBridge();
           bridge?.startKrixAudioAnalysis(audio);
           // Simulate rhythmic mouth lip sync (2D avatar fallback)
           let open = false;
           mouthInterval = setInterval(() => {
+            if (!isCurrentSession(session)) {
+              clearInterval(mouthInterval);
+              return;
+            }
             open = !open;
             onSpeakingChunk?.(open);
           }, 140);
         };
 
         audio.onended = () => {
-          if (mouthInterval) clearInterval(mouthInterval);
-          onSpeakingChunk?.(false);
-          getKrixBridge()?.stopKrixAudioAnalysis();
+          if (!isCurrentSession(session)) return;
+          clearTimeout(stuckTimer);
+          teardownLipSync();
+          notifyVoiceOutputActivity(false); // Step 5: playback end signal
           onEnd?.();
           currentAudio = null;
         };
 
-        audio.onerror = () => {
-          if (mouthInterval) clearInterval(mouthInterval);
-          onSpeakingChunk?.(false);
-          getKrixBridge()?.stopKrixAudioAnalysis();
-          playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
+        audio.onpause = () => {
+          if (!isCurrentSession(session) || audio.ended) return;
+          // Unexpected pause (audio device vanished / route change) — bounded
+          // single recovery; the watchdog still bounds a failed resume.
+          scheduleUnexpectedPauseRecovery(audio, session);
         };
 
-        await audio.play();
+        audio.onerror = () => {
+          if (!isCurrentSession(session)) return;
+          clearTimeout(stuckTimer);
+          teardownLipSync();
+          if (currentAudio === audio) currentAudio = null;
+          playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName, session);
+        };
+
+        // Bound the await: a wedged play() (autoplay-policy suspension,
+        // wedged decoder) must not keep this session promise unsettled
+        // forever — the stuck watchdog owns the recovery path. Late
+        // rejections are absorbed (the onerror handler already ran or the
+        // session was superseded).
+        const playPromise = audio.play();
+        playPromise.catch(() => undefined);
+        await Promise.race([
+          playPromise,
+          new Promise<void>((resolve) => {
+            const raceTimer = setTimeout(() => resolve(), 12_500);
+            if (typeof raceTimer === 'object' && 'unref' in raceTimer) (raceTimer as any).unref?.();
+          }),
+        ]);
+        // Autoplay policy: a rejected play() in a never-interacted hidden tab
+        // surfaces here or via onerror — either way the session ends at the
+        // Web Speech fallback, never in a stuck state.
         return;
       }
     }
   } catch {}
 
   // Seamless fallback to browser Web Speech API matching chosen voice profile
-  playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName);
+  if (isCurrentSession(session)) {
+    playWebSpeechFallback(cleaned, speed, onStart, onEnd, onSpeakingChunk, targetLang, pitch, voiceName, session);
+  }
 }
 
 function playWebSpeechFallback(
@@ -183,7 +397,8 @@ function playWebSpeechFallback(
   onSpeakingChunk?: (isMouthOpen: boolean) => void,
   targetLang?: string,
   pitch: number = 1.0,
-  voiceName: string = 'Aoede'
+  voiceName: string = 'Aoede',
+  session: number = playbackSession
 ) {
   if (typeof window === 'undefined' || !window.speechSynthesis) {
     onEnd?.();
@@ -330,11 +545,17 @@ function playWebSpeechFallback(
   let mouthInterval: any = null;
 
   utterance.onstart = () => {
+    if (!isCurrentSession(session)) return;
     onStart?.();
+    notifyVoiceOutputActivity(true);
     let open = false;
     // Push synthetic lip-sync volume for the 3D avatar (Web Speech API
     // doesn't expose raw audio so we simulate with the mouth-open toggle)
     mouthInterval = setInterval(() => {
+      if (!isCurrentSession(session)) {
+        clearInterval(mouthInterval);
+        return;
+      }
       open = !open;
       onSpeakingChunk?.(open);
       getKrixBridge()?.pushKrixLipSyncVolume(open ? 0.45 : 0.1);
@@ -342,17 +563,21 @@ function playWebSpeechFallback(
   };
 
   utterance.onend = () => {
+    if (!isCurrentSession(session)) return;
     if (mouthInterval) clearInterval(mouthInterval);
     onSpeakingChunk?.(false);
     getKrixBridge()?.pushKrixLipSyncVolume(0);
+    notifyVoiceOutputActivity(false); // Step 5: playback end signal
     onEnd?.();
     currentUtterance = null;
   };
 
   utterance.onerror = () => {
+    if (!isCurrentSession(session)) return;
     if (mouthInterval) clearInterval(mouthInterval);
     onSpeakingChunk?.(false);
     getKrixBridge()?.pushKrixLipSyncVolume(0);
+    notifyVoiceOutputActivity(false); // Step 5: playback end signal
     onEnd?.();
     currentUtterance = null;
   };
@@ -362,6 +587,12 @@ function playWebSpeechFallback(
 }
 
 export function stopKrishaSpeech(): void {
+  // Invalidate the current playback session FIRST: any in-flight Gemini-TTS
+  // fetch or pending recovery timer becomes a no-op the moment it resumes
+  // (speech stops correctly and completely on explicit stop/shutdown).
+  playbackSession += 1;
+  unexpectedPausePending = false;
+
   // Stop Krix 3D lip-sync analysis
   getKrixBridge()?.stopKrixAudioAnalysis();
   getKrixBridge()?.pushKrixLipSyncVolume(0);

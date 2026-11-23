@@ -471,6 +471,22 @@ function appendLpvAudit(entry: AuditInput): void {
     ...entry,
   };
   writeRecord(record);
+  // Phase E observation sink (additive, best-effort): lets the security
+  // event-intelligence layer consume LPV security-decision metadata AFTER
+  // the record is durably written. Purely outbound — LPV security behavior,
+  // storage, and chain verification are untouched; a sink failure can never
+  // affect the audit or the vault.
+  try {
+    lpvSecurityEventSink?.(record);
+  } catch { /* observation must never break the audit */ }
+}
+
+/** Optional outbound observer for the Phase E security event-intelligence
+ *  layer (see appendLpvAudit). Additive only: setting/clearing it has no
+ *  effect on LPV security behavior. */
+let lpvSecurityEventSink: ((record: Record<string, unknown>) => void) | null = null;
+export function setLpvSecurityEventSink(fn: ((record: Record<string, unknown>) => void) | null): void {
+  lpvSecurityEventSink = fn;
 }
 
 /** Full bounded chain walk — REQUIRED before audit history is trusted. */

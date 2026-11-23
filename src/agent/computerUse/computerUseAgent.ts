@@ -354,7 +354,9 @@ export class ComputerUseAgent {
     }
 
     try {
-      const state = await this.observer.getCurrentState({ maxAgeMs: force ? 0 : this.stateStaleMs });
+      // analyze:'local' — the computer-use loop stays fully offline: screen
+      // understanding for targeting runs through the local OCR pipeline.
+      const state = await this.observer.getCurrentState({ maxAgeMs: force ? 0 : this.stateStaleMs, analyze: 'local' });
       this.events?.emit({
         name: 'COMPUTER_OBSERVED',
         payload: { stateId: state.id, activeWindow: state.activeWindow?.title },

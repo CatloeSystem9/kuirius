@@ -323,7 +323,9 @@ export class AdaptiveObserver {
     const capturePromise = this.screenObserver.getCurrentState({
       // OBSERVE_NOW and post-action verification always want a FRESH frame;
       // region captures too (the point is current, focused evidence).
+      // analyze:'local' — adaptive evidence stays on-device (offline vision).
       maxAgeMs: 0,
+      analyze: 'local',
       region: regionBounds ?? undefined,
       question: request.question,
     });

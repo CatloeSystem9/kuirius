@@ -1,0 +1,20 @@
+scripts/test-containment.ts(170,38): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(205,42): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(209,26): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(212,26): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(215,27): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(219,21): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(223,28): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(227,30): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(233,23): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(236,29): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(520,41): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(531,35): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(566,31): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(596,25): error TS2554: Expected 2 arguments, but got 1.
+scripts/test-containment.ts(601,19): error TS2554: Expected 2 arguments, but got 1.
+src/agent/containment/containment.ts(669,51): error TS2345: Argument of type 'number' is not assignable to parameter of type '{ pid: number; operatorCredential?: string; authorityEpoch?: number; }'.
+src/agent/containment/containment.ts(723,46): error TS2339: Property 'outcome' does not exist on type '{ ok: true; authorityEpoch?: number; } | { ok: false; outcome: ContainmentOutcome; reason: string; }'.
+  Property 'outcome' does not exist on type '{ ok: true; authorityEpoch?: number; }'.
+src/agent/containment/containment.ts(723,63): error TS2339: Property 'reason' does not exist on type '{ ok: true; authorityEpoch?: number; } | { ok: false; outcome: ContainmentOutcome; reason: string; }'.
+  Property 'reason' does not exist on type '{ ok: true; authorityEpoch?: number; }'.

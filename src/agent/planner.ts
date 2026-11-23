@@ -502,6 +502,171 @@ export function isResearchRequest(text: string): boolean {
 }
 
 /**
+ * Office intents (spreadsheet + presentation). Conservative: the clause must
+ * START with an explicit office verb ("create/make/read a spreadsheet/excel/
+ * presentation/pptx…"), so ordinary chat and file searches are never hijacked.
+ *
+ * Two creation paths, honestly distinct:
+ *  - about X     → *.generate tools: the server drafts content with one
+ *                  bounded text-only model call (online content acquisition)
+ *                  and writes the local file;
+ *  - named/with… → *.create / *.edit tools: deterministic, no model call.
+ * Bare file names resolve to the user's Documents folder server-side.
+ */
+
+/** "5.5" → number, "true"/"false" → boolean, else string — typed cells. */
+function coerceOfficeCell(raw: string): string | number | boolean | null {
+  const t = raw.trim();
+  if (!t) return null;
+  if (/^-?\d+(?:\.\d+)?$/.test(t)) return Number(t);
+  if (/^(true|false)$/i.test(t)) return t.toLowerCase() === 'true';
+  return t.replace(/^["']|["']$/g, '');
+}
+
+function slugifyFileName(topic: string, ext: string): string {
+  const slug = topic
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 40);
+  return `${slug || 'krisha-file'}${ext}`;
+}
+
+export function classifySpreadsheetIntent(clause: string): StepClassification | null {
+  const clean = clause.trim();
+  if (!clean) return null;
+
+  let m: RegExpMatchArray | null;
+
+  // Edit: "add a row to budget.xlsx: milk, 5.5" / "add rows to budget.xlsx: a,b | c,d"
+  if ((m = clean.match(/^add\s+(?:an?\s+)?rows?\s+to\s+(?:"([^"]+)"|([\w\-.]+\.(?:xlsx|xls)))(?::\s*(.+))?$/i))) {
+    const path = (m[1] ?? m[2] ?? '').trim();
+    const data = (m[3] ?? '').trim();
+    if (!path || !data) return null;
+    const rows = data
+      .split(/\s*\|\s*/)
+      .map((line) => line.split(',').map(coerceOfficeCell))
+      .filter((r) => r.some((c) => c !== null && c !== ''));
+    if (rows.length === 0) return null;
+    return {
+      toolName: 'spreadsheet.edit',
+      capability: 'spreadsheet.edit',
+      description: `Append ${rows.length} row${rows.length > 1 ? 's' : ''} to ${path}`,
+      input: { path, ops: rows.map((r) => ({ type: 'append_rows', rows: [r] })) },
+    };
+  }
+
+  // Read: "read/show the spreadsheet budget.xlsx" or a bare xlsx path.
+  if ((m = clean.match(/^(?:read|show|open)\s+(?:the\s+|my\s+)?(?:excel|spreadsheet|xlsx\s+file)\s+(?:"([^"]+)"|([\w\-.]+\.(?:xlsx|xls)))$/i)) ||
+      (m = clean.match(/^read\s+(?:"([^"]+)"|([\w\-.]+\.(?:xlsx|xls)))$/i))) {
+    const path = (m[1] ?? m[2] ?? '').trim();
+    if (!path) return null;
+    return {
+      toolName: 'spreadsheet.read',
+      capability: 'spreadsheet.read',
+      description: `Read the spreadsheet ${path}`,
+      input: { path },
+    };
+  }
+
+  const createMatch = clean.match(/^(?:create|make|build|new|generate)\s+(?:an?\s+|the\s+)?(?:excel|spreadsheet|xlsx)(?:\s+file)?\s*(.*)$/i);
+  if (createMatch) {
+    const rest = (createMatch[1] ?? '').trim();
+    // "about X" → content generation (online research + local file).
+    const aboutMatch = rest.match(/^(?:(?:named|called)\s+(?:"([^"]+)"|([\w\-.]+\.(?:xlsx|xls))?|([\w\-.]+\.(?:xlsx|xls)))\s*)?(?:about|on the topic of|with data (?:about|on))\s+(.+)$/i);
+    if (aboutMatch) {
+      const path = (aboutMatch[1] ?? aboutMatch[2] ?? aboutMatch[3] ?? '').trim();
+      const topic = aboutMatch[4].trim();
+      if (topic) {
+        return {
+          toolName: 'spreadsheet.generate',
+          capability: 'spreadsheet.generate',
+          description: `Create a spreadsheet about "${topic.slice(0, 50)}"`,
+          input: { path: path || slugifyFileName(topic, '.xlsx'), topic },
+        };
+      }
+    }
+    // "with columns A, B, C" → deterministic create with a header row.
+    const colMatch = rest.match(/^(?:(?:named|called)\s+)?(?:"([^"]+)"|([\w\-.]+\.(?:xlsx|xls))?)\s*(?:with(?:\s+the)?\s+columns?\s+(.+))?$/i);
+    if (colMatch && (colMatch[1] || colMatch[2] || colMatch[3])) {
+      const path = (colMatch[1] ?? colMatch[2] ?? '').trim();
+      const columns = colMatch[3]
+        ? colMatch[3].split(',').map((c) => c.trim()).filter(Boolean)
+        : [];
+      if (path || columns.length > 0) {
+        return {
+          toolName: 'spreadsheet.create',
+          capability: 'spreadsheet.create',
+          description: columns.length > 0
+            ? `Create the spreadsheet ${path || 'krisha-sheet.xlsx'} with columns: ${columns.join(', ')}`
+            : `Create the empty spreadsheet ${path}`,
+          input: {
+            path: path || 'krisha-sheet.xlsx',
+            sheets: [{ name: 'Data', rows: columns.length > 0 ? [columns] : [[]] }],
+          },
+        };
+      }
+    }
+  }
+  return null;
+}
+
+export function isSpreadsheetIntent(text: string): boolean {
+  return classifySpreadsheetIntent(text) !== null;
+}
+
+export function classifyPresentationIntent(clause: string): StepClassification | null {
+  const clean = clause.trim();
+  if (!clean) return null;
+
+  let m: RegExpMatchArray | null;
+  const createMatch = clean.match(/^(?:create|make|build|new|generate)\s+(?:an?\s+|the\s+)?(?:presentation|pptx|powerpoint(?:\s+presentation)?|slide\s+deck|deck)(?:\s+file)?\s*(.*)$/i);
+  if (!createMatch) return null;
+  const rest = (createMatch[1] ?? '').trim();
+
+  // Explicit slide titles: "… with slides: Intro; Data; Conclusion"
+  const slidesMatch = rest.match(/^(?:(?:named|called)\s+(?:"([^"]+)"|([\w\-.]+\.(?:pptx))?|([\w\-.]+\.(?:pptx)))\s*)?(?:with\s+slides?\s*[:：]\s*(.+))?$/i);
+  if (slidesMatch && slidesMatch[4]) {
+    const path = (slidesMatch[1] ?? slidesMatch[2] ?? slidesMatch[3] ?? '').trim();
+    const titles = slidesMatch[4]
+      .split(/\s*[;]\s*|\s+then\s+/i)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    if (titles.length > 0) {
+      return {
+        toolName: 'presentation.create',
+        capability: 'presentation.create',
+        description: `Create the presentation ${path || 'krisha-deck.pptx'} with ${titles.length} slide(s)`,
+        input: {
+          path: path || 'krisha-deck.pptx',
+          title: titles[0],
+          slides: titles.map((t) => ({ title: t, bullets: [] })),
+        },
+      };
+    }
+  }
+
+  // "about X" → content generation. Optional slide count: "with 8 slides about X"
+  const aboutMatch = rest.match(/^(?:(?:named|called)\s+(?:"([^"]+)"|([\w\-.]+\.(?:pptx))?|([\w\-.]+\.(?:pptx)))\s*)?(?:(?:with|having)\s+(\d{1,2})\s+slides?\s+)?(?:about|on|on the topic of|covering)\s+(.+)$/i);
+  if (aboutMatch && aboutMatch[5]) {
+    const path = (aboutMatch[1] ?? aboutMatch[2] ?? aboutMatch[3] ?? '').trim();
+    const slideCount = aboutMatch[4] ? parseInt(aboutMatch[4], 10) : undefined;
+    const topic = aboutMatch[5].trim();
+    return {
+      toolName: 'presentation.generate',
+      capability: 'presentation.generate',
+      description: `Create a presentation about "${topic.slice(0, 50)}"${slideCount ? ` (${slideCount} slides)` : ''}`,
+      input: { path: path || slugifyFileName(topic, '.pptx'), topic, ...(slideCount ? { slides: slideCount } : {}) },
+    };
+  }
+  return null;
+}
+
+export function isPresentationIntent(text: string): boolean {
+  return classifyPresentationIntent(text) !== null;
+}
+
+/**
  * Diagnostic intent classification (Self-Diagnostics v1).
  * Conservative: matches explicit diagnostic queries ("check system health", "run diagnostics", "self-diagnostics").
  */
@@ -589,6 +754,14 @@ export function classifyStep(clause: string): StepClassification | null {
   // 3.6 Keyboard-control intents.
   const keyboardIntent = classifyKeyboardIntent(text);
   if (keyboardIntent) return keyboardIntent;
+
+  // 3.65 Office intents (spreadsheet/presentation) — explicit office verbs
+  // only; must win over the file/web detectors ("read budget.xlsx" reads the
+  // workbook, it does not open it with an association).
+  const spreadsheetIntent = classifySpreadsheetIntent(text);
+  if (spreadsheetIntent) return spreadsheetIntent;
+  const presentationIntent = classifyPresentationIntent(text);
+  if (presentationIntent) return presentationIntent;
 
   // 3.7 Deep-research intents (additional Deep Research capability) — explicit
   // verbs, file targets stay on the filesystem detectors below.

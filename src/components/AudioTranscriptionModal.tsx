@@ -19,6 +19,7 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { AudioRecordingSession, transcribeAudio, blobToBase64 } from '../utils/transcribeService';
+import { getConversationInactivityTracker } from '../utils/conversationInactivity';
 
 interface AudioTranscriptionModalProps {
   isOpen: boolean;
@@ -100,6 +101,13 @@ export const AudioTranscriptionModal: React.FC<AudioTranscriptionModalProps> = (
       session.onVolumeChange = (vol) => {
         setRecordVolume(vol);
       };
+      // Step 3: detectable microphone failures are reported to the inactivity
+      // tracker as failures — never as ordinary conversational silence. (This
+      // modal's transcripts are utility recordings, not conversational turns,
+      // so success here deliberately does NOT reset the inactivity clock.)
+      session.onMutedDetected = () => {
+        getConversationInactivityTracker().reportMicIssue('microphone_permission_denied');
+      };
       await session.start();
       sessionRef.current = session;
       setIsRecording(true);
@@ -109,6 +117,12 @@ export const AudioTranscriptionModal: React.FC<AudioTranscriptionModalProps> = (
         setRecordDuration((prev) => prev + 1);
       }, 1000);
     } catch (err: any) {
+      const name = String(err?.name || '');
+      if (name === 'NotAllowedError' || name === 'SecurityError') {
+        getConversationInactivityTracker().reportMicIssue('microphone_permission_denied');
+      } else if (name === 'NotFoundError' || name === 'NotReadableError' || name === 'OverconstrainedError') {
+        getConversationInactivityTracker().reportMicIssue('microphone_unavailable');
+      }
       setErrorMessage(err?.message || 'Could not access microphone.');
       setIsRecording(false);
     }

@@ -12,7 +12,7 @@
 import type { KeyboardBackend } from './keyboardTypes';
 import { ControlError } from './mouseTypes';
 
-const REQUEST_TIMEOUT_MS = 25_000; // generous: cold PowerShell startup takes seconds
+const REQUEST_TIMEOUT_MS = 60_000; // generous: cold PowerShell startup takes seconds; long typing is paced (~12 ms/char) and the server scales its own timeout to the text length
 
 /** Base URL of the local server ('' = same origin, browser default). */
 let BACKEND_BASE_URL = '';
@@ -64,6 +64,8 @@ async function callServer(payload: Record<string, unknown>): Promise<any> {
 export class PowerShellKeyboardBackend implements KeyboardBackend {
   async typeText(text: string): Promise<{ sent: number }> {
     const data = await callServer({ action: 'type', text });
+    // The server reports the SendInput-verified injected count (may be lower
+    // than requested — that shortfall is honest evidence, never fabricated).
     return { sent: typeof data.sent === 'number' ? data.sent : text.length };
   }
 

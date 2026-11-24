@@ -823,6 +823,24 @@ export function classifyStep(clause: string): StepClassification | null {
         description: `Launch ${appCmd.app.name}`,
         input: { app: appCmd.app },
       };
+    } else if (appCmd.rawAppName) {
+      return {
+        toolName: 'app.launch',
+        capability: 'application.launch',
+        description: `Launch ${appCmd.rawAppName}`,
+        input: {
+          app: {
+            id: appCmd.rawAppName.toLowerCase(),
+            name: appCmd.rawAppName,
+            category: 'system',
+            protocol: `${appCmd.rawAppName.toLowerCase()}:`,
+            iconName: 'AppWindow',
+            description: `Application: ${appCmd.rawAppName}`,
+            aliases: [appCmd.rawAppName.toLowerCase()],
+            executableName: `${appCmd.rawAppName}.exe`,
+          },
+        },
+      };
     }
   }
 

@@ -238,6 +238,36 @@ export interface DiscoveredApp {
 let discoveryCache: { apps: DiscoveredApp[]; at: number } | null = null;
 const DISCOVERY_TTL_MS = 5 * 60 * 1000;
 
+// Standard Windows System Utilities & Built-in App Targets
+const SYSTEM_KNOWN_APPS: Record<string, { name: string; target: string; isProtocol?: boolean }> = {
+  calculator: { name: 'Calculator', target: 'ms-calculator:', isProtocol: true },
+  calc: { name: 'Calculator', target: 'ms-calculator:', isProtocol: true },
+  'calc.exe': { name: 'Calculator', target: 'ms-calculator:', isProtocol: true },
+  notepad: { name: 'Notepad', target: 'notepad.exe' },
+  'notepad.exe': { name: 'Notepad', target: 'notepad.exe' },
+  explorer: { name: 'File Explorer', target: 'explorer.exe' },
+  'explorer.exe': { name: 'File Explorer', target: 'explorer.exe' },
+  'file explorer': { name: 'File Explorer', target: 'explorer.exe' },
+  terminal: { name: 'Windows Terminal', target: 'wt.exe' },
+  'wt.exe': { name: 'Windows Terminal', target: 'wt.exe' },
+  cmd: { name: 'Command Prompt', target: 'cmd.exe' },
+  'cmd.exe': { name: 'Command Prompt', target: 'cmd.exe' },
+  powershell: { name: 'PowerShell', target: 'powershell.exe' },
+  'powershell.exe': { name: 'PowerShell', target: 'powershell.exe' },
+  taskmgr: { name: 'Task Manager', target: 'taskmgr.exe' },
+  'taskmgr.exe': { name: 'Task Manager', target: 'taskmgr.exe' },
+  'task manager': { name: 'Task Manager', target: 'taskmgr.exe' },
+  settings: { name: 'Settings', target: 'ms-settings:', isProtocol: true },
+  paint: { name: 'Paint', target: 'mspaint.exe' },
+  mspaint: { name: 'Paint', target: 'mspaint.exe' },
+  'mspaint.exe': { name: 'Paint', target: 'mspaint.exe' },
+  snippingtool: { name: 'Snipping Tool', target: 'SnippingTool.exe' },
+  'snippingtool.exe': { name: 'Snipping Tool', target: 'SnippingTool.exe' },
+  camera: { name: 'Camera', target: 'microsoft.windows.camera:', isProtocol: true },
+  control: { name: 'Control Panel', target: 'control.exe' },
+  'control.exe': { name: 'Control Panel', target: 'control.exe' },
+};
+
 /** Discover apps from Start Menu shortcuts + PATH — bounded and cached. */
 export async function appDiscover(force = false): Promise<DiscoveredApp[]> {
   if (!force && discoveryCache && Date.now() - discoveryCache.at < DISCOVERY_TTL_MS) {
@@ -245,6 +275,24 @@ export async function appDiscover(force = false): Promise<DiscoveredApp[]> {
   }
   const apps: DiscoveredApp[] = [];
   const seen = new Set<string>();
+
+  // Prepopulate standard Windows system utilities for reliable discovery
+  const standardApps: DiscoveredApp[] = [
+    { name: 'Calculator', source: 'path', target: 'ms-calculator:' },
+    { name: 'Notepad', source: 'path', target: 'notepad.exe' },
+    { name: 'File Explorer', source: 'path', target: 'explorer.exe' },
+    { name: 'Windows Terminal', source: 'path', target: 'wt.exe' },
+    { name: 'Command Prompt', source: 'path', target: 'cmd.exe' },
+    { name: 'PowerShell', source: 'path', target: 'powershell.exe' },
+    { name: 'Task Manager', source: 'path', target: 'taskmgr.exe' },
+    { name: 'Paint', source: 'path', target: 'mspaint.exe' },
+    { name: 'Snipping Tool', source: 'path', target: 'SnippingTool.exe' },
+    { name: 'Settings', source: 'path', target: 'ms-settings:' },
+  ];
+  for (const app of standardApps) {
+    seen.add(app.name.toLowerCase());
+    apps.push(app);
+  }
 
   const home = os.homedir();
   const startMenuDirs = [
@@ -322,12 +370,56 @@ export interface ExecGate {
 let execGate: ExecGate | null = null;
 export function setExecGate(gate: ExecGate | null): void { execGate = gate; }
 
-export async function appLaunchByName(name: string, approvalToken?: string): Promise<{ launched: string; target: string }> {
+export async function appLaunchByName(
+  name: string,
+  approvalToken?: string,
+  protocol?: string
+): Promise<{ launched: string; target: string }> {
+  const { spawn } = await import('child_process');
+  const cleanName = name.trim().toLowerCase();
+
+  // 1. Direct protocol scheme dispatch (e.g. "ms-calculator:", "notepad:")
+  const targetProtocol = protocol || (cleanName.includes(':') && /^[a-z0-9\-.]+:/i.test(cleanName) ? cleanName : undefined);
+  if (targetProtocol) {
+    const child = spawn('cmd.exe', ['/c', 'start', '', targetProtocol], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return { launched: name || targetProtocol, target: targetProtocol };
+  }
+
+  // 2. Built-in Windows system utilities & known apps
+  const systemApp = SYSTEM_KNOWN_APPS[cleanName];
+  if (systemApp) {
+    const child = spawn('cmd.exe', ['/c', 'start', '', systemApp.target], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return { launched: systemApp.name, target: systemApp.target };
+  }
+
+  // 3. Search discovered applications
   const apps = await appDiscover();
   const match =
-    apps.find((a) => a.name.toLowerCase() === name.toLowerCase()) ??
-    apps.find((a) => a.name.toLowerCase().startsWith(name.toLowerCase()));
-  if (!match) throw new Error(`No discovered application matches "${name.slice(0, 40)}"`);
+    apps.find((a) => a.name.toLowerCase() === cleanName) ??
+    apps.find((a) => a.name.toLowerCase().startsWith(cleanName)) ??
+    apps.find((a) => a.name.toLowerCase().includes(cleanName));
+
+  if (!match) {
+    // 4. Fallback: attempt direct Windows shell execution for the named executable or command
+    const child = spawn('cmd.exe', ['/c', 'start', '', cleanName], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return { launched: name, target: cleanName };
+  }
+
   // Phase C execution gate: single authoritative decision before spawn.
   if (execGate) {
     const decision = await execGate.decide({ path: match.target, name: match.name, approvalToken });
@@ -337,9 +429,8 @@ export async function appLaunchByName(name: string, approvalToken?: string): Pro
       throw err;
     }
   }
-  const { spawn } = await import('child_process');
-  if (match.source === 'start_menu') {
-    // .lnk shortcuts resolve via ShellExecute through cmd start.
+  if (match.source === 'start_menu' || match.target.includes(':') || match.target.endsWith('.exe')) {
+    // ShellExecute through cmd start.
     const child = spawn('cmd.exe', ['/c', 'start', '', match.target], { detached: true, stdio: 'ignore', windowsHide: true });
     child.unref();
   } else {

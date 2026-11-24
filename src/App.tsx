@@ -34,6 +34,7 @@ import { detectAndParseWebAction, openExternalUrl } from './utils/webActions';
 import {
   detectAndParseAppLaunchCommand,
   launchLaptopApp,
+  generateOfflineAppResponse,
   LaptopApp,
 } from './utils/appLauncher';
 import {
@@ -1477,6 +1478,66 @@ export default function App() {
         setInitialAppSearch(appCmd.rawAppName);
         setActiveModal('apps');
       }
+
+      // If client is currently offline, fulfill app instruction immediately offline
+      const isClientOffline = typeof navigator !== 'undefined' && navigator.onLine === false;
+      if (isClientOffline) {
+        const offlineReplyData = generateOfflineAppResponse(appCmd, settings.userName, settings.languagePreference);
+        setLastSpokenText(offlineReplyData.reply);
+        setExpression(offlineReplyData.expression as any);
+        setEmotionData(offlineReplyData.emotionData as any);
+
+        const botMsg: Message = {
+          id: 'msg_' + (Date.now() + 1),
+          role: 'model',
+          content: offlineReplyData.reply,
+          timestamp: Date.now(),
+          expression: offlineReplyData.expression,
+          emotionData: offlineReplyData.emotionData as any,
+          appAction: detectedAppAction || undefined,
+        };
+
+        const finalMessages = [...targetConvo.messages, botMsg];
+        const finalConvo = {
+          ...targetConvo,
+          updatedAt: Date.now(),
+          messages: finalMessages,
+        };
+
+        const finalConversations = updatedConversations.map((c) =>
+          c.id === finalConvo.id ? finalConvo : c
+        );
+
+        setConversations(finalConversations);
+        saveStoredConversations(finalConversations);
+        activityFeedRef.current?.resolve('chat:reply');
+        activityFeedRef.current?.push(
+          appCmd.app ? `Launched ${appCmd.app.name} offline.` : 'Processed app instruction offline.',
+          'success'
+        );
+
+        if (liveTurnId !== null) getConversationTurnManager().completeTurn(liveTurnId);
+
+        if (settings.voiceEnabled) {
+          speakKrishaText(
+            offlineReplyData.reply,
+            settings.voiceName || 'Aoede',
+            settings.voiceSpeed,
+            () => setIsSpeaking(true),
+            () => setIsSpeaking(false),
+            undefined,
+            settings.languagePreference || 'auto',
+            settings.voicePitch ?? 1.0,
+            settings.voiceEngine || 'auto'
+          );
+        } else {
+          setIsSpeaking(true);
+          const talkDuration = Math.min(6500, Math.max(2200, offlineReplyData.reply.length * 45));
+          setTimeout(() => setIsSpeaking(false), talkDuration);
+        }
+        setIsLoading(false);
+        return;
+      }
     }
 
     // Check for local file system & PDF/document commands
@@ -2160,39 +2221,97 @@ export default function App() {
         .catch((err) => console.warn('Background memory extraction error:', err));
     } catch (err) {
       console.warn('Chat request fallback triggered:', err);
-      // Step 5: a failed response is an honest FAILED turn (never completed);
-      // the conversation stays intact for the next real exchange.
-      if (liveTurnId !== null) getConversationTurnManager().failTurn(liveTurnId);
       activityFeedRef.current?.resolve('chat:reply');
-      activityFeedRef.current?.push('The response could not be prepared.', 'error', { sticky: true, key: 'chat:error' });
-      const fallbackReply = `I'm right here with you, ${settings.userName || 'you'}. Tell me more.`;
-      const fallbackEmotion = analyzeSentimentAndKeywords(fallbackReply);
 
-      const botMsg: Message = {
-        id: 'msg_' + (Date.now() + 1),
-        role: 'model',
-        content: fallbackReply,
-        timestamp: Date.now(),
-        expression: fallbackEmotion.expression,
-        emotionData: fallbackEmotion,
-      };
+      if (appCmd.isAppCommand) {
+        // Successful offline app execution fallback
+        if (liveTurnId !== null) getConversationTurnManager().completeTurn(liveTurnId);
+        activityFeedRef.current?.push(
+          appCmd.app ? `Launched ${appCmd.app.name} offline.` : 'App action processed offline.',
+          'success'
+        );
+        const offlineReplyData = generateOfflineAppResponse(appCmd, settings.userName, settings.languagePreference);
+        const fallbackReply = offlineReplyData.reply;
+        const fallbackEmotion = offlineReplyData.emotionData;
 
-      const finalMessages = [...targetConvo.messages, botMsg];
-      const finalConvo = {
-        ...targetConvo,
-        updatedAt: Date.now(),
-        messages: finalMessages,
-      };
+        const botMsg: Message = {
+          id: 'msg_' + (Date.now() + 1),
+          role: 'model',
+          content: fallbackReply,
+          timestamp: Date.now(),
+          expression: offlineReplyData.expression,
+          emotionData: fallbackEmotion as any,
+          appAction: detectedAppAction || undefined,
+        };
 
-      const finalConversations = updatedConversations.map((c) =>
-        c.id === finalConvo.id ? finalConvo : c
-      );
+        const finalMessages = [...targetConvo.messages, botMsg];
+        const finalConvo = {
+          ...targetConvo,
+          updatedAt: Date.now(),
+          messages: finalMessages,
+        };
 
-      setConversations(finalConversations);
-      saveStoredConversations(finalConversations);
-      setExpression(fallbackEmotion.expression);
-      setEmotionData(fallbackEmotion);
-      setLastSpokenText(fallbackReply);
+        const finalConversations = updatedConversations.map((c) =>
+          c.id === finalConvo.id ? finalConvo : c
+        );
+
+        setConversations(finalConversations);
+        saveStoredConversations(finalConversations);
+        setExpression(offlineReplyData.expression as any);
+        setEmotionData(fallbackEmotion as any);
+        setLastSpokenText(fallbackReply);
+
+        if (settings.voiceEnabled) {
+          speakKrishaText(
+            fallbackReply,
+            settings.voiceName || 'Aoede',
+            settings.voiceSpeed,
+            () => setIsSpeaking(true),
+            () => setIsSpeaking(false),
+            undefined,
+            settings.languagePreference || 'auto',
+            settings.voicePitch ?? 1.0,
+            settings.voiceEngine || 'auto'
+          );
+        } else {
+          setIsSpeaking(true);
+          const talkDuration = Math.min(6500, Math.max(2200, fallbackReply.length * 45));
+          setTimeout(() => setIsSpeaking(false), talkDuration);
+        }
+      } else {
+        // Step 5: a failed response is an honest FAILED turn (never completed);
+        // the conversation stays intact for the next real exchange.
+        if (liveTurnId !== null) getConversationTurnManager().failTurn(liveTurnId);
+        activityFeedRef.current?.push('The response could not be prepared.', 'error', { sticky: true, key: 'chat:error' });
+        const fallbackReply = `I'm right here with you, ${settings.userName || 'you'}. Tell me more.`;
+        const fallbackEmotion = analyzeSentimentAndKeywords(fallbackReply);
+
+        const botMsg: Message = {
+          id: 'msg_' + (Date.now() + 1),
+          role: 'model',
+          content: fallbackReply,
+          timestamp: Date.now(),
+          expression: fallbackEmotion.expression,
+          emotionData: fallbackEmotion,
+        };
+
+        const finalMessages = [...targetConvo.messages, botMsg];
+        const finalConvo = {
+          ...targetConvo,
+          updatedAt: Date.now(),
+          messages: finalMessages,
+        };
+
+        const finalConversations = updatedConversations.map((c) =>
+          c.id === finalConvo.id ? finalConvo : c
+        );
+
+        setConversations(finalConversations);
+        saveStoredConversations(finalConversations);
+        setExpression(fallbackEmotion.expression);
+        setEmotionData(fallbackEmotion);
+        setLastSpokenText(fallbackReply);
+      }
     } finally {
       setIsLoading(false);
     }

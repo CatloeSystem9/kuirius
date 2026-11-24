@@ -123,6 +123,8 @@ import {
 // operator credential, authority epoch, pinning and E-stop checks inside
 // Phase D are the authority). No new classification, no new audit authority.
 import { IncidentStore, IncidentOrchestrator } from "./src/agent/incidents/index";
+// Initiation Subsystem — autonomous start (Scheduler + Event Triggers + Boot Resume)
+import { InitiationManager } from "./src/agent/initiation/index";
 
 const spfOutboundGuard = installSpfOutboundGuard(spfFirewall);
 
@@ -344,6 +346,13 @@ const incidentOrchestrator = new IncidentOrchestrator({
   },
 });
 incidentOrchestratorRef = incidentOrchestrator;
+
+// Initiation Subsystem: Persistent Mission Scheduler + Reactive Event Triggers + Boot Resume
+const initiationManager = new InitiationManager({
+  processMonitor,
+  audit: (event) => auditAndIngest(event, "initiation-subsystem"),
+});
+initiationManager.start();
 
 // Phase A raw lifecycle events → E.1 (direct subscription; never breaks the monitor).
 processMonitor.onEvent((event) => {
@@ -1213,8 +1222,26 @@ function generateCompanionFallbackReply(
     gesture = "tilt_head";
     intensity = 0.85;
     blushLevel = 0.2;
-  } else if (clean.includes("app") || clean.includes("software") || clean.includes("program") || clean.includes("spotify") || clean.includes("discord") || clean.includes("vscode") || clean.includes("slack") || clean.includes("calculator") || clean.includes("steam") || clean.includes("notion")) {
-    reply = `Launching that application on your laptop right now! Let's get to work~`;
+  } else if (clean.includes("calculator") || clean.includes("calc") || clean.includes("hisab")) {
+    reply = isHindi
+      ? `Bilkul! Main abhi aapke laptop par Calculator open kar rahi hoon~ Chaliye hisab-kitab aur calculations shuru karte hain! 🔢💙`
+      : `Opening Calculator for you right now! Let's get that math and calculation done together~ 🔢💙`;
+    expression = "happy_sparkle";
+    gesture = "perk_up";
+    intensity = 0.9;
+    blushLevel = 0.25;
+  } else if (clean.includes("notepad") || clean.includes("scratchpad") || clean.includes("text editor")) {
+    reply = isHindi
+      ? `Right away! Maine aapke liye Notepad launch kar diya hai~ Apne saare ideas aur notes likhne ke liye taiyaar hoon! 📝💙`
+      : `Launching Notepad for you right now! Ready for your thoughts, notes, and scratchpad ideas~ 📝💙`;
+    expression = "happy_sparkle";
+    gesture = "subtle_nod";
+    intensity = 0.9;
+    blushLevel = 0.25;
+  } else if (clean.includes("app") || clean.includes("software") || clean.includes("program") || clean.includes("spotify") || clean.includes("discord") || clean.includes("vscode") || clean.includes("slack") || clean.includes("steam") || clean.includes("notion")) {
+    reply = isHindi
+      ? `Bilkul! Main abhi aapke laptop par ye application launch kar rahi hoon~ Chaliye kaam shuru karte hain! ✨💙`
+      : `Launching that application on your laptop right now! Let's get to work together~ ✨💙`;
     expression = "happy_sparkle";
     gesture = "perk_up";
     intensity = 0.9;
@@ -4415,11 +4442,113 @@ app.post('/api/app/discover', (req, res) =>
   fsResult(res, () => sys.appDiscover(req.body?.force === true).then((apps) => sys.appSearch(apps, String(req.body?.query ?? ''))))
 );
 app.post('/api/app/launch', (req, res) =>
-  fsResult(res, () => (req.body?.path ? sys.appLaunchByPath(String(req.body.path), req.body?.approvalToken) : sys.appLaunchByName(String(req.body?.name ?? ''), req.body?.approvalToken)))
+  fsResult(res, () =>
+    req.body?.path
+      ? sys.appLaunchByPath(String(req.body.path), req.body?.approvalToken)
+      : sys.appLaunchByName(String(req.body?.name ?? ''), req.body?.approvalToken, typeof req.body?.protocol === 'string' ? req.body.protocol : undefined)
+  )
 );
 app.post('/api/app/status', (req, res) => fsResult(res, () => sys.appStatus(String(req.body?.name ?? ''))));
 app.post('/api/app/close', (req, res) => fsResult(res, () => sys.appClose(Number(req.body?.pid), req.body?.force === true)));
 app.post('/api/app/focus', (req, res) => fsResult(res, () => sys.appFocus(Number(req.body?.pid))));
+
+// ---- Initiation Subsystem Routes (Scheduler, Event Triggers, Boot Resume) ----
+app.get('/api/initiation/status', (req, res) => {
+  res.json(initiationManager.getStatus());
+});
+
+app.get('/api/initiation/missions', (req, res) => {
+  res.json({ missions: initiationManager.scheduler.getMissions() });
+});
+
+app.post('/api/initiation/missions', (req, res) => {
+  try {
+    const { id, name, description, kind, trigger, actionPayload, promptInstruction } = req.body;
+    if (!id || !name || !trigger) {
+      return res.status(400).json({ error: 'id, name, and trigger are required' });
+    }
+    const created = initiationManager.scheduler.addMission({
+      id: String(id),
+      name: String(name),
+      description: String(description || ''),
+      kind: kind || 'custom_task',
+      trigger,
+      actionPayload,
+      promptInstruction,
+      enabled: req.body.enabled !== false,
+    });
+    res.json({ success: true, mission: created });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to add mission' });
+  }
+});
+
+app.post('/api/initiation/missions/:id/toggle', (req, res) => {
+  const enabled = initiationManager.scheduler.toggleMission(req.params.id, req.body?.enabled);
+  res.json({ success: true, id: req.params.id, enabled });
+});
+
+app.post('/api/initiation/missions/:id/trigger', async (req, res) => {
+  const result = await initiationManager.scheduler.triggerNow(req.params.id);
+  if (!result) return res.status(404).json({ error: 'Mission not found' });
+  res.json({ success: result.success, result });
+});
+
+app.get('/api/initiation/rules', (req, res) => {
+  res.json({ rules: initiationManager.triggers.getRules() });
+});
+
+app.post('/api/initiation/rules', (req, res) => {
+  try {
+    const { id, name, description, source, eventType, filter, action, cooldownMs } = req.body;
+    if (!id || !name || !source || !eventType || !action) {
+      return res.status(400).json({ error: 'id, name, source, eventType, and action are required' });
+    }
+    const created = initiationManager.triggers.addRule({
+      id: String(id),
+      name: String(name),
+      description: String(description || ''),
+      source,
+      eventType,
+      filter,
+      action,
+      cooldownMs: Number(cooldownMs) || 60_000,
+      enabled: req.body.enabled !== false,
+    });
+    res.json({ success: true, rule: created });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to add rule' });
+  }
+});
+
+app.post('/api/initiation/rules/:id/toggle', (req, res) => {
+  const enabled = initiationManager.triggers.toggleRule(req.params.id, req.body?.enabled);
+  res.json({ success: true, id: req.params.id, enabled });
+});
+
+app.get('/api/initiation/boot-resume', (req, res) => {
+  res.json(initiationManager.bootResume.inspectBootGoals());
+});
+
+app.post('/api/initiation/sync-goals', (req, res) => {
+  try {
+    const goals = Array.isArray(req.body?.goals) ? req.body.goals : [];
+    initiationManager.bootResume.saveDurableGoals(goals);
+    res.json({ success: true, count: goals.length });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to sync goals' });
+  }
+});
+
+app.post('/api/initiation/boot-resume/:id/resume', (req, res) => {
+  const resumed = initiationManager.bootResume.resumeGoal(req.params.id);
+  if (!resumed) return res.status(404).json({ error: 'Goal not found' });
+  res.json({ success: true, goal: resumed });
+});
+
+app.get('/api/initiation/events', (req, res) => {
+  res.json({ events: initiationManager.getRecentEvents() });
+});
 
 // ---- LPV — Local Private Vault (post-roadmap capability) ----
 // Encrypted local credential storage, retention policy, controlled retrieval.
@@ -4657,6 +4786,11 @@ async function startServer() {
         malwareEngine.stop();
       } catch {
         // engine owns its own lifecycle guards
+      }
+      try {
+        initiationManager.stop();
+      } catch {
+        // initiation owns its own lifecycle guards
       }
     },
   });

@@ -5,6 +5,14 @@
  * and custom app path support.
  */
 
+import {
+  understandAppInstruction,
+  generateOfflineAppResponse,
+  setOfflineAppsProvider,
+  type AppIntentResult,
+  type OfflineAppResponse,
+} from './offlineAppIntent';
+
 export interface AppQuickTask {
   id: string;
   label: string;
@@ -787,12 +795,13 @@ export function launchLaptopApp(
   recordRecentApp(app.id);
 
   // 1. Try host server-side launch bridge if available
-  if (app.executableName || app.name) {
+  if (app.executableName || app.name || app.protocol) {
     fetch('/api/app/launch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         name: app.executableName || app.name,
+        protocol: app.protocol,
         asAdmin: options?.asAdmin,
       }),
     }).catch(() => {
@@ -895,6 +904,16 @@ export function searchLaptopApps(query: string, category?: string): LaptopApp[] 
   });
 }
 
+// Initialize offline apps provider for natural language understanding
+setOfflineAppsProvider(getAllLaptopApps);
+
+export {
+  understandAppInstruction,
+  generateOfflineAppResponse,
+  type AppIntentResult,
+  type OfflineAppResponse,
+};
+
 /**
  * Parse user voice or chat command for launching downloaded laptop applications
  * Supports direct Windows option clicks, search bar intent, and app launches.
@@ -905,9 +924,25 @@ export function detectAndParseAppLaunchCommand(text: string): {
   rawAppName: string | null;
   action: 'launch' | 'list_apps' | 'windows_start';
   searchQuery?: string;
+  confidence?: number;
+  detectedLanguage?: 'en' | 'hi';
 } {
   const clean = text.trim();
   if (!clean) return { isAppCommand: false, app: null, rawAppName: null, action: 'launch' };
+
+  // Prioritize comprehensive offline natural language intent analysis
+  const offlineIntent = understandAppInstruction(clean);
+  if (offlineIntent.isAppCommand) {
+    return {
+      isAppCommand: true,
+      app: offlineIntent.app,
+      rawAppName: offlineIntent.rawAppName,
+      action: offlineIntent.action,
+      searchQuery: offlineIntent.searchQuery,
+      confidence: offlineIntent.confidence,
+      detectedLanguage: offlineIntent.detectedLanguage,
+    };
+  }
 
   const lower = clean.toLowerCase();
 

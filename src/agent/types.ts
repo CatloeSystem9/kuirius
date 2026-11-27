@@ -108,6 +108,8 @@ export interface AgentTask {
   summary?: string;
   /** Relevant memories recalled for this task's input (Phase 2). */
   memoryContext?: string[];
+  /** Formatted learned knowledge, corrections, and verified skills (Learning Mechanism). */
+  learnedContext?: string;
   /** Structured scratchpad carrying results between steps (Phase 10). */
   context?: Record<string, unknown>;
   /**
@@ -162,6 +164,8 @@ export interface ToolContext {
   userRequest?: string;
   /** Relevant memories recalled for this task (Phase 3, from MemoryService). */
   relevantMemories?: string[];
+  /** Formatted learned knowledge, corrections, and skills for this task. */
+  learnedContext?: string;
   /** Permission registry used for pre-execution validation (Phase 3). */
   permissions?: import('./permissions').PermissionManager;
   /** Effective timeout for this invocation in ms (Phase 3). */

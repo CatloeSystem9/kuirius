@@ -208,3 +208,262 @@ export function maskIfSecretLike(value: string): string {
   if (value.length > 200) return value.slice(0, 200) + '…';
   return value;
 }
+
+// ============================================================================
+// Krix Learning Mechanism (Foundation for Krix Academy)
+// ============================================================================
+
+export type LearningSource =
+  | 'conversation'
+  | 'correction'
+  | 'research'
+  | 'task_outcome'
+  | 'tool_result'
+  | 'academy'
+  | 'memory';
+
+export type LearningCandidateType =
+  | 'new_knowledge'
+  | 'correction'
+  | 'relationship'
+  | 'procedure'
+  | 'skill_change'
+  | 'temporary';
+
+export type VerificationStatus =
+  | 'unverified'
+  | 'user_provided'
+  | 'hypothesis'
+  | 'fact';
+
+export type MasteryStatus = 'unverified' | 'tested' | 'proficient' | 'expert';
+
+export interface Provenance {
+  source: LearningSource;
+  sourceId?: string;
+  timestamp: number;
+  rawText: string;
+  confidence: number;
+}
+
+export interface ConceptRelationship {
+  id: string;
+  fromId: string;
+  toId: string;
+  type:
+    | 'prerequisite'
+    | 'related'
+    | 'contradicts'
+    | 'extends'
+    | 'example_of'
+    | 'part_of';
+  strength: number;
+  evidence: string;
+  createdAt: number;
+}
+
+export interface ConceptContradiction {
+  id: string;
+  conceptId: string;
+  conflictingText: string;
+  conflictingSource: LearningSource;
+  description: string;
+  detectedAt: number;
+  resolved: boolean;
+  resolution?: string;
+}
+
+export interface ConceptVersionSnapshot {
+  version: number;
+  definition: string;
+  verificationStatus: VerificationStatus;
+  confidence: number;
+  updatedAt: number;
+  changeNote: string;
+}
+
+export interface AcquiredConcept {
+  id: string;
+  label: string;
+  definition: string;
+  relationships: ConceptRelationship[];
+  prerequisites: string[];
+  knowledgeGaps: string[];
+  confidence: number;
+  verificationStatus: VerificationStatus;
+  provenance: Provenance[];
+  version: number;
+  versionHistory: ConceptVersionSnapshot[];
+  contradictions: ConceptContradiction[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface ValidationEvidence {
+  type:
+    | 'task_success'
+    | 'test_pass'
+    | 'user_confirmation'
+    | 'repeated_success';
+  taskId?: string;
+  description: string;
+  timestamp: number;
+  passed: boolean;
+}
+
+export interface AcquiredSkill {
+  id: string;
+  label: string;
+  description: string;
+  prerequisites: string[];
+  requiredKnowledge: string[];
+  requiredPermissions: string[];
+  procedure: string;
+  validationEvidence: ValidationEvidence[];
+  masteryStatus: MasteryStatus;
+  version: number;
+  lastTestedAt?: number;
+  knownLimitations: string[];
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface LearningCandidate {
+  id: string;
+  type: LearningCandidateType;
+  source: LearningSource;
+  content: string;
+  context: Record<string, unknown>;
+  confidence: number;
+  sessionId: string;
+  timestamp: number;
+  idempotencyKey: string;
+}
+
+export interface LearningSession {
+  id: string;
+  startedAt: number;
+  updatedAt: number;
+  mode: 'guided' | 'independent' | 'ambient';
+  topic?: string;
+  source: LearningSource;
+  candidates: LearningCandidate[];
+  outcome?: LearningOutcome;
+  status: 'active' | 'paused' | 'completed' | 'failed';
+  resumeToken?: string;
+  apiCallsUsed: number;
+}
+
+export interface StructuredCorrection {
+  id: string;
+  originalMistake: string;
+  cause:
+    | 'missing_knowledge'
+    | 'incorrect_knowledge'
+    | 'wrong_procedure'
+    | 'misunderstood_context'
+    | 'unknown';
+  correctedKnowledge: string;
+  evidence: string[];
+  validatedAt?: number;
+  appliedCount: number;
+  conceptIds: string[];
+  createdAt: number;
+}
+
+export interface ExperienceRecord {
+  id: string;
+  taskId: string;
+  outcome: 'success' | 'failure' | 'partial';
+  environmental: boolean;
+  cause?: string;
+  lessonDerived?: string;
+  validated: boolean;
+  conceptIds: string[];
+  toolsUsed: string[];
+  timestamp: number;
+}
+
+export interface LearningStrategyStat {
+  id: string;
+  method: string;
+  source: LearningSource;
+  successCount: number;
+  failureCount: number;
+  successRate: number;
+  sampleSize: number;
+  conceptDifficulties: Record<string, number>;
+  lastUpdatedAt: number;
+}
+
+export interface RevisionRequirement {
+  id: string;
+  conceptId: string;
+  reason: string;
+  failureCount: number;
+  priority: 'low' | 'medium' | 'high';
+  resolved: boolean;
+  createdAt: number;
+}
+
+export interface CapabilityChange {
+  type: 'skill_acquired' | 'knowledge_updated' | 'correction_applied';
+  id: string;
+  evidence: string[];
+}
+
+export interface LearningOutcome {
+  sessionId: string;
+  understood: string[];
+  conceptsAcquired: string[];
+  conceptsUpdated: string[];
+  conceptsRejected: string[];
+  skillsAcquired: string[];
+  skillsUpdated: string[];
+  conflicts: ConceptContradiction[];
+  uncertainties: string[];
+  validatedItems: string[];
+  failedAssessments: string[];
+  remainingGaps: string[];
+  capabilityChanges: CapabilityChange[];
+}
+
+export interface KnowledgeIntegrationResult {
+  candidateId: string;
+  action: 'created' | 'updated' | 'merged' | 'rejected' | 'flagged_conflict';
+  conceptId?: string;
+  conflict?: ConceptContradiction;
+  reason: string;
+}
+
+export interface LearningQueueItem {
+  id: string;
+  type: 'intake' | 'integrate' | 'validate' | 'consolidate' | 'experience';
+  payload: unknown;
+  priority: number;
+  createdAt: number;
+  attempts: number;
+  maxAttempts: number;
+  idempotencyKey: string;
+  cancelled?: boolean;
+}
+
+export interface LearningConfig {
+  maxConcurrentTasks: number;
+  maxQueueSize: number;
+  batchConsolidationDelayMs: number;
+  apiCallBudgetPerSession: number;
+  deduplicationWindowMs: number;
+  enableExperienceLearning: boolean;
+  enableCorrectionTracking: boolean;
+}
+
+export const DEFAULT_LEARNING_CONFIG: LearningConfig = {
+  maxConcurrentTasks: 2,
+  maxQueueSize: 50,
+  batchConsolidationDelayMs: 5000,
+  apiCallBudgetPerSession: 10,
+  deduplicationWindowMs: 300_000,
+  enableExperienceLearning: true,
+  enableCorrectionTracking: true,
+};

@@ -232,7 +232,14 @@ export class ScreenObserver {
 
   /** Cheap capture + signature comparison; no vision analysis runs here. */
   async detectChanges(): Promise<ScreenChangeResult> {
-    const frame = await this.captureFrame();
+    // Change detection only needs the small analysis buffer.  In particular,
+    // ambient glances must not JPEG-encode a full screenshot merely to learn
+    // whether anything changed; that work is deferred until a meaningful
+    // change justifies local understanding.
+    this.ensureAllowed();
+    const frame = this.captureSource.captureAnalysis
+      ? await withTimeout(this.captureSource.captureAnalysis(), this.captureTimeoutMs, 'timeout')
+      : await this.captureFrame();
     const signature = computeBlockSignature(frame);
 
     if (!this.lastState) {

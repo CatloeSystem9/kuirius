@@ -46,6 +46,22 @@ export interface AgentCoreOptions {
    * this only READS the package and attaches memory/knowledge to the task.
    */
   contextProvider?: (input: string, taskId: string) => ContextPackage | undefined;
+  /**
+   * Learning Mechanism — supplies retrieved learned concepts, corrections,
+   * verified skills, and knowledge gaps before planning/execution.
+   */
+  learningProvider?: (
+    input: string,
+    taskId: string
+  ) =>
+    | {
+        formatted: string;
+        concepts: unknown[];
+        corrections: unknown[];
+        skills: unknown[];
+        gaps: string[];
+      }
+    | undefined;
   stepTimeoutMs?: number;
   maxAttemptsPerStep?: number;
   retryDelayMs?: number;
@@ -64,6 +80,7 @@ export class AgentCore {
   private planner: Planner;
   private planning?: PlanEngine;
   private readonly contextProvider?: AgentCoreOptions['contextProvider'];
+  private readonly learningProvider?: AgentCoreOptions['learningProvider'];
   /** Intelligence Loop v1 — bounded per-task cycle observability. */
   readonly cycleTrace = new CycleTraceStore();
   private stepTimeoutMs: number;
@@ -83,6 +100,7 @@ export class AgentCore {
     this.planner = options.planner ?? new HeuristicPlanner();
     this.permissions = options.permissions ?? new PermissionManager();
     this.contextProvider = options.contextProvider;
+    this.learningProvider = options.learningProvider;
     this.recovery = options.recovery ?? new RecoveryManager({
       registry: this.registry,
       events: this.events,
@@ -240,6 +258,26 @@ export class AgentCore {
         }
       } catch {
         // context must never break execution
+      }
+
+      // ---- LEARNING RETRIEVAL (Krix Learning Mechanism): inject relevant
+      // learned concepts, validated corrections, and verified skills before
+      // planning/execution. Never blocks or throws.
+      try {
+        const learned = this.learningProvider?.(task.goal.rawInput, taskId);
+        if (learned && learned.formatted) {
+          this.store.update(taskId, (t) => {
+            t.learnedContext = learned.formatted;
+          });
+          this.cycleTrace.record(taskId, 'context', {
+            learnedConcepts: learned.concepts.length,
+            learnedCorrections: learned.corrections.length,
+            learnedSkills: learned.skills.length,
+            knowledgeGaps: learned.gaps.length,
+          });
+        }
+      } catch {
+        // learning retrieval must never break execution
       }
 
       // PLAN
@@ -819,6 +857,7 @@ export class AgentCore {
             memory: taskMemory,
             userRequest: task.goal.rawInput,
             relevantMemories: task.memoryContext,
+            learnedContext: task.learnedContext,
             permissions: this.permissions,
             timeoutMs: effectiveTimeout,
           }),

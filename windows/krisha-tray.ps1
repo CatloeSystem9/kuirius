@@ -35,7 +35,11 @@
 #>
 
 param(
-    [switch]$SummonOnly
+    [switch]$SummonOnly,
+    # Approval Surface: the Windows toast's Approve/Deny buttons activate the
+    # krisha:// protocol with this URI. The tray then relays the decision to
+    # the server and exits. Headless helper — same shape as -SummonOnly.
+    [string]$ApprovalUri
 )
 
 $ErrorActionPreference = 'Stop'
@@ -94,6 +98,7 @@ namespace KrishaTray
         [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
         [DllImport("user32.dll")] public static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
         [DllImport("user32.dll")] public static extern uint SendInput(uint n, INPUT[] inputs, int size);
+        [DllImport("user32.dll")] public static extern uint GetClipboardSequenceNumber();
         [DllImport("kernel32.dll")] public static extern bool CreateMutexW(IntPtr attr, bool initial, string name);
         [DllImport("kernel32.dll")] public static extern int GetLastError();
 
@@ -336,6 +341,147 @@ function Invoke-KrishaSafetyStop {
     }
 }
 
+# Clipboard change signal for the Initiation subsystem.
+#
+# Deliberately CONTENT-FREE: GetClipboardSequenceNumber is a Win32 counter
+# that increments whenever the clipboard changes. It never opens the
+# clipboard, so Krisha learns that "something was copied" without ever
+# reading what was copied. The clipboard contents are never transmitted,
+# logged, or stored.
+function Send-ClipboardChanged {
+    try {
+        Invoke-RestMethod -Method Post -Uri "$base/api/initiation/clipboard" `
+            -ContentType 'application/json' -Body '{}' -TimeoutSec 3 | Out-Null
+        Write-TrayLog 'clipboard change signalled (content not read)'
+        return $true
+    } catch {
+        # The server may be down or the endpoint may not exist yet — the
+        # signal is best-effort and must never disturb the tray.
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Approval Surface — Windows Action Center toasts
+#
+# An operator decision (execution gate, rollback, vault) that arrives while
+# Krisha's window is not in front becomes a Windows toast with Approve / Deny
+# buttons. Clicking a button activates the krisha:// protocol, which runs this
+# script again with -ApprovalUri; that short-lived helper relays the decision
+# to the server and exits.
+#
+# The toast is raised with built-in WinRT only — no external PowerShell module
+# is required. If WinRT is unavailable the tray falls back to a balloon, which
+# notifies but cannot carry the buttons.
+# ---------------------------------------------------------------------------
+
+$script:ApprovalAppId = 'Krisha.Approval'
+
+function Register-KrishaApprovalSurface {
+    # The AppUserModelID is what makes a script-raised toast possible.
+    try {
+        $key = "HKCU:\Software\Classes\AppUserModelId\$($script:ApprovalAppId)"
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        New-ItemProperty -Path $key -Name 'DisplayName' -Value 'Krisha' -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $key -Name 'IconUri' -Value '' -PropertyType String -Force | Out-Null
+    } catch {
+        Write-TrayLog "could not register the toast AppUserModelID: $_"
+    }
+    # The protocol the toast buttons activate.
+    try {
+        $proto = 'HKCU:\Software\Classes\krisha'
+        if (-not (Test-Path $proto)) { New-Item -Path $proto -Force | Out-Null }
+        New-ItemProperty -Path $proto -Name '(Default)' -Value 'URL:Krisha Approval' -PropertyType String -Force | Out-Null
+        New-ItemProperty -Path $proto -Name 'URL Protocol' -Value '' -PropertyType String -Force | Out-Null
+        $cmd = Join-Path $proto 'shell\open\command'
+        if (-not (Test-Path $cmd)) { New-Item -Path $cmd -Force | Out-Null }
+        $handler = "powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSScriptRoot\krisha-tray.ps1`" -ApprovalUri `"%1`""
+        New-ItemProperty -Path $cmd -Name '(Default)' -Value $handler -PropertyType String -Force | Out-Null
+    } catch {
+        Write-TrayLog "could not register the krisha:// protocol: $_"
+    }
+}
+
+function ConvertTo-XmlText {
+    param([string]$Text)
+    if ($null -eq $Text) { return '' }
+    return ($Text -replace '&', '&amp;' -replace '<', '&lt;' -replace '>', '&gt;' -replace '"', '&quot;')
+}
+
+function Show-KrishaApprovalToast {
+    param(
+        [string]$Id,
+        [string]$Capability,
+        [string]$Title,
+        [string]$Detail
+    )
+    $safeTitle = ConvertTo-XmlText ($Title -replace '\s+', ' ').Trim()
+    $safeDetail = ConvertTo-XmlText ($Detail -replace '\s+', ' ').Trim()
+    if ($safeDetail.Length -gt 220) { $safeDetail = $safeDetail.Substring(0, 217) + '...' }
+
+    $xml = @"
+<toast launch="krisha://approval?id=$Id" duration="long">
+  <visual>
+    <binding template="ToastGeneric">
+      <text>$safeTitle</text>
+      <text>$safeDetail</text>
+    </binding>
+  </visual>
+  <actions>
+    <action content="Approve" activationType="protocol" arguments="krisha://approval?id=$Id&amp;cap=$Capability&amp;decision=approve" />
+    <action content="Deny" activationType="protocol" arguments="krisha://approval?id=$Id&amp;cap=$Capability&amp;decision=deny" />
+  </actions>
+</toast>
+"@
+    try {
+        $doc = New-Object Windows.Data.Xml.Dom.XmlDocument
+        $doc.LoadXml($xml)
+        $toast = New-Object Windows.UI.Notifications.ToastNotification $doc
+        $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($script:ApprovalAppId)
+        $notifier.Show($toast)
+        Write-TrayLog "approval toast raised for $Id"
+        return $true
+    } catch {
+        Write-TrayLog "approval toast failed: $_"
+        return $false
+    }
+}
+
+# Relay a decision made from the toast to the server.
+function Send-KrishaApprovalDecision {
+    param([string]$Id, [string]$Capability, [string]$Decision)
+    try {
+        $body = @{ id = $Id; capability = $Capability; decision = $Decision; via = 'toast' } | ConvertTo-Json
+        $r = Invoke-RestMethod -Method Post -Uri "$base/api/approvals/decide" `
+            -ContentType 'application/json' -Body $body -TimeoutSec 8
+        Write-TrayLog "approval $Decision for $Id -> ok=$($r.ok)"
+        return $r.ok
+    } catch {
+        Write-TrayLog "approval decision relay failed: $_"
+        return $false
+    }
+}
+
+# Parse a krisha://approval?... URI into its parts.
+function Read-ApprovalUri {
+    param([string]$Uri)
+    try {
+        $parsed = [Uri]$Uri
+        $q = $parsed.Query.TrimStart('?')
+        $parts = @{}
+        foreach ($pair in ($q -split '&')) {
+            if (-not $pair) { continue }
+            $kv = $pair -split '=', 2
+            $k = [System.Uri]::UnescapeDataString($kv[0])
+            $v = if ($kv.Count -gt 1) { [System.Uri]::UnescapeDataString($kv[1]) } else { '' }
+            $parts[$k] = $v
+        }
+        return $parts
+    } catch {
+        return $null
+    }
+}
+
 function Set-KrishaAutostart {
     param([bool]$Enable)
     $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\Startup\Krisha.lnk'
@@ -381,6 +527,22 @@ function Convert-HotkeySpec {
     return @{ mods = [uint32]$mods; vk = [uint32]$vk }
 }
 
+# ------------------------------------------------------------- approval-only mode
+
+# The toast's Approve/Deny buttons activate krisha://approval?... which lands
+# here. This is a headless one-shot: relay the decision to the server, then
+# exit. It never opens a window and never touches the tray host.
+if ($ApprovalUri) {
+    $parts = Read-ApprovalUri -Uri $ApprovalUri
+    if (-not $parts -or -not $parts['id'] -or -not $parts['decision']) {
+        Write-TrayLog "malformed approval URI — ignored"
+        exit 1
+    }
+    $capability = if ($parts['cap']) { $parts['cap'] } else { '' }
+    [void](Send-KrishaApprovalDecision -Id $parts['id'] -Capability $capability -Decision $parts['decision'])
+    exit 0
+}
+
 # ------------------------------------------------------------ summon-only mode
 
 if ($SummonOnly) {
@@ -391,6 +553,10 @@ if ($SummonOnly) {
 # ----------------------------------------------------------------- tray host
 
 Write-TrayLog 'tray host starting'
+
+# Register the toast AppUserModelID and the krisha:// protocol the toast
+# buttons activate. Both are per-user (HKCU) and need no elevation.
+Register-KrishaApprovalSurface
 
 if ([KrishaTray.Native]::MutexHeld('KrishaTrayHostMutex')) {
     Write-TrayLog 'another tray host instance already holds the mutex — exiting'
@@ -501,6 +667,69 @@ if ($cfg['cornerFailsafe']) {
     $cornerTimer.Start()
 }
 
+# -- clipboard change watcher (Initiation subsystem)
+# Polls the Win32 clipboard SEQUENCE NUMBER — a counter, not the clipboard
+# itself. The contents are never opened, read, logged or transmitted.
+$script:lastClipSeq = [uint32]0
+try { $script:lastClipSeq = [KrishaTray.Native]::GetClipboardSequenceNumber() } catch { }
+$clipTimer = New-Object System.Windows.Forms.Timer
+$clipTimer.Interval = 2000
+$clipTimer.add_Tick({
+    try {
+        $seq = [KrishaTray.Native]::GetClipboardSequenceNumber()
+        if ($seq -ne $script:lastClipSeq) {
+            $script:lastClipSeq = $seq
+            [void](Send-ClipboardChanged)
+        }
+    } catch { }
+})
+$clipTimer.Start()
+
+# -- approval surface: watch for pending operator decisions ------------------
+# The server owns the decision; the tray only presents it. Each request is
+# toasted ONCE (tracked by id) so a long-lived pending request does not
+# produce a stream of notifications.
+$script:notifiedApprovals = @{}
+
+function Sync-KrishaApprovals {
+    try {
+        $r = Invoke-RestMethod -Uri "$base/api/approvals/pending" -TimeoutSec 5
+        $requests = @($r.requests)
+        foreach ($req in $requests) {
+            $id = [string]$req.id
+            if (-not $id) { continue }
+            if ($script:notifiedApprovals.ContainsKey($id)) { continue }
+            # Tell the server this request was genuinely surfaced to a human.
+            try {
+                Invoke-RestMethod -Method Post -Uri "$base/api/approvals/surfaced" `
+                    -ContentType 'application/json' -Body (@{ id = $id; via = 'toast' } | ConvertTo-Json) `
+                    -TimeoutSec 5 | Out-Null
+            } catch { }
+            $script:notifiedApprovals[$id] = $true
+            $ok = Show-KrishaApprovalToast -Id $id -Capability ([string]$req.capability) `
+                -Title ([string]$req.title) -Detail ([string]$req.detail)
+            if (-not $ok) {
+                # WinRT unavailable — fall back to a balloon that opens Krisha.
+                Show-Balloon ([string]$req.title) ([string]$req.detail) 'Warning'
+            }
+        }
+        # Forget decisions that are no longer pending so a re-raised request
+        # with the same id would still be toasted.
+        $live = @{}
+        foreach ($req in $requests) { $live[[string]$req.id] = $true }
+        foreach ($id in @($script:notifiedApprovals.Keys)) {
+            if (-not $live.ContainsKey($id)) { $script:notifiedApprovals.Remove($id) }
+        }
+    } catch {
+        # The server may be down — the tray must never be disturbed by it.
+    }
+}
+
+$approvalTimer = New-Object System.Windows.Forms.Timer
+$approvalTimer.Interval = 3000
+$approvalTimer.add_Tick({ Sync-KrishaApprovals })
+$approvalTimer.Start()
+
 # -- tray menu
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
@@ -544,6 +773,8 @@ $miExit.add_Click({
     Write-TrayLog 'tray exit requested'
     [void][KrishaTray.Native]::UnregisterHotKey($form.Handle, 1)
     [void][KrishaTray.Native]::UnregisterHotKey($form.Handle, 2)
+    $clipTimer.Stop()
+    $approvalTimer.Stop()
     $notify.Visible = $false
     $notify.Dispose()
     $form.Close()

@@ -79,6 +79,10 @@ import {
   proactiveSettingsFromCompanion,
   type ProactiveMessage,
 } from './utils/proactiveConversation';
+import {
+  InitiationClient,
+  initiationSettingsFromCompanion,
+} from './utils/initiationClient';
 import { spfScreenItem } from './agent/spf/index';
 import { getMemoryService } from './agent/memory/memoryService';
 import { attachMemoryToSystem } from './agent/memory/memoryBridge';
@@ -98,6 +102,7 @@ import { LocalFileActionCard } from './components/LocalFileActionCard';
 import { AppActionCard } from './components/AppActionCard';
 import { MapsLocationCard } from './components/MapsLocationCard';
 import { RollbackApprovalCard } from './components/RollbackApprovalCard';
+import { ApprovalSurfaceCard } from './components/ApprovalSurfaceCard';
 import { LocationDetailsModal } from './components/LocationDetailsModal';
 import { DocumentViewerModal } from './components/DocumentViewerModal';
 import { WebBrowserModal } from './components/WebBrowserModal';
@@ -110,6 +115,7 @@ import { ScreenVisionModal } from './components/ScreenVisionModal';
 import { ArcadeModal } from './components/arcade/ArcadeModal';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import type { GameId } from './components/arcade/types';
+import OfflineBanner from './components/OfflineBanner';
 import {
   loadHabits,
   loadCalendarEvents,
@@ -303,6 +309,8 @@ export default function App() {
   const conversationsRef = useRef(conversations);
   conversationsRef.current = conversations;
   const proactiveServiceRef = useRef<ReturnType<typeof getProactiveConversationService> | null>(null);
+  // Initiation — the executor half of the autonomous-start subsystem.
+  const initiationClientRef = useRef<InitiationClient | null>(null);
   // Step 6 — Camera Vision state (explicit user control only; the service
   // never starts the camera on its own).
   const [cameraStatus, setCameraStatus] = useState<CameraStatus>('inactive');
@@ -387,6 +395,65 @@ export default function App() {
     []
   );
 
+  /**
+   * Deliver a message from Krisha to the user: it enters the ACTIVE
+   * conversation as a real model message (truthful history — nothing
+   * fabricated) and is spoken through the voice pipeline when enabled.
+   * Shared by proactive conversations and autonomous initiations so both
+   * arrive in the same, honest form.
+   */
+  const deliverKrishaMessage = useCallback(
+    (text: string, expression: string, emotion: EmotionAnalysis, speak: boolean) => {
+      if (!text) return;
+      const botMsg: Message = {
+        id: 'msg_' + (Date.now() + 2),
+        role: 'model',
+        content: text,
+        timestamp: Date.now(),
+        expression: normalizeExpression(expression),
+        emotionData: {
+          ...emotion,
+          expression: normalizeExpression(expression),
+          sentiment: 'neutral',
+        } as EmotionAnalysis,
+      };
+      setConversations((prev) => {
+        const target = prev.find((c) => c.id === activeConvoIdRef.current) || prev[0];
+        if (!target) return prev;
+        const updated = {
+          ...target,
+          updatedAt: Date.now(),
+          messages: [...target.messages, botMsg],
+        };
+        const next = prev.map((c) => (c.id === updated.id ? updated : c));
+        saveStoredConversations(next);
+        return next;
+      });
+      setExpression(normalizeExpression(expression));
+      setEmotionData({
+        ...emotion,
+        expression: normalizeExpression(expression),
+        sentiment: 'neutral',
+      } as EmotionAnalysis);
+      setLastSpokenText(text);
+      const s = settingsRef.current;
+      if (speak && s.voiceEnabled) {
+        speakKrishaText(
+          text,
+          s.voiceName || 'Aoede',
+          s.voiceSpeed,
+          () => setIsSpeaking(true),
+          () => setIsSpeaking(false),
+          undefined,
+          s.languagePreference || 'auto',
+          s.voicePitch ?? 1.0,
+          s.voiceEngine || 'auto'
+        );
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     // Persistent Identity Foundation (Step 1): restore Krix's identity during
     // application startup — validated load from storage (create-once if
@@ -411,6 +478,12 @@ export default function App() {
       applyScreenVisionAction: (action) => {
         setActiveScreenVisionAction(action);
       },
+      offerAmbientGlance: (offer) => {
+        // Ambient awareness deliberately offers, never interrupts, speaks or
+        // copies screen text into chat. The activity feed keeps the choice in
+        // the user's hands.
+        activityFeedRef.current?.push(offer.message, 'info', { key: 'ambient:build-errors' });
+      },
     });
     const memoryAttachment = attachMemoryToSystem(system, getMemoryService());
     agentSystemRef.current = system;
@@ -419,6 +492,7 @@ export default function App() {
     // targeting and agent observation never upload a screenshot. The observer
     // already starts offline; this syncs explicit user changes immediately.
     system.screenObserver?.setOfflineVision(settings.offlineVision !== false);
+    if (settings.ambientAwareness === true) system.ambientGlance?.start();
     // Background Runtime (Step 1 — lid-closed operation): a bounded,
     // visibility-aware watchdog keeps the runtime observable while the window
     // is hidden or the lid is closed (Windows "Do nothing"). It only DETECTS
@@ -535,52 +609,12 @@ export default function App() {
         // Add the message to the ACTIVE conversation as a real model message
         // (truthful history — nothing fabricated) and speak through the
         // Step 2 pipeline with the user's existing voice settings.
-        const botMsg: Message = {
-          id: 'msg_' + (Date.now() + 2),
-          role: 'model',
-          content: message.text,
-          timestamp: Date.now(),
-          expression: normalizeExpression(message.expression),
-          emotionData: {
-            ...message.emotionData,
-            expression: normalizeExpression(message.expression),
-            sentiment: 'neutral',
-          } as EmotionAnalysis,
-        };
-        setConversations((prev) => {
-          const target =
-            prev.find((c) => c.id === activeConvoIdRef.current) || prev[0];
-          if (!target) return prev;
-          const updated = {
-            ...target,
-            updatedAt: Date.now(),
-            messages: [...target.messages, botMsg],
-          };
-          const next = prev.map((c) => (c.id === updated.id ? updated : c));
-          saveStoredConversations(next);
-          return next;
-        });
-        setExpression(normalizeExpression(message.expression));
-        setEmotionData({
-          ...message.emotionData,
-          expression: normalizeExpression(message.expression),
-          sentiment: 'neutral',
-        } as EmotionAnalysis);
-        setLastSpokenText(message.text);
-        const s = settingsRef.current;
-        if (s.voiceEnabled) {
-          speakKrishaText(
-            message.text,
-            s.voiceName || 'Aoede',
-            s.voiceSpeed,
-            () => setIsSpeaking(true),
-            () => setIsSpeaking(false),
-            undefined,
-            s.languagePreference || 'auto',
-            s.voicePitch ?? 1.0,
-            s.voiceEngine || 'auto'
-          );
-        }
+        deliverKrishaMessage(
+          message.text,
+          message.expression,
+          message.emotionData as EmotionAnalysis,
+          true
+        );
       },
     });
     proactiveServiceRef.current = proactiveService;
@@ -620,6 +654,122 @@ export default function App() {
       }
     });
     watchdog.start();
+    // Initiation — autonomous start. The server-side trigger engine decides
+    // WHEN and WHAT (scheduled missions, reactive rules, boot-resume); this
+    // client decides WHETHER and HOW. Execution goes through the agent core
+    // directly — NOT runAgentTask — so an autonomous mission can never grant
+    // itself a permission the user never gave.
+    const initiationClient = new InitiationClient({
+      getSettings: () => initiationSettingsFromCompanion(settingsRef.current),
+      isUserActive: () => inactivityTracker.getDiagnostics().state === 'active_conversation',
+      isSpeaking: () => isSpeakingRef.current,
+      executeTask: async (prompt: string) => {
+        try {
+          const task = await system.core.submit(prompt);
+          const summary = task.summary || task.error || '';
+          return {
+            success: task.status === 'completed',
+            summary:
+              task.status === 'completed'
+                ? summary
+                : `The task ${task.status === 'failed' ? 'failed' : task.status}: ${summary || 'no summary'}`,
+          };
+        } catch (err: any) {
+          return { success: false, summary: err?.message || String(err) };
+        }
+      },
+      deliver: (text, opts) => {
+        deliverKrishaMessage(text, 'gentle_smile', {
+          expression: 'gentle_smile',
+          intensity: 0.7,
+          gesture: 'none',
+          blushLevel: 0.2,
+        } as EmotionAnalysis, opts.speak !== false);
+      },
+      notify: (text, level) => {
+        activityFeedRef.current?.push(text, level || 'info');
+      },
+      ack: async (ack) => {
+        try {
+          await fetch('/api/initiation/ack', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(ack),
+          });
+        } catch {
+          // the server will re-offer the record after the lease expires
+        }
+      },
+      defer: async (id, delayMs) => {
+        try {
+          const res = await fetch('/api/initiation/defer', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id, delayMs }),
+          });
+          const body = await res.json();
+          return body?.deferred === true;
+        } catch {
+          return false;
+        }
+      },
+      syncGoals: async (goals) => {
+        await fetch('/api/initiation/sync-goals', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goals }),
+        });
+      },
+      getGoals: () => (system.goals ? system.goals.list() : []),
+      reflectNightly: async () => {
+        try {
+          const response = await fetch('/api/reflection/nightly');
+          if (!response.ok) return { success: false, summary: 'could not read the verified audit digest' };
+          const digest = await response.json();
+          if (digest?.verified !== true || !Array.isArray(digest?.corrections)) {
+            return { success: false, summary: 'audit digest was not verifiable' };
+          }
+          const outcomes = digest.corrections.map((item: { text?: unknown; kind?: unknown; count?: unknown }) =>
+            system.consolidation?.consolidateAuditCorrection(String(item.text ?? ''), String(item.kind ?? ''), Number(item.count ?? 0))
+          ).filter(Boolean) ?? [];
+          const recorded = outcomes.filter((outcome: any) => outcome.action === 'created' || outcome.action === 'merged' || outcome.action === 'superseded').length;
+          const summary = `Nightly reflection reviewed ${Number(digest.entries ?? 0)} verified audit event(s) and recorded ${recorded} correction${recorded === 1 ? '' : 's'}.`;
+          activityFeedRef.current?.push(summary, 'info');
+          return { success: true, summary };
+        } catch {
+          return { success: false, summary: 'nightly reflection could not reach the local server' };
+        }
+      },
+    });
+    initiationClientRef.current = initiationClient;
+    initiationClient.start();
+    // The browser holds the project approvals; the server is the only side
+    // that can watch the filesystem. Hand the approved roots over so
+    // file_created / file_modified rules have something to react to.
+    const pushWatchedRoots = async () => {
+      try {
+        const roots = system.projects?.listApproved?.() ?? [];
+        await fetch('/api/initiation/watch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ directories: roots }),
+        });
+      } catch {
+        // the watcher is an enhancement — a failure must never break the app
+      }
+    };
+    void pushWatchedRoots();
+    const detachWatchRoots = system.bus.on('PROJECT_INDEXED', () => {
+      void pushWatchedRoots();
+    });
+    // Goal continuity across reboots: keep the server's durable copy in step
+    // with the browser's goal store whenever a goal changes.
+    const detachGoalStatusSync = system.bus.on('GOAL_STATUS_UPDATED', () => {
+      void initiationClient.syncGoalsToServer();
+    });
+    const detachGoalMilestoneSync = system.bus.on('GOAL_MILESTONE_RECORDED', () => {
+      void initiationClient.syncGoalsToServer();
+    });
     // Action Transparency: feed the stream from the real event bus.
     const feed = activityFeedRef.current!;
     const detachActivityBus = attachActivityFeedToSystem(feed, system.bus);
@@ -636,6 +786,11 @@ export default function App() {
       detachTurnPhases();
       proactiveServiceRef.current?.detach();
       proactiveServiceRef.current = null;
+      detachGoalStatusSync();
+      detachGoalMilestoneSync();
+      detachWatchRoots();
+      initiationClientRef.current?.stop();
+      initiationClientRef.current = null;
       setVoiceOutputActivityListener(null);
       memoryAttachment.detach();
       system.liveWatcher?.dispose();
@@ -761,6 +916,8 @@ export default function App() {
     // Offline vision toggles take effect immediately — the observer downgrades
     // or re-allows cloud analysis requests without any restart.
     agentSystemRef.current?.screenObserver?.setOfflineVision(newSettings.offlineVision !== false);
+    if (newSettings.ambientAwareness === true) agentSystemRef.current?.ambientGlance?.start();
+    else agentSystemRef.current?.ambientGlance?.stop();
   };
 
   const handleAddMemory = (newMemory: string) => {
@@ -2099,6 +2256,12 @@ export default function App() {
           // identity rides every chat request — model/provider switches
           // cannot replace who Krisha is.
           identity: getIdentityService().getTransportPayload(),
+          // Learning Mechanism: retrieve relevant learned knowledge and inject
+          // it into the system instruction so the chat model can apply what
+          // Krix has learned in previous conversations. Limited to 3000 chars
+          // by contextFormatter; omitted when no relevant knowledge exists.
+          learnedContext: agentSystemRef.current?.learningOrchestrator
+            ?.buildReasoningContext(text).formatted ?? "",
         }),
       });
 
@@ -2484,6 +2647,9 @@ export default function App() {
         isWhiteBackground ? 'bg-white text-slate-800' : 'bg-[#02040a] text-slate-300'
       }`}
     >
+      {/* Offline status banner */}
+      <OfflineBanner />
+
       {/* 1. Immersive Left Sidebar Navigation (Desktop/Tablet) & Mobile Top Header */}
       <SidebarNav
         activeModal={activeModal}
@@ -2762,6 +2928,12 @@ export default function App() {
           <RollbackApprovalCard isLightMode={isWhiteBackground} />
           {/* LPV — the only operator approval surface for vault challenges (save/fill) */}
           <LpvApprovalCard isLightMode={isWhiteBackground} />
+          {/* Approval Surface — the unified operator surface: every decision
+              kind (execution gate, rollback, vault, quarantine) in one card,
+              mirrored by a Windows Action Center toast. It also reports
+              presence, which is what lets a proven-safe action run
+              unattended while the operator is away. */}
+          <ApprovalSurfaceCard isLightMode={isWhiteBackground} />
           <HabitActionCard
             action={activeHabitAction}
             onDismiss={() => setActiveHabitAction(null)}

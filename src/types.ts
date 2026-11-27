@@ -253,6 +253,8 @@ export interface CompanionSettings {
   // uploaded. The "look at screen" button uses local OCR instead of cloud
   // vision while this is on. Stored settings without the key fall back to ON.
   offlineVision?: boolean;
+  /** Opt-in, local-only low-frequency screen glances after screen sharing. */
+  ambientAwareness?: boolean;
   // Step 4 — Proactive Conversations (all optional: stored settings without
   // these keys fall back to the defaults below).
   proactiveConversations?: boolean;
@@ -261,6 +263,19 @@ export interface CompanionSettings {
   proactiveQuietHoursEnabled?: boolean;
   proactiveQuietHoursStart?: number;
   proactiveQuietHoursEnd?: number;
+  // Initiation — autonomous start (scheduled missions, reactive rules,
+  // boot-resume). Optional: stored settings without these keys fall back to
+  // the defaults in src/utils/initiationClient.ts.
+  /** Master switch for every autonomous initiation. */
+  initiationEnabled?: boolean;
+  /** Allow initiations to RUN tasks (not just notify/propose). */
+  initiationAutoExecute?: boolean;
+  /** Honour the quiet-hours window for initiations. */
+  initiationQuietHoursEnabled?: boolean;
+  initiationQuietHoursStart?: number;
+  initiationQuietHoursEnd?: number;
+  /** Skip an initiation while the user is actively in conversation. */
+  initiationRespectUserActivity?: boolean;
 }
 
 export type ActiveModal =

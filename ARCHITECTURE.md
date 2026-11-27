@@ -2903,3 +2903,114 @@ eligibility/attempt/result, post-verification result, token presence.
 Metadata only: no token values, no executable paths, no secrets.
 
 **Tests:** `scripts/test-containment.ts` - 142 assertions, 0 failed (Phase D completion). Covers: the credential-backed production authority end-to-end (enrollment gating, wrong-credential denial, epoch-staleness mid-operation refusal, cleared-authority fail-closed, re-enrollment restore), the E5 credential machinery (set/verify/clear/backoff/epoch on an isolated store), the full D.3 machinery (pinning, PID-reuse refusal, identity changes, ambiguous identity, IDENTITY_NOT_GUARANTEED, pin infrastructure failures, client-label injection ignored, classification downgrade, stale evidence, E-stop at entry/after-approval/pre-termination/concurrent, honest termination outcomes, single-use under concurrency, bounded token registry, audit correctness + metadata privacy), a real pin-worker smoke test (self-pin, read-only), and production-route runtime tests on an isolated store including credential enrollment through the spawned server's own recovery pipe (wrong credential denied; correct credential proceeds to identity read; benign-process approval refused by server-side classification; clearing restores the disabled posture).**Known limitations:** same-user ceiling (elevated/SYSTEM processes cannot be pinned -> IDENTITY_NOT_GUARANTEED); the approval credential defends against AGENT self-authorization - a same-user process can reach the enrollment pipe exactly as it can reach the recovery credential (the disclosed OS boundary; such a process can terminate processes directly without Krisha); containment approval requires operator enrollment - before `set-containment-credential` the D.4 disabled posture holds; permission-based (not identity-based) authorization throughout the Phase 18 doctrine; a malicious process could exit naturally before termination (reported honestly); tokens are consumed on any post-validation refusal (a refused containment requires fresh approval - deliberate fail-closed posture); WMI WITHIN-1 detection granularity for short-lived processes (Phase A); the E5 M1 recovery-pipe tests cannot run concurrently with the live app unless each process binds its own transport (fixed for all suites via KRISHA_RECOVERY_PIPE_PATH isolation).
+---
+
+## 40. Initiation — autonomous start (scheduler, event triggers, boot-resume)
+
+Krisha starts things without being asked. Three features, one spine.
+
+```
+TRIGGER SIDE (Node server — always on, keeps time across reboots)
+  MissionScheduler    daily / interval / one_shot  ->  mission due
+  EventTriggerEngine  process / download / file / clipboard -> rule matched
+  BootResumeManager   durable goals -> unfinished goal found
+              |
+              v
+      InitiationQueue  (.krisha/initiation_queue.json — durable outbox)
+              |                       survives reboot; leased, not popped
+              |  SSE  /api/initiation/stream   (push on enqueue + backlog)
+              v
+EXECUTOR SIDE (browser — the only place with the agent core and Phase 18 gate)
+  InitiationClient    eligibility -> execute -> deliver -> ack
+```
+
+### Why the split
+
+The trigger engine runs in Node so it survives reboots and keeps time while
+the browser is closed. The executor runs in the browser because that is where
+the tool registry, the agent core and the Phase 18 permission gate live. An
+autonomous mission therefore cannot grant itself a permission the user never
+gave: it runs `core.submit(...)` with the DEFAULT permission set and fails
+honestly when a tool needs more. (`runAgentTask` is deliberately NOT used —
+it grants mouse/keyboard/filesystem permissions based on the text of a
+request, which is correct for a user request and wrong for a mission.)
+
+`contracts.ts` is the ONLY shared surface between the two halves.
+
+### The three actions
+
+| Action | What happens | Runs a task? |
+|---|---|---|
+| `notify` | Surfaces in the activity feed | No |
+| `suggest` | Speaks a proposal; the USER decides | No |
+| `execute_task` | Runs through the agent core (permission-gated) | Yes |
+
+### Honesty rules
+
+- **No fake success.** A mission reports the DELIVERY outcome, not a
+  fabricated task result. The executor's ack updates the mission's real
+  outcome (`lastResult`) through `InitiationManager.acknowledge`.
+- **Catch-up window.** A daily mission missed by more than 6 hours is
+  skipped and rescheduled — an 09:00 briefing at 14:00 is noise.
+- **Defer, don't drop.** Quiet hours, a busy user, or a busy speaker are
+  TRANSIENT: the record is postponed (`POST /api/initiation/defer`) and
+  delivered later. The deferral budget is finite (12) so a record cannot
+  loop forever. A standing state (disabled) is acknowledged as skipped.
+- **Leases, not destructive pops.** A client that dies mid-delivery does not
+  swallow the work: the lease expires and the record returns to `pending`.
+- **Latest-wins dedupe.** Records carry a `dedupeKey` (`rule:<id>`,
+  `mission:<id>`, `boot_resume`). A new pending record with the same key
+  REPLACES the older one, so a burst of process events while the browser was
+  closed becomes ONE notification on reconnect, not ten.
+- **Process-event kind.** The monitor emits `kind: 'create' | 'delete'`, not
+  `'process_created'` — the reactive rules compared against a value that
+  could never occur, so process rules never fired. Fixed.
+
+### Boot-resume
+
+Goals live in the browser (localStorage) and are mirrored to the server's
+durable store (`POST /api/initiation/sync-goals`) on every goal change. The
+server enqueues a resumption briefing at startup, so a goal survives a
+reboot: the tray autostart launches the server at Windows login, the server
+queues the briefing, and the browser picks it up from the durable backlog
+when it connects.
+
+The durable goal store lives beside the rest of the subsystem state
+(`.krisha/durable_goals.json`) — it previously defaulted to a different path
+than the rest of the subsystem wrote.
+
+### Clipboard
+
+Clipboard change detection uses the Win32 clipboard SEQUENCE NUMBER
+(`GetClipboardSequenceNumber`), reported by the tray layer. The clipboard is
+never opened: Krisha learns that "something was copied" without ever reading
+what was copied. Contents are never transmitted, logged, or stored.
+
+### State (`.krisha/`)
+
+`scheduled_missions.json` · `reactive_rules.json` · `initiation_queue.json` ·
+`durable_goals.json`
+
+### Endpoints
+
+`GET /api/initiation/status` · `GET /api/initiation/missions` ·
+`POST /api/initiation/missions` · `POST /api/initiation/missions/:id/toggle` ·
+`POST /api/initiation/missions/:id/trigger` · `GET /api/initiation/rules` ·
+`POST /api/initiation/rules` · `POST /api/initiation/rules/:id/toggle` ·
+`GET /api/initiation/boot-resume` · `POST /api/initiation/sync-goals` ·
+`POST /api/initiation/boot-resume/:id/resume` · `GET /api/initiation/events` ·
+`GET /api/initiation/stream` (SSE) · `GET /api/initiation/pending` (lease) ·
+`POST /api/initiation/ack` · `POST /api/initiation/defer` ·
+`POST /api/initiation/clipboard` · `GET /api/initiation/queue`
+
+### Tests
+
+`scripts/test-initiation.ts` — 88 assertions, 0 failed. Covers: the queue
+(lease, expiry, ack, deferral budget, persistence across a restart), the
+scheduler (trigger maths, catch-up skip, one-shot disable, a fired mission
+reaching the queue with a real action), the event triggers (the
+`create`/`delete` kind fix, cooldown, action dispatch, clipboard), boot-resume
+(goals surviving a restart, primary goal selection, a briefing queued at
+startup, the durable store living in the configured directory), and the
+client (the three actions, transient-vs-standing skips, auto-execute off, and
+never interrupting an active conversation).

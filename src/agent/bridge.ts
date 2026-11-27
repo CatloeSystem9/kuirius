@@ -18,11 +18,13 @@ import { ScreenObserver } from './vision/screenObserver';
 import { BrowserCaptureSource } from './vision/browserCapture';
 import { LiveScreenWatcher } from './vision/liveWatcher';
 import { ScreenUnderstandingService } from './vision/screenUnderstanding';
+import { AmbientScreenGlance } from './vision/ambientGlance';
 import { createLivePerceptionTools } from './vision/liveTools';
 import { isMultiStepRequest, isScreenIntent, isMouseIntent, isKeyboardIntent, isSystemIntent, isResearchIntent, isSpreadsheetIntent, isPresentationIntent, splitIntoClauses, classifyStep, HeuristicPlanner } from './planner';
 import { createOfficeTools } from './office/officeTools';
 import { LearningService } from './learning/learningService';
 import { WorkflowAwarePlanner } from './learning/workflowPlanner';
+import { LearningOrchestrator } from './learning/learningOrchestrator';
 import { SkillEngine, SkillAwarePlanner, createSkillTools } from './skills';
 import { getMemoryService } from './memory/memoryService';
 import { ConsolidationEngine } from './memory/consolidation';
@@ -78,6 +80,8 @@ export interface AgentHost {
   openModal(modal: import('../types').ActiveModal): void;
   setPose(pose: string): void;
   applyScreenVisionAction?(action: import('../types').ScreenVisionAction): void;
+  /** A restrained, local screen-awareness offer (never raw screen text). */
+  offerAmbientGlance?(offer: import('./vision/ambientGlance').AmbientGlanceOffer): void;
 }
 
 export interface AgentSystem {
@@ -91,12 +95,16 @@ export interface AgentSystem {
   /** Live Screen Perception — adaptive watcher + local SPF-screened understanding. */
   liveWatcher?: LiveScreenWatcher;
   screenUnderstanding?: ScreenUnderstandingService;
+  /** Low-frequency, opt-in background screen awareness. */
+  ambientGlance?: AmbientScreenGlance;
   /** Adaptive observation layer (Phase 13). */
   adaptiveObserver?: AdaptiveObserver;
   /** Keyboard control service (Phase 6). */
   keyboardControl?: KeyboardControlService;
   /** Learning + workflow acquisition service (Phase 12). */
   learning?: LearningService;
+  /** Krix Learning Mechanism — concept, experience, correction, skill & Academy orchestrator. */
+  learningOrchestrator?: LearningOrchestrator;
   /** Learned Skills v1 — validated reusable-capability engine. */
   skills?: SkillEngine;
   /** Project Awareness v1 — read-only understanding of approved projects. */
@@ -224,6 +232,12 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     permissions,
     taskResolver: (taskId) => store.get(taskId),
   });
+  const learningOrchestrator = new LearningOrchestrator({
+    storage: localStorageAdapter,
+    semantic,
+    knowledgeGraph,
+    taskResolver: (taskId) => store.get(taskId),
+  });
   const planner = new SkillAwarePlanner(new WorkflowAwarePlanner(new HeuristicPlanner(), learning), skills);
   const core = new AgentCore({
     registry,
@@ -237,6 +251,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     // memories/knowledge are attached to the task before planning, so tools
     // receive relevantMemories and the cycle is traceable end to end.
     contextProvider: (input, taskId) => contextEngine.getTaskContext(taskId) ?? contextEngine.buildContext({ input, taskId, now: Date.now() }),
+    learningProvider: (input) => learningOrchestrator.buildReasoningContext(input),
   });
 
   registry.registerAll(createBrowserTools());
@@ -268,6 +283,13 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
   });
   screenUnderstanding.attach();
   registry.registerAll(createLivePerceptionTools(liveWatcher, screenUnderstanding));
+  const ambientGlance = new AmbientScreenGlance({
+    observer: screenObserver,
+    understanding: screenUnderstanding,
+    // The coordinator itself never speaks, sends a message, or repeats OCR
+    // text; it only forwards a bounded offer for the host to display.
+    onOffer: (offer) => host.offerAmbientGlance?.(offer),
+  });
 
   // Adaptive observation (Phase 13): event/task-driven scheduling ON TOP of
   // the Phase 4 observer — decides when/how/whether to look at the screen.
@@ -419,6 +441,7 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     // Live perception stops immediately with an emergency stop.
     try {
       liveWatcher.stop();
+      ambientGlance.stop();
     } catch {
       /* the gate still blocks side effects */
     }
@@ -589,6 +612,8 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
 
   // Learning + workflow acquisition (Phase 12): subscribe to the shared bus.
   const detachLearning = learning.attach();
+  // Krix Learning Mechanism: event-driven concept, experience & correction learning.
+  const detachLearningOrchestrator = learningOrchestrator.attach(bus);
 
   // Learned Skills v1: subscribe to the shared bus (verified-success learning
   // + skill-reuse outcome recording). Event-driven only; never polls.
@@ -713,9 +738,11 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
     screenObserver,
     liveWatcher,
     screenUnderstanding,
+    ambientGlance,
     adaptiveObserver,
     keyboardControl,
     learning,
+    learningOrchestrator,
     skills,
     goals,
     multimodal,
@@ -736,8 +763,10 @@ export function createAgentSystem(host: AgentHost): AgentSystem {
       detachStepListener();
       detachLiveHints();
       liveWatcher.dispose();
+      ambientGlance.stop();
       screenUnderstanding.detach();
       detachLearning();
+      detachLearningOrchestrator();
       detachSkills();
       detachGoals();
       detachObservation();

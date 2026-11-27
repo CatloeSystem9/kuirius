@@ -307,7 +307,45 @@ export function planRollback(opId: string): PlanResult {
   }
   const challenge = createChallenge(opId, planHash, plan.journalHash, plan.stopGeneration);
   appendAuditSyncSafe({ kind: 'e5_rollback_plan_created', opId, planHash, opKind: plan.opKind });
+  // Approval Surface hook: the challenge now exists and needs an operator
+  // decision. The registry mirrors it into the unified surface (browser card
+  // or Windows toast). A hook failure must never break plan creation.
+  try {
+    rollbackChallengeHook?.({
+      challengeId: challenge.challengeId,
+      opId,
+      planHash,
+      opKind: plan.opKind,
+      affectedPaths: plan.affectedPaths.map((p) => p.path),
+      expiresAt: challenge.expiresAt,
+    });
+  } catch (err) {
+    console.warn('[rollback] approval-surface hook failed (challenge still valid):', err);
+  }
   return { plan, planHash, challenge };
+}
+
+/**
+ * Hook invoked when a rollback challenge is created.
+ *
+ * Set by the approval registry so the challenge can be presented outside the
+ * browser window. Deliberately optional and failure-isolated: the challenge
+ * itself remains authoritative whether or not anything is listening.
+ */
+export type RollbackChallengeHook = (info: {
+  challengeId: string;
+  opId: string;
+  planHash: string;
+  opKind: string;
+  affectedPaths: string[];
+  expiresAt: number;
+}) => void;
+
+let rollbackChallengeHook: RollbackChallengeHook | null = null;
+
+/** Register (or clear) the approval-surface hook. */
+export function setRollbackChallengeHook(hook: RollbackChallengeHook | null): void {
+  rollbackChallengeHook = hook;
 }
 
 function createChallenge(opId: string, planHash: string, journalHash: string, stopGeneration: number): { challengeId: string; expiresAt: number } {

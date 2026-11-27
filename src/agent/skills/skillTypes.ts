@@ -124,7 +124,7 @@ export interface SkillLearnOutcome {
 
 // ---------------------------------------------------------------- constants
 
-export const SKILL_SCHEMA_VERSION = 1;
+export const SKILL_SCHEMA_VERSION = 2;
 export const SKILLS_STORAGE_KEY = 'krisha_skills_v1';
 
 /** Hard caps — the skill store stays lightweight on an i3 laptop. */
@@ -132,6 +132,18 @@ export const MAX_SKILLS = 30;
 export const MAX_SKILL_STEPS = 10;
 export const MAX_VERSION_HISTORY = 10;
 export const MAX_KEYWORDS = 8;
+
+/** Verified manual-flow evidence held until it has recurred three times. */
+export interface SkillCandidate {
+  id: string;
+  goalPattern: string;
+  stepSignature: string;
+  successes: number;
+  firstTaskId: string;
+  lastTaskId: string;
+  createdAt: number;
+  updatedAt: number;
+}
 
 /** Minimum token similarity to treat a task as the same skill (reinforce). */
 export const SKILL_GOAL_MATCH_THRESHOLD = 0.5;

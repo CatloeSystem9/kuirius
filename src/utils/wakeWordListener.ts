@@ -2,7 +2,8 @@
  * High-performance, battery-friendly Wake-Word detection engine for "Krisha"
  * Optimized to use minimal CPU and RAM:
  * - Single-instance listener with strict debounce locking to prevent duplicate commands ("too many orders")
- * - Automatic pause when tab is in background / hidden
+ * - Continues while the app is backgrounded, subject to the browser's
+ *   microphone permission and platform power policy
  * - Instant teardown on stop
  */
 
@@ -80,10 +81,12 @@ export class WakeWordManager {
   private handleVisibilityChange = () => {
     if (typeof document === 'undefined') return;
     this.isTabHidden = document.hidden;
-    if (this.isTabHidden) {
-      this.pauseRecognition();
-      this.setStatus('paused_hidden');
-    } else if (this.isListeningDesired && !this.isKrishaSpeaking) {
+    // A wake word is specifically useful away from Krisha's window.  Do not
+    // stop the mic on visibility changes: browsers that support background
+    // SpeechRecognition keep the existing session alive.  If a browser ends
+    // that session, the normal onend restart path restores it when visible or
+    // hidden.  We retain isTabHidden for diagnostics/backward compatibility.
+    if (!this.isTabHidden && this.isListeningDesired && !this.isKrishaSpeaking) {
       this.scheduleRestart(300);
     }
   };
@@ -104,7 +107,7 @@ export class WakeWordManager {
       rec.maxAlternatives = 1; // Lower alternatives to save RAM and CPU
 
       rec.onstart = () => {
-        if ((!this.isKrishaSpeaking || this.bargeInEnabled) && !this.isTabHidden) {
+        if (!this.isKrishaSpeaking || this.bargeInEnabled) {
           this.setStatus('listening');
         }
       };
@@ -114,8 +117,6 @@ export class WakeWordManager {
         // Krix speaks — only a MATCHED wake word can interrupt (noise alone
         // never does). Without barge-in, playback pauses recognition as before.
         if (this.isKrishaSpeaking && !this.bargeInEnabled) return;
-        if (this.isTabHidden) return;
-
         let interimTranscript = '';
         let finalTranscript = '';
 
@@ -153,12 +154,10 @@ export class WakeWordManager {
       };
 
       rec.onend = () => {
-        if (this.isListeningDesired && !this.isTabHidden && (!this.isKrishaSpeaking || this.bargeInEnabled)) {
+        if (this.isListeningDesired && (!this.isKrishaSpeaking || this.bargeInEnabled)) {
           this.scheduleRestart(500); // 500ms debounce prevents CPU spin
         } else if (this.isKrishaSpeaking) {
           this.setStatus('paused_speaking');
-        } else if (this.isTabHidden) {
-          this.setStatus('paused_hidden');
         } else {
           this.setStatus('idle');
         }
@@ -248,7 +247,7 @@ export class WakeWordManager {
   private scheduleRestart(delayMs: number = 500) {
     if (this.restartTimeout) clearTimeout(this.restartTimeout);
     this.restartTimeout = setTimeout(() => {
-      if (this.isListeningDesired && !this.isKrishaSpeaking && !this.isTabHidden && this.recognition) {
+      if (this.isListeningDesired && !this.isKrishaSpeaking && this.recognition) {
         try {
           this.recognition.start();
         } catch {
@@ -291,7 +290,7 @@ export class WakeWordManager {
       this.initRecognition();
     }
 
-    if (this.recognition && !this.isKrishaSpeaking && !this.isTabHidden) {
+    if (this.recognition && !this.isKrishaSpeaking) {
       try {
         this.recognition.start();
         this.setStatus('listening');
@@ -317,7 +316,7 @@ export class WakeWordManager {
         this.pauseRecognition();
       }
     } else {
-      if (this.isListeningDesired && !this.isTabHidden) {
+      if (this.isListeningDesired) {
         this.scheduleRestart(600);
       }
     }

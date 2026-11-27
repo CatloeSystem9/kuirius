@@ -14,6 +14,7 @@ import { classifyTask, recommendedTimeoutMs } from './complexity';
 import type { ModelRegistry, ModelTier } from './modelProfiles';
 import type { TaskRequirements } from './requirements';
 import { resolveRequirements, satisfiesRequirements } from './requirements';
+import { localModelEligible } from './localPolicy';
 import type { PerformanceTelemetry } from './telemetry';
 
 const TIER_ORDER: ModelTier[] = ['light', 'balanced', 'strong'];
@@ -99,7 +100,10 @@ export class ModelRouter {
 
     for (let i = TIER_ORDER.indexOf(floor); i < TIER_ORDER.length; i++) {
       const tier = TIER_ORDER[i];
-      const candidates = this.registry.byTier(tier, this.now()).filter((p) => satisfiesRequirements(p, requirements));
+      const candidates = this.registry.byTier(tier, this.now()).filter((p) =>
+        satisfiesRequirements(p, requirements) &&
+        (p.deployment !== 'local' || localModelEligible(input.text ?? '', classification, requirements))
+      );
       if (candidates.length > 0) {
         selected = { id: candidates[0].id, tier };
         break;
@@ -118,7 +122,7 @@ export class ModelRouter {
     const decision: RouteDecision = {
       tier: profile.tier,
       model: profile.id,
-      reason: `smallest capable: tier ${profile.tier} meets complexity ${classification.tier}`,
+      reason: `${profile.deployment === 'local' ? 'local-first' : 'hosted'}: tier ${profile.tier} meets complexity ${classification.tier}`,
       orderedModels: this.orderedModelsFrom(profile.id),
       escalationPath: TIER_ORDER.slice(TIER_ORDER.indexOf(profile.tier) + 1),
       attempts: 0,

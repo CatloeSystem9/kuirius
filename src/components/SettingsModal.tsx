@@ -96,6 +96,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   const [companionNotes, setCompanionNotes] = useState(settings.companionNotes || '');
   // Offline vision: computer use + agent screen observation stay on-device.
   const [offlineVision, setOfflineVision] = useState(settings.offlineVision !== false);
+  const [ambientAwareness, setAmbientAwareness] = useState(settings.ambientAwareness === true);
   // Step 4 — Proactive Conversations controls.
   const [proactiveConversations, setProactiveConversations] = useState(settings.proactiveConversations ?? true);
   const [proactiveInactivityMinutes, setProactiveInactivityMinutes] = useState(settings.proactiveInactivityMinutes ?? 30);
@@ -211,6 +212,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
       languagePreference,
       companionNotes: companionNotes.trim(),
       offlineVision,
+      ambientAwareness,
       proactiveConversations,
       proactiveInactivityMinutes,
       proactiveMinIntervalHours,
@@ -550,6 +552,28 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                   type="checkbox"
                   checked={offlineVision}
                   onChange={(e) => setOfflineVision(e.target.checked)}
+                  className="sr-only peer"
+                />
+                <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>
+              </label>
+            </div>
+
+            {/* 3b. Proactive Conversations (Step 4) */}
+            <div className="flex items-center justify-between pt-2 border-t border-blue-900/20">
+              <div>
+                <label className="text-xs font-medium text-blue-200 uppercase tracking-wider flex items-center gap-1.5">
+                  <Sparkles className="w-3.5 h-3.5 text-blue-400" />
+                  <span>Ambient Screen Awareness</span>
+                </label>
+                <p className="text-[11px] text-slate-400 mt-0.5">
+                  After you choose a screen to share, Krix makes a local glance about once a minute. She only offers help for sustained build errors; screenshots and text are not saved or uploaded.
+                </p>
+              </div>
+              <label className="relative inline-flex items-center cursor-pointer flex-shrink-0 ml-3">
+                <input
+                  type="checkbox"
+                  checked={ambientAwareness}
+                  onChange={(e) => setAmbientAwareness(e.target.checked)}
                   className="sr-only peer"
                 />
                 <div className="w-9 h-5 bg-slate-800 peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-4 after:w-4 after:transition-all peer-checked:bg-blue-600"></div>

@@ -14,6 +14,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import type { InitiationAction } from './contracts';
 
 export type MissionTrigger =
   | { type: 'daily'; time: string } // "HH:mm" 24-hour format, e.g. "09:00"
@@ -34,9 +35,19 @@ export interface ScheduledMission {
   trigger: MissionTrigger;
   actionPayload?: Record<string, unknown>;
   promptInstruction?: string;
+  /**
+   * What the executor does when this mission fires. `notify` surfaces it,
+   * `suggest` proposes it, `execute_task` runs the task through the agent
+   * core (permission-gated).
+   */
+  action: InitiationAction;
   enabled: boolean;
   createdAt: number;
   lastRunAt?: number;
+  /**
+   * Outcome of the last DELIVERY (dispatch to the executor), not the outcome
+   * of the task itself — the executor reports that separately via the ack.
+   */
   lastResult?: 'success' | 'failure' | 'skipped';
   lastMessage?: string;
   nextRunAt: number;
@@ -52,6 +63,12 @@ export interface MissionExecutionResult {
 export interface SchedulerOptions {
   storagePath?: string;
   heartbeatIntervalMs?: number;
+  /**
+   * How late a missed daily mission may be and still run. A mission missed by
+   * more than this (server off overnight, laptop closed) is skipped and
+   * rescheduled — an 09:00 briefing at 14:00 is noise, not helpful.
+   */
+  catchUpWindowMs?: number;
   now?: () => number;
   onMissionDue?: (mission: ScheduledMission) => Promise<MissionExecutionResult>;
   audit?: (event: { kind: string; missionId: string; [key: string]: unknown }) => void;
@@ -100,10 +117,12 @@ export class MissionScheduler {
   private readonly onMissionDue?: (mission: ScheduledMission) => Promise<MissionExecutionResult>;
   private readonly audit?: (event: { kind: string; missionId: string; [key: string]: unknown }) => void;
   private isProcessing = false;
+  private readonly catchUpWindowMs: number;
 
   constructor(options: SchedulerOptions = {}) {
     this.storagePath = options.storagePath || path.join(DEFAULT_STORE_DIR, DEFAULT_STORE_FILE);
     this.heartbeatIntervalMs = options.heartbeatIntervalMs || 30_000; // 30s heartbeat
+    this.catchUpWindowMs = options.catchUpWindowMs ?? 6 * 60 * 60 * 1000; // 6 hours
     this.now = options.now || (() => Date.now());
     this.onMissionDue = options.onMissionDue;
     this.audit = options.audit;
@@ -154,6 +173,17 @@ export class MissionScheduler {
         if (!mission.enabled) continue;
 
         if (mission.nextRunAt <= now) {
+          // A daily mission missed by more than the catch-up window is stale —
+          // reschedule it instead of firing a briefing hours late.
+          if (mission.trigger.type === 'daily' && now - mission.nextRunAt > this.catchUpWindowMs) {
+            mission.lastRunAt = now;
+            mission.lastResult = 'skipped';
+            mission.lastMessage = 'missed — outside the catch-up window';
+            mission.nextRunAt = calculateNextRunTime(mission.trigger, now);
+            this.audit?.({ kind: 'mission_skipped_stale', missionId: mission.id });
+            this.saveMissions();
+            continue;
+          }
           await this.executeMission(mission);
         }
       }
@@ -174,7 +204,8 @@ export class MissionScheduler {
       if (this.onMissionDue) {
         result = await this.onMissionDue(mission);
       } else {
-        result = { success: true, message: 'Heartbeat default execution' };
+        // No dispatcher wired — report honestly instead of claiming success.
+        result = { success: false, message: 'No mission dispatcher is attached' };
       }
     } catch (err: any) {
       result = { success: false, message: err?.message || String(err) };
@@ -207,11 +238,12 @@ export class MissionScheduler {
    * Add a new scheduled mission
    */
   public addMission(
-    mission: Omit<ScheduledMission, 'createdAt' | 'nextRunAt' | 'runCount'>
+    mission: Omit<ScheduledMission, 'createdAt' | 'nextRunAt' | 'runCount' | 'action'> & { action?: InitiationAction }
   ): ScheduledMission {
     const now = this.now();
     const fullMission: ScheduledMission = {
       ...mission,
+      action: mission.action || 'suggest',
       createdAt: now,
       runCount: 0,
       nextRunAt: calculateNextRunTime(mission.trigger, now),
@@ -310,6 +342,9 @@ export class MissionScheduler {
         description: 'Prepares morning habit check-in, agenda, and active goal briefing.',
         kind: 'morning_briefing',
         trigger,
+        action: 'suggest',
+        promptInstruction:
+          'Give me a short morning briefing: any active goals and their next step, anything pending from yesterday, and the one thing worth doing first today. Then ask if you should start it.',
         enabled: true,
         createdAt: now,
         nextRunAt: calculateNextRunTime(trigger, now),
@@ -326,6 +361,9 @@ export class MissionScheduler {
         description: 'End-of-day reflection on daily accomplishments, log rotation and memory consolidation.',
         kind: 'nightly_maintenance',
         trigger,
+        action: 'execute_task',
+        promptInstruction:
+          'Do an end-of-day pass: summarize what was accomplished today, record any open goal progress, consolidate what is worth remembering, and note anything that is blocked. Keep it brief.',
         enabled: true,
         createdAt: now,
         nextRunAt: calculateNextRunTime(trigger, now),
@@ -342,6 +380,9 @@ export class MissionScheduler {
         description: 'Checks Downloads directory for newly completed files and helps organize them.',
         kind: 'periodic_check',
         trigger,
+        action: 'execute_task',
+        promptInstruction:
+          'Check the Downloads folder for files that finished since the last check. If there is a genuinely new and relevant file, tell me what it is and offer to open or organize it. If nothing new, say nothing and finish quietly.',
         enabled: true,
         createdAt: now,
         nextRunAt: calculateNextRunTime(trigger, now),
@@ -363,7 +404,12 @@ export class MissionScheduler {
       if (Array.isArray(parsed)) {
         for (const m of parsed) {
           if (m && typeof m.id === 'string') {
-            this.missions.set(m.id, m);
+            // Repair: missions persisted before actions existed get a safe default.
+            const action: InitiationAction =
+              m.action === 'notify' || m.action === 'suggest' || m.action === 'execute_task'
+                ? m.action
+                : 'suggest';
+            this.missions.set(m.id, { ...m, action });
           }
         }
       }

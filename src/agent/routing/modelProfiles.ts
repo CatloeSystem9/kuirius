@@ -29,6 +29,8 @@ export interface ModelProfile {
   relativeCost: number;
   /** 0..1 — observed/declared reliability for ranking. */
   reliability: number;
+  /** Local models are eligible only under the router's conservative policy. */
+  deployment?: 'local' | 'hosted';
 }
 
 /** Tier inferred from the repo's model naming (configuration mapping). */

@@ -21,6 +21,9 @@ import {
   containmentApprovalEpoch,
   verifyContainmentApprovalCredential,
   serverPermissions,
+  readAuditEntries,
+  readLastVerifiedAuditSegment,
+  verifyAuditChain,
 } from "./serverSafety";
 // E5 M3 — rollback planning/challenges + E7 quarantine (imported for their
 // synchronous init side effects: none — they are pure consumers of the M1/M2
@@ -33,6 +36,7 @@ import {
   createDefaultModelRegistry,
   getPerformanceTelemetry,
   hashKey,
+  localModelEligible,
   ModelRouter,
   RequestCoalescer,
 } from "./src/agent/routing";
@@ -69,6 +73,17 @@ import type { VisualInspectionResult } from "./src/agent/spf/visualInspection";
 // another client or integration. Installed before anything can call out.
 import { installSpfOutboundGuard } from "./src/agent/spf/outboundGuard";
 import { appendAuditSyncSafe } from "./serverSafety";
+// Approval Surface — unified operator decisions (browser card + Windows toast)
+// with confidence-gated autonomy. See src/agent/approval/.
+import {
+  ApprovalRegistry,
+  PresenceTracker,
+  TrustGate,
+  AUTO_APPROVABLE_ACTION_TYPES,
+  DEFAULT_APPROVAL_POLICY,
+  sanitizePolicy,
+  type ApprovalPolicy,
+} from "./src/agent/approval/index";
 // Process Monitor (Phase A) — independent, event-driven host process
 // visibility. Temporary session-owned WMI subscriptions (no admin, no
 // permanent consumers, clean disposal on shutdown/restart), bounded
@@ -348,9 +363,24 @@ const incidentOrchestrator = new IncidentOrchestrator({
 incidentOrchestratorRef = incidentOrchestrator;
 
 // Initiation Subsystem: Persistent Mission Scheduler + Reactive Event Triggers + Boot Resume
+// The trigger engine runs here (Node keeps time across reboots); the executor
+// runs in the browser. `initiationClients` holds the open SSE connections that
+// receive queued initiations as soon as they are produced.
+const initiationClients = new Set<{ write: (chunk: string) => void; close: () => void }>();
 const initiationManager = new InitiationManager({
   processMonitor,
   audit: (event) => auditAndIngest(event, "initiation-subsystem"),
+  onRecordQueued: (record) => {
+    // Push the new initiation to every connected executor immediately.
+    const chunk = `event: initiation\ndata: ${JSON.stringify(record)}\n\n`;
+    for (const client of initiationClients) {
+      try {
+        client.write(chunk);
+      } catch {
+        initiationClients.delete(client);
+      }
+    }
+  },
 });
 initiationManager.start();
 
@@ -827,12 +857,49 @@ const CANDIDATE_CHAT_MODELS = [
 // existing fallback resilience is never reduced). Routing produces decisions
 // only — execution, retries and safety behavior below are unchanged.
 const modelRoutingRegistry = createDefaultModelRegistry();
+// Optional Ollama-compatible local model. It is never assumed to exist: when
+// KRISHA_LOCAL_MODEL is absent, routing remains hosted-only exactly as before.
+const LOCAL_MODEL_NAME = String(process.env.KRISHA_LOCAL_MODEL || '').trim();
+const LOCAL_MODEL_ID = LOCAL_MODEL_NAME ? `local:${LOCAL_MODEL_NAME}` : '';
+const LOCAL_MODEL_BASE_URL = String(process.env.KRISHA_LOCAL_BASE_URL || 'http://127.0.0.1:11434').replace(/\/$/, '');
+if (LOCAL_MODEL_ID) {
+  modelRoutingRegistry.register({
+    id: LOCAL_MODEL_ID, provider: 'ollama', deployment: 'local', tier: 'light',
+    capabilities: { reasoning: true, coding: false, vision: false, toolUse: false, structuredOutput: true, streaming: true },
+    contextTokens: 8_192, relativeSpeed: 0.9, relativeCost: 0, reliability: 0.7,
+  });
+}
 const modelRouter = new ModelRouter(modelRoutingRegistry, getPerformanceTelemetry());
 const chatClassifier = new CachedClassifier({ telemetry: getPerformanceTelemetry() });
 const perf = getPerformanceTelemetry();
 const visionCoalescer = new RequestCoalescer<any>(perf);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Short local chat through Ollama. A 5s abort keeps an absent/wedged local
+ * runtime from delaying the hosted waterfall. */
+async function generateLocalChat(contents: any[], systemInstruction: string): Promise<string> {
+  if (!LOCAL_MODEL_NAME) throw new Error('local model is not configured');
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 5_000);
+  try {
+    const messages = [
+      { role: 'system', content: systemInstruction },
+      ...contents.map((item) => ({ role: item.role === 'model' ? 'assistant' : 'user', content: String(item?.parts?.[0]?.text ?? '') })),
+    ];
+    const response = await fetch(`${LOCAL_MODEL_BASE_URL}/api/chat`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+      body: JSON.stringify({ model: LOCAL_MODEL_NAME, messages, stream: false, options: { num_predict: 180 } }),
+    });
+    if (!response.ok) throw new Error(`local model HTTP ${response.status}`);
+    const body = await response.json() as any;
+    const text = String(body?.message?.content ?? '').trim();
+    if (!text) throw new Error('local model returned no text');
+    return text;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
 
 // Persistent Identity Foundation (Step 1): resolve the request's identity into
 // a validated KrishaIdentity. Fail-closed toward the compiled-in canonical
@@ -1622,6 +1689,7 @@ app.post("/api/chat", async (req, res) => {
     languagePreference = "auto",
     habitsContext = "",
     identity,
+    learnedContext = "",
   } = req.body;
 
   try {
@@ -1756,6 +1824,18 @@ app.post("/api/chat", async (req, res) => {
     const resolvedIdentity = resolveRequestIdentity(identity);
     const identityPromptBlock = renderIdentityPromptBlock(resolvedIdentity.identity);
 
+    // Learning Mechanism: inject retrieved knowledge into the system instruction
+    // when the client supplies learnedContext (formatted by LearningOrchestrator).
+    // Capped at 3000 chars server-side as a safety net (contextFormatter already
+    // caps at 3000 on the client, so this is defence-in-depth only).
+    const sanitizedLearnedContext =
+      typeof learnedContext === "string" && learnedContext.trim().length > 0
+        ? learnedContext.trim().slice(0, 3000)
+        : "";
+    const learnedContextDirective = sanitizedLearnedContext
+      ? `\n\n[KRIX ACQUIRED KNOWLEDGE — apply this when relevant; never invent or contradict it]:\n${sanitizedLearnedContext}`
+      : "";
+
     const systemInstruction = buildChatSystemInstruction({
       identityPromptBlock,
       userName,
@@ -1764,6 +1844,7 @@ app.post("/api/chat", async (req, res) => {
       userPreferenceContext,
       habitsInstruction,
       locationContext,
+      extraDirectives: learnedContextDirective || undefined,
     });
 
     // Format previous turns for Gemini contents
@@ -1786,7 +1867,7 @@ app.post("/api/chat", async (req, res) => {
     // Phase 17: deterministic task classification → route. The selected model
     // goes first in the waterfall; the full candidate list stays behind it.
     const chatComplexity = chatClassifier.classify(lastUserMsg || "");
-    const chatRoute = modelRouter.route({ classification: chatComplexity });
+    const chatRoute = modelRouter.route({ text: lastUserMsg || '', classification: chatComplexity });
 
     let reply = "";
     let mapsGrounding: MapsGroundingPlaceItem[] = [];
@@ -1822,12 +1903,27 @@ app.post("/api/chat", async (req, res) => {
 
     let usedChatModel: string | undefined;
     if (!reply) {
+      // Local is a best-effort first hop for short, safe conversation only.
+      // Any failure immediately falls through to the unchanged hosted
+      // waterfall; hard reasoning never enters this branch.
+      if (chatRoute.model === LOCAL_MODEL_ID && localModelEligible(lastUserMsg || '', chatRoute.classification, chatRoute.requirements)) {
+        const startedAt = Date.now();
+        try {
+          reply = await generateLocalChat(contents, systemInstruction);
+          usedChatModel = LOCAL_MODEL_ID;
+          perf.recordModelCall({ at: Date.now(), model: LOCAL_MODEL_ID, latencyMs: Date.now() - startedAt, ok: true, via: 'primary' });
+        } catch {
+          perf.recordModelCall({ at: Date.now(), model: LOCAL_MODEL_ID, latencyMs: Date.now() - startedAt, ok: false, via: 'primary', errorKind: 'local_unavailable' });
+        }
+      }
+    }
+    if (!reply) {
       const fallbackChat = await generateContentWithFallback(ai, {
         contents,
         systemInstruction,
         temperature: 0.9,
         topP: 0.95,
-        models: chatRoute.orderedModels,
+        models: chatRoute.orderedModels.filter((model) => model !== LOCAL_MODEL_ID),
       });
       reply = fallbackChat.text;
       usedChatModel = fallbackChat.usedModel;
@@ -4442,17 +4538,87 @@ app.post('/api/app/discover', (req, res) =>
   fsResult(res, () => sys.appDiscover(req.body?.force === true).then((apps) => sys.appSearch(apps, String(req.body?.query ?? ''))))
 );
 app.post('/api/app/launch', (req, res) =>
-  fsResult(res, () =>
-    req.body?.path
-      ? sys.appLaunchByPath(String(req.body.path), req.body?.approvalToken)
-      : sys.appLaunchByName(String(req.body?.name ?? ''), req.body?.approvalToken, typeof req.body?.protocol === 'string' ? req.body.protocol : undefined)
-  )
+  fsResult(res, async () => {
+    try {
+      return req.body?.path
+        ? await sys.appLaunchByPath(String(req.body.path), req.body?.approvalToken)
+        : await sys.appLaunchByName(String(req.body?.name ?? ''), req.body?.approvalToken, typeof req.body?.protocol === 'string' ? req.body.protocol : undefined);
+    } catch (err: any) {
+      // Phase C: the execution gate asked for an operator decision. Raise it on
+      // the unified approval surface so it can be answered from the Windows
+      // toast as well as the browser — and so confidence-gated autonomy can
+      // act on it if the operator is away and this action type is proven safe.
+      const decision = err?.execGateDecision;
+      if (decision?.decision === 'REQUIRE_USER_APPROVAL') {
+        const identity = decision.fileIdentity ?? {};
+        const request = await approvalRegistry.raise({
+          actionType: 'exec_launch',
+          title: 'Launch needs your approval',
+          detail: String(decision.reason ?? 'the execution gate requires approval').slice(0, 400),
+          risk: decision.classification === 'HIGH_CONFIDENCE_THREAT' ? 'high' : 'medium',
+          backend: {
+            kind: 'execgate',
+            ref: String(identity.path ?? ''),
+            extra: {
+              path: identity.path,
+              mtimeMs: identity.mtimeMs,
+              size: identity.size,
+              classification: decision.classification,
+            },
+          },
+        });
+        const view = approvalRegistry.list().find((r) => r.id === request.id);
+        if (request.state === 'auto_approved' && view?.issuedToken) {
+          // The confidence gate approved it while the operator was away.
+          return sys.appLaunchByPath(String(identity.path), view.issuedToken);
+        }
+        const error = new Error(
+          `Execution gate: approval required — request ${request.id} (answer it in Krisha or the Action Center toast)`
+        );
+        (error as any).approvalRequestId = request.id;
+        (error as any).approvalRequest = view;
+        throw error;
+      }
+      throw err;
+    }
+  })
 );
 app.post('/api/app/status', (req, res) => fsResult(res, () => sys.appStatus(String(req.body?.name ?? ''))));
 app.post('/api/app/close', (req, res) => fsResult(res, () => sys.appClose(Number(req.body?.pid), req.body?.force === true)));
 app.post('/api/app/focus', (req, res) => fsResult(res, () => sys.appFocus(Number(req.body?.pid))));
 
 // ---- Initiation Subsystem Routes (Scheduler, Event Triggers, Boot Resume) ----
+// Nightly Reflection: return a bounded, metadata-only digest from the verified
+// audit tail. Raw audit entries never leave the server and the browser decides
+// whether/how to consolidate the fixed correction guidance into local memory.
+app.get('/api/reflection/nightly', (req, res) => {
+  const verified = verifyAuditChain();
+  const segment = readLastVerifiedAuditSegment(10_000);
+  if (!segment.available || !segment.coversTail) {
+    return res.status(503).json({ verified: false, reason: segment.reason ?? 'audit tail is not verifiable' });
+  }
+  const since = new Date();
+  since.setHours(0, 0, 0, 0);
+  const rules: Record<string, string> = {
+    e5_rollback_refused: 'When a rollback is refused, inspect and refresh its plan before attempting it again.',
+    e5_quarantine_release_refused: 'When a quarantine release is refused, keep the item quarantined and review the refusal before retrying.',
+    approval_denied: 'When an approval is denied, do not repeat the action without a new operator decision.',
+    e5_stop_blocked: 'When safety controls block an action, resolve the control state before retrying.',
+    approval_auto_failed: 'When unattended approval fails, return the action to the operator instead of retrying automatically.',
+  };
+  const counts = new Map<string, number>();
+  for (const record of segment.records) {
+    if (typeof record.at !== 'number' || record.at < since.getTime()) continue;
+    const kind = typeof record.kind === 'string' ? record.kind : '';
+    if (rules[kind]) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  res.json({
+    verified: true,
+    wholeFileVerified: verified.ok,
+    entries: segment.records.filter((r) => typeof r.at === 'number' && r.at >= since.getTime()).length,
+    corrections: Array.from(counts.entries()).slice(0, 5).map(([kind, count]) => ({ kind, count, text: rules[kind] })),
+  });
+});
 app.get('/api/initiation/status', (req, res) => {
   res.json(initiationManager.getStatus());
 });
@@ -4463,7 +4629,7 @@ app.get('/api/initiation/missions', (req, res) => {
 
 app.post('/api/initiation/missions', (req, res) => {
   try {
-    const { id, name, description, kind, trigger, actionPayload, promptInstruction } = req.body;
+    const { id, name, description, kind, trigger, actionPayload, promptInstruction, action } = req.body;
     if (!id || !name || !trigger) {
       return res.status(400).json({ error: 'id, name, and trigger are required' });
     }
@@ -4475,6 +4641,7 @@ app.post('/api/initiation/missions', (req, res) => {
       trigger,
       actionPayload,
       promptInstruction,
+      action,
       enabled: req.body.enabled !== false,
     });
     res.json({ success: true, mission: created });
@@ -4548,6 +4715,130 @@ app.post('/api/initiation/boot-resume/:id/resume', (req, res) => {
 
 app.get('/api/initiation/events', (req, res) => {
   res.json({ events: initiationManager.getRecentEvents() });
+});
+
+// ---- Initiation delivery channel (server -> browser executor) ----
+// The trigger engine decides WHEN/WHAT; the browser decides WHETHER/HOW.
+// This SSE stream is the handoff: a queued initiation is pushed the moment
+// it exists, and the browser reports the outcome back through /ack.
+
+app.get('/api/initiation/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
+
+  const clientId = String(req.query.clientId || `client_${Date.now().toString(36)}`);
+  const write = (chunk: string) => {
+    res.write(chunk);
+  };
+
+  // Tell the client it is connected, then hand over the backlog — a mission
+  // that fired while the browser was closed must not be lost.
+  write(`event: ready\ndata: ${JSON.stringify({ clientId })}\n\n`);
+  try {
+    // Leased, not merely listed: a second client must not run the same work.
+    for (const lease of initiationManager.queue.claim(clientId, 25)) {
+      write(`event: initiation\ndata: ${JSON.stringify(lease.record)}\n\n`);
+    }
+  } catch {
+    // a backlog read failure must not kill the stream
+  }
+
+  const client = { write, close: () => { try { res.end(); } catch { /* already closed */ } } };
+  initiationClients.add(client);
+
+  // Keep the connection warm without spamming the client.
+  const keepAlive = setInterval(() => {
+    try {
+      res.write(': keep-alive\n\n');
+    } catch {
+      clearInterval(keepAlive);
+    }
+  }, 25_000);
+  (keepAlive as any)?.unref?.();
+
+  const cleanup = () => {
+    clearInterval(keepAlive);
+    initiationClients.delete(client);
+  };
+  req.on('close', cleanup);
+  res.on('close', cleanup);
+});
+
+// Fallback for clients that cannot hold an SSE connection open: claim and
+// return whatever is waiting. The lease mechanism means a dropped connection
+// never loses the work.
+app.get('/api/initiation/pending', (req, res) => {
+  try {
+    const clientId = String(req.query.clientId || `client_${Date.now().toString(36)}`);
+    const limit = Math.min(25, Math.max(1, Number(req.query.limit) || 10));
+    const leases = initiationManager.queue.claim(clientId, limit);
+    res.json({ leases });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to claim pending initiations' });
+  }
+});
+
+// The executor's report for one record.
+app.post('/api/initiation/ack', (req, res) => {
+  try {
+    const { id, success, summary } = req.body ?? {};
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    const applied = initiationManager.acknowledge(String(id), success === true, summary ? String(summary) : undefined);
+    res.json({ success: applied });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to acknowledge initiation' });
+  }
+});
+
+// The executor could not deliver the record RIGHT NOW (quiet hours, the user
+// is busy). Deferring keeps the work — dropping it would silently lose a
+// mission. The record returns to the queue and is handed out again later.
+app.post('/api/initiation/defer', (req, res) => {
+  try {
+    const { id, delayMs } = req.body ?? {};
+    if (!id) return res.status(400).json({ error: 'id is required' });
+    const delay = Math.min(6 * 60 * 60 * 1000, Math.max(0, Number(delayMs) || 0));
+    const deferred = initiationManager.queue.defer(String(id), delay);
+    res.json({ success: deferred, deferred });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to defer initiation' });
+  }
+});
+
+// The Windows layer reports that the clipboard changed. Deliberately
+// content-free — the Win32 clipboard sequence counter needs no clipboard read,
+// so Krisha learns that something was copied without ever reading what.
+app.post('/api/initiation/clipboard', (req, res) => {
+  try {
+    initiationManager.triggers.handleClipboardChanged();
+    res.json({ success: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to signal clipboard change' });
+  }
+});
+
+// The browser knows which project roots the user approved (approval lives in
+// the browser's ProjectEngine); the server is the only side that can watch
+// the filesystem. This hands the approved roots over — nothing else is ever
+// watched.
+app.post('/api/initiation/watch', (req, res) => {
+  try {
+    const directories = Array.isArray(req.body?.directories)
+      ? req.body.directories.filter((d: unknown): d is string => typeof d === 'string' && d.length > 0)
+      : [];
+    initiationManager.triggers.startFileWatcher(directories);
+    res.json({ success: true, watching: initiationManager.triggers.getWatchedDirectories() });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to set watched directories' });
+  }
+});
+
+// Diagnostics: the full queue, newest first.
+app.get('/api/initiation/queue', (req, res) => {
+  res.json({ records: initiationManager.queue.list(), stats: initiationManager.queue.stats() });
 });
 
 // ---- LPV — Local Private Vault (post-roadmap capability) ----
@@ -4701,6 +4992,276 @@ app.post("/api/vault/approvals/decline", (req, res) =>
 app.post("/api/vault/challenge/status", (req, res) =>
   lpvResult(res, () => lpv.getChallengeStatus(String(req.body?.challengeId ?? '')))
 );
+
+// ---------------------------------------------------------------------------
+// Approval Surface — one set of operator decisions, presented wherever the
+// operator actually is (browser window OR Windows Action Center toast).
+//
+// The server decides WHEN to ask (the confidence-gated policy) and carries
+// the decision to the subsystem that owns it. It never replaces that
+// subsystem's authority.
+//
+// See src/agent/approval/ for the full design; ARCHITECTURE.md §41 for the
+// architecture record.
+// ---------------------------------------------------------------------------
+
+const APPROVAL_STATE_DIR = path.join(process.cwd(), ".krisha", "approval");
+const APPROVAL_POLICY_FILE = path.join(APPROVAL_STATE_DIR, "policy.json");
+
+/** The operator's policy — persisted so it survives a restart. */
+let approvalPolicy: ApprovalPolicy = { ...DEFAULT_APPROVAL_POLICY };
+try {
+  if (fs.existsSync(APPROVAL_POLICY_FILE)) {
+    approvalPolicy = sanitizePolicy(JSON.parse(fs.readFileSync(APPROVAL_POLICY_FILE, "utf8")));
+  }
+} catch (err) {
+  console.warn("[approval] could not read the stored policy — using defaults:", err);
+}
+function saveApprovalPolicy(): void {
+  try {
+    if (!fs.existsSync(APPROVAL_STATE_DIR)) fs.mkdirSync(APPROVAL_STATE_DIR, { recursive: true });
+    fs.writeFileSync(APPROVAL_POLICY_FILE, JSON.stringify(approvalPolicy, null, 2), "utf8");
+  } catch (err) {
+    console.warn("[approval] could not persist the policy:", err);
+  }
+}
+
+const approvalTrust = new TrustGate({
+  // The E5 audit chain is the ONLY learning source. The gate reads the LAST
+  // contiguous hash-verified segment (the recent evidence) and verifies that
+  // it reaches the end of the file — so stale evidence is never presented as
+  // current, and a tampered tail teaches nothing. The whole-file verdict is
+  // reported alongside it for the operator.
+  readAudit: () => {
+    const segment = readLastVerifiedAuditSegment(5000);
+    return {
+      entries: segment.records,
+      available: segment.available,
+      ...(segment.reason ? { reason: segment.reason } : {}),
+      coversTail: segment.coversTail,
+      length: segment.length,
+    };
+  },
+  verifyChain: () => verifyAuditChain(),
+  storagePath: path.join(APPROVAL_STATE_DIR, "trust_state.json"),
+  audit: (event) => auditAndIngest(event, "approval-trust"),
+});
+
+const approvalPresence = new PresenceTracker();
+
+const approvalRegistry = new ApprovalRegistry({
+  trust: approvalTrust,
+  presence: approvalPresence,
+  getPolicy: () => approvalPolicy,
+  audit: (event) => auditAndIngest(event, "approval-surface"),
+  backends: {
+    // E5 rollback core — the owning subsystem decides; the registry only
+    // carries the operator's answer to it.
+    rollback: {
+      approve: (request) => {
+        try {
+          rollback.approveChallenge(request.backend.ref);
+          return { ok: true, reason: 'rollback challenge approved' };
+        } catch (err: any) {
+          return { ok: false, reason: err?.message || String(err) };
+        }
+      },
+      decline: (request) => {
+        try {
+          rollback.declineChallenge(request.backend.ref);
+          return { ok: true, reason: 'rollback challenge declined' };
+        } catch (err: any) {
+          return { ok: false, reason: err?.message || String(err) };
+        }
+      },
+    },
+    // LPV vault — the one-time decision token stays inside the vault. It is
+    // fetched here from the operator-facing pending listing, which is the
+    // only place it is ever released.
+    lpv: {
+      approve: async (request) => {
+        const pending = lpv.listPendingChallenges();
+        const match = pending.find((c) => c.challengeId === request.backend.ref);
+        if (!match) return { ok: false, reason: 'the vault challenge is no longer pending' };
+        const result = await lpv.approveChallenge(match.challengeId, match.decisionToken);
+        return {
+          ok: result.approved === true,
+          reason: result.approved ? 'vault challenge approved' : 'vault approval refused',
+          ...(result.fill ? { result: { fill: result.fill } } : {}),
+        };
+      },
+      decline: (request) => {
+        const pending = lpv.listPendingChallenges();
+        const match = pending.find((c) => c.challengeId === request.backend.ref);
+        if (!match) return { ok: false, reason: 'the vault challenge is no longer pending' };
+        const result = lpv.declineChallenge(match.challengeId, match.decisionToken);
+        return { ok: result.declined === true, reason: 'vault challenge declined' };
+      },
+    },
+    // Phase C execution gate — the approval mints a single-use launch token
+    // bound to the exact file identity that was assessed.
+    execgate: {
+      approve: (request) => {
+        const extra = request.backend.extra ?? {};
+        const path = String(extra.path ?? request.backend.ref);
+        const mtimeMs = Number(extra.mtimeMs ?? 0);
+        const size = Number(extra.size ?? 0);
+        const classification = String(extra.classification ?? 'SUSPICIOUS');
+        const token = executionGate.issueApproval(path, { path, mtimeMs, size }, classification);
+        if (!token) {
+          return { ok: false, reason: 'the execution gate refused to issue an approval for this classification' };
+        }
+        return { ok: true, reason: 'launch approval issued', issuedToken: token.token };
+      },
+      decline: () => ({ ok: true, reason: 'launch declined — no approval was issued' }),
+    },
+    // E5 quarantine — releasing a quarantined file.
+    quarantine: {
+      approve: (request) => {
+        const extra = request.backend.extra ?? {};
+        const paths = Array.isArray(extra.paths) ? (extra.paths as string[]) : [];
+        const result = quarantine.releaseQuarantine(paths);
+        const released = Array.isArray(result?.released) ? result.released : [];
+        const refused = Array.isArray(result?.refused) ? result.refused : [];
+        return {
+          ok: released.length > 0,
+          reason: released.length > 0 ? `released ${released.length} item(s)` : 'the release was refused',
+          result: { released, refused },
+        };
+      },
+      decline: () => ({ ok: true, reason: 'quarantine release declined' }),
+    },
+    // Phase D containment — deliberately NOT decidable from this surface.
+    // Its authority is the operator CREDENTIAL, not a click; a toast cannot
+    // carry a secret. The request is surfaced so the operator KNOWS, but the
+    // decision still has to be made in Krisha (or the recovery CLI) with the
+    // enrolled credential.
+    containment: {
+      approve: () => ({
+        ok: false,
+        reason: 'containment requires the operator credential — approve it in Krisha or the recovery CLI',
+      }),
+      decline: () => ({ ok: true, reason: 'containment declined' }),
+    },
+  },
+});
+
+// The rollback core and the LPV vault now tell the registry when they raise
+// a challenge, so the unified surface sees them the moment they exist.
+rollback.setRollbackChallengeHook((info) => {
+  void approvalRegistry.raise({
+    actionType: 'rollback',
+    title: 'Rollback needs your approval',
+    detail: `Restore ${info.affectedPaths.length} file(s) from the ${info.opKind} journal.`,
+    risk: 'medium',
+    backend: {
+      kind: 'rollback',
+      ref: info.challengeId,
+      extra: { opId: info.opId, planHash: info.planHash, opKind: info.opKind },
+    },
+    ttlMs: Math.max(1000, info.expiresAt - Date.now()),
+  });
+});
+
+lpv.setLpvChallengeHook((info) => {
+  void approvalRegistry.raise({
+    actionType: 'vault_retrieval',
+    title: 'Vault access needs your approval',
+    detail: info.purpose === 'fill'
+      ? `Fill a stored credential${info.entryTitle ? ` (${info.entryTitle})` : ''}.`
+      : `Retrieve a stored credential${info.entryTitle ? ` (${info.entryTitle})` : ''}.`,
+    risk: 'high',
+    backend: { kind: 'lpv', ref: info.challengeId },
+    ttlMs: Math.max(1000, info.expiresAt - Date.now()),
+  });
+});
+
+// ---- Approval Surface routes ----
+// The pending listing is the operator-facing surface: it is the ONLY place
+// the decision capability is released, exactly like the LPV vault's pending
+// listing releases its one-time decision token.
+
+app.get('/api/approvals/pending', (req, res) => {
+  res.json({ requests: approvalRegistry.pending(), presence: approvalRegistry.presenceState() });
+});
+
+app.post('/api/approvals/surfaced', (req, res) => {
+  try {
+    const id = String(req.body?.id ?? '');
+    const via = req.body?.via === 'toast' ? 'toast' : 'browser';
+    const ok = approvalRegistry.markSurfaced(id, via);
+    res.json({ success: ok });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to record the surface' });
+  }
+});
+
+app.post('/api/approvals/decide', async (req, res) => {
+  try {
+    const id = String(req.body?.id ?? '');
+    const decision = req.body?.decision === 'approve' ? 'approve' : req.body?.decision === 'deny' ? 'deny' : '';
+    if (!id || !decision) return res.status(400).json({ error: 'id and decision are required' });
+    const via = req.body?.via === 'toast' ? 'toast' : 'browser';
+    const capability = typeof req.body?.capability === 'string' ? req.body.capability : undefined;
+    const reason = typeof req.body?.reason === 'string' ? req.body.reason.slice(0, 300) : undefined;
+    const result = await approvalRegistry.decide(id, decision, via, capability, reason);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to record the decision' });
+  }
+});
+
+app.get('/api/approvals/trust', (req, res) => {
+  const trust = approvalRegistry.trustState();
+  res.json({
+    ...trust,
+    policy: approvalRegistry.policy(),
+    presence: approvalRegistry.presenceState(),
+    autoApprovable: [...AUTO_APPROVABLE_ACTION_TYPES],
+  });
+});
+app.post('/api/approvals/policy', (req, res) => {
+  try {
+    approvalPolicy = sanitizePolicy({ ...approvalPolicy, ...(req.body ?? {}) });
+    saveApprovalPolicy();
+    res.json({ success: true, policy: approvalPolicy });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to save the policy' });
+  }
+});
+
+// Presence: the browser reports in while the operator is actually there.
+// This is what separates "online — ask" from "offline — act alone if trusted".
+app.post('/api/approvals/presence', (req, res) => {
+  try {
+    const present = req.body?.present !== false;
+    if (present) approvalPresence.markPresent();
+    else approvalPresence.markAbsent();
+    res.json({ success: true, presence: approvalRegistry.presenceState() });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to update presence' });
+  }
+});
+
+// A containment decision that needs the operator is surfaced (so the operator
+// knows), but it is never decided by this surface — its authority is the
+// operator credential.
+app.get('/api/approvals/containment-pending', (req, res) => {
+  try {
+    const incidents = incidentStore.all();
+    const pending = (Array.isArray(incidents) ? incidents : [])
+      .filter((i: any) => i?.state === 'AWAITING_OPERATOR' || typeof i?.pendingOperatorDecision === 'string')
+      .map((i: any) => ({
+        id: i.id,
+        title: 'Containment needs your decision',
+        detail: i.pendingOperatorDecision ?? 'operator decision required',
+        severity: i.severity,
+      }));
+    res.json({ pending, requiresCredential: true });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to list pending containment decisions' });
+  }
+});
 
 // Vite middleware & Static serving
 async function startServer() {

@@ -339,6 +339,218 @@ export function getStorageInfo(): { root: string | null; protection: StorageProt
   return { root: storeRoot, protection: storageProtection };
 }
 
+/**
+ * The LAST contiguous, hash-verified segment of the audit chain.
+ *
+ * Why this exists alongside `verifyAuditChain()`:
+ *
+ * `verifyAuditChain()` answers "is the WHOLE file intact?" — the right
+ * question for an AUTHORITY TRANSITION (rollback, stop-state), where any
+ * break anywhere must refuse.
+ *
+ * A LEARNING consumer asks a different question: "is the recent history
+ * intact?" A chain can carry an old discontinuity — from an earlier era when
+ * a test suite wrote into the production store — while the current tail is
+ * perfectly linked. Refusing to learn from that tail would make the
+ * confidence gate permanently inert over a historical defect, while the
+ * recent evidence is still exactly as trustworthy as the whole-file check
+ * makes it.
+ *
+ * So this returns the segment that CONTAINS THE LAST RECORD of the file,
+ * verified end to end (seq continuity + prevHash linkage + per-record hash,
+ * the same rules `verifyAuditChain()` applies). Properties that matter:
+ *
+ * - The returned segment always reaches the END of the file. If the recent
+ *   tail is broken, the segment is short (or empty) and the caller learns
+ *   nothing. Stale evidence is never presented as current.
+ * - A segment starts only at a record that is itself a valid genesis
+ *   (seq 1, prevHash "genesis", hash verifies). A tampered or truncated
+ *   chain cannot manufacture a new segment.
+ * - READ-ONLY. Nothing here appends, repairs, or rewrites anything.
+ *
+ * `verifyAuditChain()` is UNCHANGED — this never weakens it.
+ */
+export function readLastVerifiedAuditSegment(maxEntries = 5000): {
+  records: Array<Record<string, unknown>>;
+  /** The segment's first line number (1-based) in the file. */
+  startLine: number;
+  /** How many records the segment holds. */
+  length: number;
+  /** Total lines in the file. */
+  totalLines: number;
+  /** Whether the segment reaches the end of the file. */
+  coversTail: boolean;
+  available: boolean;
+  reason?: string;
+} {
+  const empty = { records: [], startLine: 0, length: 0, totalLines: 0, coversTail: false, available: false };
+  if (storeRoot === null) {
+    return { ...empty, reason: 'protected storage unavailable' };
+  }
+  const file = path.join(storeRoot, AUDIT_DIR, AUDIT_FILE);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { ...empty, reason: 'audit file unreadable' };
+  }
+  const lines = raw.split('\n').filter((l) => l.trim());
+  const totalLines = lines.length;
+  if (totalLines === 0) {
+    return { records: [], startLine: 0, length: 0, totalLines: 0, coversTail: false, available: true };
+  }
+
+  // Walk the file forward, tracking the CURRENT segment. A segment begins at
+  // a valid genesis record and continues while the linkage holds.
+  let segmentStart = -1;
+  let segmentSeq = 0;
+  let segmentPrevHash = 'genesis';
+  let lastVerifiedIndex = -1;
+
+  for (let i = 0; i < totalLines; i++) {
+    const line = lines[i];
+    if (line.length > 64 * 1024) {
+      // An oversized line breaks the segment — it cannot be verified.
+      segmentStart = -1;
+      continue;
+    }
+    let rec: { seq?: unknown; prevHash?: unknown; hash?: unknown; kind?: unknown };
+    try {
+      rec = JSON.parse(line);
+    } catch {
+      segmentStart = -1;
+      continue;
+    }
+    if (typeof rec.seq !== 'number' || typeof rec.prevHash !== 'string' || typeof rec.hash !== 'string') {
+      segmentStart = -1;
+      continue;
+    }
+    const { hash, ...rest } = rec;
+    const computed = crypto.createHash('sha256').update(JSON.stringify(rest), 'utf8').digest('hex');
+    if (hash !== computed) {
+      segmentStart = -1;
+      continue;
+    }
+    const isGenesis = rec.seq === 1 && rec.prevHash === 'genesis';
+    if (isGenesis) {
+      // A fresh, self-consistent segment.
+      segmentStart = i;
+      segmentSeq = 1;
+      segmentPrevHash = hash;
+      lastVerifiedIndex = i;
+      continue;
+    }
+    if (segmentStart === -1) continue;
+    if (rec.seq !== segmentSeq + 1 || rec.prevHash !== segmentPrevHash) {
+      // The linkage broke — the segment ends here.
+      segmentStart = -1;
+      continue;
+    }
+    segmentSeq = rec.seq;
+    segmentPrevHash = hash;
+    lastVerifiedIndex = i;
+  }
+
+  if (segmentStart === -1 || lastVerifiedIndex < segmentStart) {
+    return {
+      records: [],
+      startLine: 0,
+      length: 0,
+      totalLines,
+      coversTail: false,
+      available: true,
+      reason: 'the tail of the audit chain is not verifiably linked',
+    };
+  }
+
+  // The segment that reaches the END of the file is the one that matters.
+  const segmentLines = lines.slice(segmentStart, lastVerifiedIndex + 1);
+  const records: Array<Record<string, unknown>> = [];
+  for (const line of segmentLines) {
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        records.push(parsed as Record<string, unknown>);
+      }
+    } catch {
+      // Already verified above — unreachable.
+    }
+  }
+
+  const coversTail = lastVerifiedIndex === totalLines - 1;
+  const windowed = records.slice(Math.max(0, records.length - Math.max(1, maxEntries)));
+
+  return {
+    records: windowed,
+    startLine: segmentStart + 1,
+    length: records.length,
+    totalLines,
+    coversTail,
+    available: true,
+    ...(coversTail
+      ? {}
+      : { reason: `the segment ends at line ${lastVerifiedIndex + 1} of ${totalLines} — the tail is not verifiable` }),
+  };
+}
+
+/**
+ * READ-ONLY view of the audit chain for LEARNING consumers (the confidence
+ * gate derives per-action-type trust scores from what actually happened).
+ *
+ * Deliberate properties:
+ * - READ-ONLY. Nothing here appends, repairs, or rewrites the chain.
+ * - BOUNDED. Only the last `maxEntries` lines are parsed, and each line is
+ *   length-capped, so a huge chain cannot turn a trust check into a memory
+ *   spike.
+ * - HONEST. Malformed lines are SKIPPED and counted, not silently dropped —
+ *   the caller learns that the chain had unparseable records.
+ * - The returned entries are the RAW records; the caller decides what a kind
+ *   means. This module never interprets audit semantics.
+ *
+ * Callers that gate a safety decision on this data MUST first call
+ * `verifyAuditChain()` — an unverified chain is not evidence.
+ */
+export function readAuditEntries(maxEntries = 2000): {
+  entries: Array<Record<string, unknown>>;
+  totalLines: number;
+  malformedLines: number;
+  available: boolean;
+  reason?: string;
+} {
+  if (storeRoot === null) {
+    return { entries: [], totalLines: 0, malformedLines: 0, available: false, reason: 'protected storage unavailable' };
+  }
+  const file = path.join(storeRoot, AUDIT_DIR, AUDIT_FILE);
+  let raw: string;
+  try {
+    raw = fs.readFileSync(file, 'utf8');
+  } catch {
+    return { entries: [], totalLines: 0, malformedLines: 0, available: false, reason: 'audit file unreadable' };
+  }
+  const lines = raw.split('\n').filter((l) => l.trim());
+  const totalLines = lines.length;
+  const window = lines.slice(Math.max(0, totalLines - Math.max(1, maxEntries)));
+  const entries: Array<Record<string, unknown>> = [];
+  let malformedLines = 0;
+  for (const line of window) {
+    if (line.length > 64 * 1024) {
+      malformedLines += 1;
+      continue;
+    }
+    try {
+      const parsed = JSON.parse(line);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        entries.push(parsed as Record<string, unknown>);
+      } else {
+        malformedLines += 1;
+      }
+    } catch {
+      malformedLines += 1;
+    }
+  }
+  return { entries, totalLines, malformedLines, available: true };
+}
+
 // ---------------------------------------------------------------------------
 // Stop-state persistence (M1a)
 // ---------------------------------------------------------------------------

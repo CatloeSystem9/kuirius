@@ -1489,7 +1489,47 @@ export function createChallenge(
   };
   challenges.set(id, challenge);
   appendLpvAudit({ kind: 'lpv_challenge_created', purpose, challengeId: id, requester: challenge.requester });
+  // Approval Surface hook: the challenge needs an operator decision. The
+  // registry mirrors it into the unified surface so it can be answered from
+  // outside the browser window. A hook failure must never break the
+  // challenge — the vault's own state stays authoritative.
+  try {
+    lpvChallengeHook?.({
+      challengeId: id,
+      purpose,
+      requester: challenge.requester,
+      origin: challenge.origin,
+      entryTitle: payload.entryDraft?.title,
+      expiresAt: challenge.expiresAt,
+    });
+  } catch (err) {
+    console.warn('[LPV] approval-surface hook failed (challenge still valid):', err);
+  }
   return { challengeId: id, expiresAt: challenge.expiresAt, purpose };
+}
+
+/**
+ * Hook invoked when an LPV challenge is created.
+ *
+ * Set by the approval registry so the challenge can be presented outside the
+ * browser window. The hook receives NO secret material — only metadata.
+ * The one-time decision token stays inside the vault; the registry fetches
+ * it from the operator-facing pending listing at decision time.
+ */
+export type LpvChallengeHook = (info: {
+  challengeId: string;
+  purpose: string;
+  requester: string;
+  origin?: string;
+  entryTitle?: string;
+  expiresAt: number;
+}) => void;
+
+let lpvChallengeHook: LpvChallengeHook | null = null;
+
+/** Register (or clear) the approval-surface hook. */
+export function setLpvChallengeHook(hook: LpvChallengeHook | null): void {
+  lpvChallengeHook = hook;
 }
 
 function originOfEntry(entry: EncryptedEntry): string {

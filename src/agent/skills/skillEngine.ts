@@ -227,6 +227,20 @@ export class SkillEngine {
       return { learned: true, skillId: existing.id, version: existing.version, reason: 'skill updated from verified improvement' };
     }
 
+    // A manual flow is only promoted after three genuinely verified, matching
+    // successes. Until then it is merely bounded evidence, not an executable
+    // reusable artifact.
+    const repetitions = this.store.recordCandidate(goalPattern, signature, task.id);
+    if (repetitions < 3) {
+      this.events.emit({
+        name: 'SKILL_CANDIDATE',
+        payload: { goalPattern, repetitions, needed: 3, steps: steps.length },
+        timestamp: Date.now(),
+      });
+      return { learned: false, reason: `verified manual flow seen ${repetitions}/3 times` };
+    }
+    this.store.removeCandidate(goalPattern, signature);
+
     const environment = deriveSkillDomains(steps);
     const requiredTools = Array.from(new Set(steps.map((s) => s.toolName)));
     const requiredPermissions = this.permissionsOfTools(requiredTools);

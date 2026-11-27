@@ -8,7 +8,7 @@
  * data only — never prose memory, never secrets.
  */
 import type { StorageAdapter } from '../taskState';
-import type { LearnedSkill, SkillStats, SkillValidation, SkillVersionInfo, SkillPrecondition } from './skillTypes';
+import type { LearnedSkill, SkillCandidate, SkillStats, SkillValidation, SkillVersionInfo, SkillPrecondition } from './skillTypes';
 import {
   MAX_SKILLS,
   MAX_VERSION_HISTORY,
@@ -19,6 +19,7 @@ import {
 export interface SkillStoreSchema {
   schemaVersion: number;
   skills: LearnedSkill[];
+  candidates?: SkillCandidate[];
 }
 
 function clamp01(n: unknown, fallback: number): number {
@@ -117,6 +118,7 @@ function repairSkill(entry: Partial<LearnedSkill>): LearnedSkill | null {
 
 export class SkillStore {
   skills: LearnedSkill[] = [];
+  candidates: SkillCandidate[] = [];
   private storage: StorageAdapter;
 
   constructor(storage: StorageAdapter) {
@@ -135,6 +137,9 @@ export class SkillStore {
         // Future schema versions are never loaded (fail clean, not corrupt).
         if ((parsed.schemaVersion as number) <= SKILL_SCHEMA_VERSION) {
           this.skills = parsed.skills.map((s) => repairSkill(s)).filter((s): s is LearnedSkill => !!s);
+          this.candidates = Array.isArray(parsed.candidates)
+            ? parsed.candidates.filter((c): c is SkillCandidate => !!c && typeof c.id === 'string' && typeof c.goalPattern === 'string' && typeof c.stepSignature === 'string' && typeof c.successes === 'number').slice(-30)
+            : [];
         }
       }
     } catch {
@@ -149,7 +154,7 @@ export class SkillStore {
       this.skills = [...this.skills].sort((a, b) => rank(b) - rank(a)).slice(0, MAX_SKILLS);
     }
     try {
-      const envelope: SkillStoreSchema = { schemaVersion: SKILL_SCHEMA_VERSION, skills: this.skills };
+      const envelope: SkillStoreSchema = { schemaVersion: SKILL_SCHEMA_VERSION, skills: this.skills, candidates: this.candidates.slice(-30) };
       this.storage.setItem(SKILLS_STORAGE_KEY, JSON.stringify(envelope));
     } catch {
       // storage failure — keep the in-memory state authoritative
@@ -175,8 +180,30 @@ export class SkillStore {
     return true;
   }
 
+  /** Record a matching verified manual flow; returns its bounded evidence count. */
+  recordCandidate(goalPattern: string, stepSignature: string, taskId: string): number {
+    const match = this.candidates.find((c) => c.stepSignature === stepSignature && c.goalPattern === goalPattern);
+    const now = Date.now();
+    if (match) {
+      if (match.lastTaskId !== taskId) match.successes += 1;
+      match.lastTaskId = taskId;
+      match.updatedAt = now;
+      this.persist();
+      return match.successes;
+    }
+    this.candidates.push({ id: `skillcand_${now}_${Math.random().toString(36).slice(2, 8)}`, goalPattern, stepSignature, successes: 1, firstTaskId: taskId, lastTaskId: taskId, createdAt: now, updatedAt: now });
+    this.persist();
+    return 1;
+  }
+
+  removeCandidate(goalPattern: string, stepSignature: string): void {
+    this.candidates = this.candidates.filter((c) => c.goalPattern !== goalPattern || c.stepSignature !== stepSignature);
+    this.persist();
+  }
+
   clear(): void {
     this.skills = [];
+    this.candidates = [];
     this.storage.removeItem(SKILLS_STORAGE_KEY);
   }
 }

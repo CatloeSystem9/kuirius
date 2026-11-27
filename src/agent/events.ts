@@ -99,6 +99,7 @@ export type AgentEventName =
   | 'WORKFLOW_REUSED'
   // Learned Skills v1 — validated reusable capabilities (tier above Phase 12)
   | 'SKILL_LEARNED'
+  | 'SKILL_CANDIDATE'
   | 'SKILL_REINFORCED'
   | 'SKILL_UPDATED'
   | 'SKILL_REJECTED'

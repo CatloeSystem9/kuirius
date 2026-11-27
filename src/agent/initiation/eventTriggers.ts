@@ -15,6 +15,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import type { ProcessEvent } from '../processmonitor/monitorTypes';
+import type { InitiationAction } from './contracts';
+import { FileChangeWatcher, type FileChangeEvent } from './fileWatcher';
 
 export type EventSource = 'process' | 'download' | 'file' | 'clipboard';
 
@@ -34,7 +36,7 @@ export interface ReactiveRuleFilter {
 }
 
 export interface ReactiveRuleAction {
-  type: 'notify' | 'suggest_proactive' | 'execute_task';
+  type: InitiationAction;
   title: string;
   messageTemplate: string; // e.g. "Finished download: {filename}"
   taskPrompt?: string;
@@ -59,6 +61,10 @@ export interface TriggeredEventPayload {
   ruleId: string;
   source: EventSource;
   eventType: EventTriggerType;
+  /** What the executor should do with this event. */
+  action: InitiationAction;
+  /** The task to run when `action` is `execute_task`. */
+  taskPrompt?: string;
   data: Record<string, unknown>;
   title: string;
   message: string;
@@ -69,6 +75,9 @@ export interface EventTriggerEngineOptions {
   storagePath?: string;
   downloadsDir?: string;
   enableDownloadsWatcher?: boolean;
+  /** Directories to watch for file_created / file_modified events. */
+  watchDirectories?: string[];
+  enableFileWatcher?: boolean;
   onRuleFired?: (event: TriggeredEventPayload) => Promise<void> | void;
   audit?: (event: { kind: string; ruleId?: string; [key: string]: unknown }) => void;
   now?: () => number;
@@ -88,6 +97,7 @@ export class EventTriggerEngine {
   private downloadsWatcher: fs.FSWatcher | null = null;
   private knownDownloadFiles = new Set<string>();
   private pendingDownloads = new Map<string, number>(); // partial files being tracked
+  private fileWatcher: FileChangeWatcher | null = null;
 
   constructor(options: EventTriggerEngineOptions = {}) {
     this.storagePath = options.storagePath || path.join(DEFAULT_STORE_DIR, DEFAULT_RULES_FILE);
@@ -102,14 +112,87 @@ export class EventTriggerEngine {
     if (options.enableDownloadsWatcher !== false) {
       this.startDownloadsWatcher();
     }
+
+    if (options.enableFileWatcher !== false && (options.watchDirectories?.length ?? 0) > 0) {
+      this.startFileWatcher(options.watchDirectories || []);
+    }
+  }
+
+  /**
+   * Start watching approved directories for file changes.
+   */
+  public startFileWatcher(directories: string[]): void {
+    if (!directories.length) return;
+    this.fileWatcher?.stop();
+    this.fileWatcher = new FileChangeWatcher({
+      directories,
+      onEvent: (event) => this.handleFileChange(event),
+    });
+    this.fileWatcher.start();
+  }
+
+  /** Stop the file watcher. */
+  public stopFileWatcher(): void {
+    this.fileWatcher?.stop();
+    this.fileWatcher = null;
+  }
+
+  /** The directories currently watched for file changes. */
+  public getWatchedDirectories(): string[] {
+    return this.fileWatcher?.getWatchedDirectories() ?? [];
+  }
+
+  /**
+   * A file appeared or changed in a watched directory.
+   */
+  public handleFileChange(event: FileChangeEvent): void {
+    const eventType: EventTriggerType = event.kind === 'file_created' ? 'file_created' : 'file_modified';
+
+    for (const rule of this.rules.values()) {
+      if (!rule.enabled || rule.source !== 'file' || rule.eventType !== eventType) continue;
+
+      if (rule.filter?.fileExtension) {
+        const reqExt = rule.filter.fileExtension.toLowerCase();
+        const ext = event.extension.toLowerCase();
+        if (ext !== reqExt && !ext.endsWith(reqExt)) continue;
+      }
+
+      if (rule.filter?.pathPattern && !event.path.toLowerCase().includes(rule.filter.pathPattern.toLowerCase())) {
+        continue;
+      }
+
+      if (rule.filter?.minFileSize && event.size < rule.filter.minFileSize) continue;
+
+      this.evaluateAndFireRule(rule, {
+        filename: event.filename,
+        path: event.path,
+        size: event.size,
+        extension: event.extension,
+        dir: event.dir,
+      });
+    }
+  }
+
+  /**
+   * The clipboard CHANGED.
+   *
+   * Deliberately content-free: the Windows layer reports that the clipboard
+   * sequence number moved (a Win32 counter that needs no clipboard read), so
+   * Krisha learns that "something was copied" without ever reading what.
+   */
+  public handleClipboardChanged(): void {
+    for (const rule of this.rules.values()) {
+      if (!rule.enabled || rule.source !== 'clipboard' || rule.eventType !== 'clipboard_text') continue;
+      this.evaluateAndFireRule(rule, { changed: true });
+    }
   }
 
   /**
    * Feed a process event from ProcessMonitor into the reactive engine
    */
   public handleProcessEvent(event: ProcessEvent): void {
-    const eventType: EventTriggerType =
-      event.kind === 'process_created' ? 'process_started' : 'process_terminated';
+    // The monitor emits 'create' / 'delete' — NOT 'process_created'.
+    const eventType: EventTriggerType = event.kind === 'create' ? 'process_started' : 'process_terminated';
 
     const pName = (event.name || '').toLowerCase();
 
@@ -124,7 +207,8 @@ export class EventTriggerEngine {
       this.evaluateAndFireRule(rule, {
         processName: event.name,
         pid: event.pid,
-        commandLine: event.commandLine,
+        // The monitor is metadata-only — there is no command line to report.
+        ...(event.kind === 'create' && event.path ? { path: event.path } : {}),
       });
     }
   }
@@ -225,18 +309,25 @@ export class EventTriggerEngine {
     rule.fireCount = (rule.fireCount || 0) + 1;
     this.saveRules();
 
-    // Render message from template
-    let message = rule.action.messageTemplate;
-    for (const [key, val] of Object.entries(data)) {
-      message = message.replace(new RegExp(`\\{${key}\\}`, 'g'), String(val));
-    }
+    // Render message (and task prompt) from the template placeholders.
+    const render = (template: string): string => {
+      let out = template;
+      for (const [key, val] of Object.entries(data)) {
+        out = out.replace(new RegExp(`\\{${key}\\}`, 'g'), String(val));
+      }
+      return out;
+    };
+    const message = render(rule.action?.messageTemplate || '');
+    const taskPrompt = rule.action?.taskPrompt ? render(rule.action.taskPrompt) : undefined;
 
     const payload: TriggeredEventPayload = {
       ruleId: rule.id,
       source: rule.source,
       eventType: rule.eventType,
+      action: rule.action?.type || 'notify',
+      ...(rule.action?.taskPrompt ? { taskPrompt: rule.action.taskPrompt } : {}),
       data,
-      title: rule.action.title,
+      title: rule.action?.title || 'Krisha noticed something',
       message,
       timestamp: now,
     };
@@ -311,8 +402,16 @@ export class EventTriggerEngine {
    * Add a new reactive rule
    */
   public addRule(rule: Omit<ReactiveRule, 'fireCount'>): ReactiveRule {
+    const actionType = rule.action?.type;
+    const action: InitiationAction =
+      actionType === 'notify' || actionType === 'suggest' || actionType === 'execute_task'
+        ? actionType
+        : actionType === 'suggest_proactive'
+          ? 'suggest'
+          : 'notify';
     const fullRule: ReactiveRule = {
       ...rule,
+      action: { ...(rule.action || { title: 'Krisha noticed something', messageTemplate: '' }), type: action },
       fireCount: 0,
     };
     this.rules.set(fullRule.id, fullRule);
@@ -353,7 +452,7 @@ export class EventTriggerEngine {
         source: 'download',
         eventType: 'download_completed',
         action: {
-          type: 'suggest_proactive',
+          type: 'suggest',
           title: 'Download Completed',
           messageTemplate: 'New file downloaded: "{filename}". Would you like to inspect or organize it?',
           taskPrompt: 'Inspect and organize downloaded file {filename}',
@@ -373,10 +472,10 @@ export class EventTriggerEngine {
         source: 'process',
         eventType: 'process_started',
         filter: {
-          processNamePattern: 'code',
+          processNamePattern: 'code.exe',
         },
         action: {
-          type: 'suggest_proactive',
+          type: 'suggest',
           title: 'Development Workspace Detected',
           messageTemplate: 'VS Code is open! Ready to assist with active code goals and documentation.',
         },
@@ -408,6 +507,26 @@ export class EventTriggerEngine {
       });
     }
 
+    // 4. A new file appeared in a watched (approved) directory.
+    if (!this.rules.has('rule_file_created')) {
+      this.rules.set('rule_file_created', {
+        id: 'rule_file_created',
+        name: 'New File In Project',
+        description: 'Detects a new file appearing in an approved project directory.',
+        source: 'file',
+        eventType: 'file_created',
+        action: {
+          type: 'suggest',
+          title: 'New File Detected',
+          messageTemplate: 'New file appeared: "{filename}". Want me to take a look?',
+          taskPrompt: 'A new file appeared in the project: {filename}. Say what it is and whether it matters.',
+        },
+        cooldownMs: 30 * 60_000, // 30 min cooldown
+        fireCount: 0,
+        enabled: true,
+      });
+    }
+
     this.saveRules();
   }
 
@@ -421,9 +540,23 @@ export class EventTriggerEngine {
       const parsed = JSON.parse(raw);
       if (Array.isArray(parsed)) {
         for (const r of parsed) {
-          if (r && typeof r.id === 'string') {
-            this.rules.set(r.id, r);
-          }
+          if (!r || typeof r.id !== 'string') continue;
+          // Repair: rules persisted before the action contract existed (or
+          // with the old 'suggest_proactive' name) get a valid action.
+          const actionType = r.action?.type;
+          const action: InitiationAction =
+            actionType === 'notify' || actionType === 'suggest' || actionType === 'execute_task'
+              ? actionType
+              : actionType === 'suggest_proactive'
+                ? 'suggest'
+                : 'notify';
+          this.rules.set(r.id, {
+            ...r,
+            action: { ...(r.action || {}), type: action },
+            cooldownMs: typeof r.cooldownMs === 'number' ? r.cooldownMs : 60_000,
+            fireCount: typeof r.fireCount === 'number' ? r.fireCount : 0,
+            enabled: r.enabled !== false,
+          });
         }
       }
     } catch (err) {

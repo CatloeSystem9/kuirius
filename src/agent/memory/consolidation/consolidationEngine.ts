@@ -216,6 +216,29 @@ export class ConsolidationEngine {
     }
   }
 
+  /**
+   * Record a correction distilled from the verified server audit. The caller
+   * supplies only fixed, metadata-derived guidance — never raw audit lines,
+   * command text, paths, or secrets. MemoryService remains the authority for
+   * secret rejection and duplicate merging.
+   */
+  consolidateAuditCorrection(text: string, auditKind: string, count: number): ConsolidationResult {
+    const clean = sanitizeCandidate(text, this.limits.maxContentChars);
+    if (!clean || !/^[a-z0-9_.-]{1,80}$/i.test(auditKind) || !Number.isFinite(count) || count < 1) {
+      return this.record({ action: 'rejected', reason: 'invalid_audit_reflection_candidate', confidence: 0 });
+    }
+    const outcome = this.memory.remember(clean, {
+      category: 'correction',
+      source: 'agent_task',
+      importance: 0.72,
+      confidence: 0.65,
+      tags: ['nightly-reflection', auditKind],
+      metadata: { auditReflection: true, auditKind, occurrences: Math.floor(count) },
+    });
+    const action = outcome.action === 'created' ? 'created' : outcome.action === 'merged' ? 'merged' : outcome.action === 'superseded' ? 'superseded' : 'rejected';
+    return this.record({ action, reason: `audit_reflection_${outcome.action}`, kind: 'decision', source: 'task_result', confidence: outcome.record?.confidence ?? 0, surface: 'memory', relatedMemoryId: outcome.record?.id });
+  }
+
   // ---------------------------------------------------------------- internals
 
   /** Memory surface: conflict → dedup → recurrence gate → remember(). */

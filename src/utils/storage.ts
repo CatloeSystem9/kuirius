@@ -20,6 +20,9 @@ export const DEFAULT_SETTINGS: CompanionSettings = {
   // Offline vision: ON by default — computer use and agent screen observation
   // never upload a screenshot; the read-screen button uses local OCR.
   offlineVision: true,
+  // Ambient awareness is opt-in: enabling it starts an OS screen-share
+  // request, and all glance processing remains local.
+  ambientAwareness: false,
   // Step 4 — Proactive Conversations: conservative, respectful defaults.
   proactiveConversations: true,
   proactiveInactivityMinutes: 30,

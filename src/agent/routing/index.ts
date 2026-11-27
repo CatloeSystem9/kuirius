@@ -11,6 +11,7 @@ export * from './complexity';
 export * from './modelProfiles';
 export * from './requirements';
 export * from './router';
+export * from './localPolicy';
 export * from './cache';
 export * from './coalesce';
 export * from './telemetry';

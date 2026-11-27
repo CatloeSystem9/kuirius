@@ -1,0 +1,16 @@
+{
+  "name": "Krisha",
+  "short_name": "Krisha",
+  "description": "Local AI companion with persistent memory, voice, and computer use.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#02040a",
+  "theme_color": "#02040a",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "any",
+      "type": "image/x-icon"
+    }
+  ]
+}
